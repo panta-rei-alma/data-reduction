@@ -1,0 +1,56 @@
+# Environment and credentials
+.env
+*.env.local
+
+# Project data (large, site-specific)
+2025.1.00383.L/
+shadow-test/
+
+# Reference PDFs (local-only, not versioned)
+reference/
+
+# Handoff / internal docs (personal reference only)
+docs/
+
+# AI tooling (Claude Code, Codex)
+CLAUDE.md
+.claude/
+.codex
+
+# CASA imaging temporaries
+IMAGING_WEIGHT_*/
+tmp_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+
+# pytest
+.pytest_cache/
+
+# CASA logs
+casa-*.log
+ipython.log
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

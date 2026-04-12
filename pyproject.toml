@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panta-rei"
+version = "0.1.0"
+description = "ALMA Large Program data processing pipeline for Panta Rei (2025.1.00383.L)"
+requires-python = ">=3.10"
+dependencies = [
+    "astroquery",
+    "astropy",
+    "numpy",
+    "requests",
+    "ghapi",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+casa = [
+    "casatasks>=6.6",
+    "casatools>=6.6",
+]
+
+[project.scripts]
+panta-rei-pipeline = "panta_rei.cli.run_pipeline:main"
+panta-rei-calibrate = "panta_rei.cli.run_calibration:main"
+panta-rei-reset = "panta_rei.cli.reset_mous:main"
+panta-rei-migrate-db = "panta_rei.cli.migrate_db:main"
+panta-rei-imaging = "panta_rei.cli.run_imaging:main"
+panta-rei-contsub = "panta_rei.cli.run_contsub:main"
+
+[tool.setuptools.packages.find]
+include = ["panta_rei*"]
