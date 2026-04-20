@@ -130,7 +130,10 @@ def resolve_field_for_ms(ms_path: str, source_name: str) -> Optional[str]:
     """Verify *source_name* exists as a field in *ms_path*.
 
     Uses ``casatools.msmetadata.fieldsforname()``.
-    Returns the field name (quoted for CASA) or *None* if not found.
+    Returns the field name or *None* if not found.
+
+    CASA's ``fieldsforname()`` raises ``RuntimeError`` for unknown
+    field names rather than returning an empty list, so we catch that.
     """
     casatools = _ensure_casatools()
     msmd = casatools.msmetadata()
@@ -139,6 +142,8 @@ def resolve_field_for_ms(ms_path: str, source_name: str) -> Optional[str]:
         field_ids = msmd.fieldsforname(source_name)
         if len(field_ids) > 0:
             return source_name
+        return None
+    except RuntimeError:
         return None
     finally:
         msmd.close()
@@ -182,28 +187,45 @@ def run_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 
     tm_center = (tm_freq[0] + tm_freq[1]) / 2.0
 
-    # Combine all vis (TM + SM) for unified selection lists
+    # Combine all vis (TM + SM) for unified selection lists.
+    # MSes that don't contain the target field are dropped — this is
+    # normal for multi-pointing observations where different execution
+    # blocks cover different fields within the same GOUS.
     all_vis = unit.vis_tm + unit.vis_sm
+    kept_vis: list[str] = []
     spw_sel: list[str] = []
     field_sel: list[str] = []
     datacolumns: set[str] = set()
 
     for ms_path in all_vis:
+        # Field resolution — skip MSes that don't contain this field
+        field = resolve_field_for_ms(ms_path, unit.source_name)
+        if field is None:
+            log.info(
+                "Field '%s' not in %s — skipping (different pointing)",
+                unit.source_name, Path(ms_path).name,
+            )
+            continue
+
         # SPW resolution
         spw = resolve_spw_for_ms(ms_path, tm_center)
         if spw is None:
             return False, f"No matching SPW in {Path(ms_path).name} for center freq {tm_center/1e9:.3f} GHz"
-        spw_sel.append(spw)
 
-        # Field resolution
-        field = resolve_field_for_ms(ms_path, unit.source_name)
-        if field is None:
-            return False, f"Field '{unit.source_name}' not found in {Path(ms_path).name}"
+        kept_vis.append(ms_path)
+        spw_sel.append(spw)
         field_sel.append(field)
 
         # Datacolumn — log per-MS for diagnostics
         dc = resolve_datacolumn(ms_path)
         datacolumns.add(dc)
+
+    if not kept_vis:
+        return False, f"Field '{unit.source_name}' not found in any MS"
+
+    # Update the unit's vis lists to only include MSes with the field
+    unit.vis_tm = [v for v in unit.vis_tm if v in kept_vis]
+    unit.vis_sm = [v for v in unit.vis_sm if v in kept_vis]
 
     unit.spw_selection = spw_sel
     unit.field_selection = field_sel

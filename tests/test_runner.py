@@ -212,6 +212,7 @@ class TestTrustedPreflight:
         mock_msmd.spwsforintent.return_value = np.array([0, 1])
         # No frequency match — both SPWs are far from target
         mock_msmd.chanfreqs.side_effect = lambda spw_id: np.linspace(200e9, 200.1e9, 960)
+        mock_msmd.fieldsforname.return_value = [0]  # Field exists
         mock_casatools.msmetadata.return_value = mock_msmd
 
         with patch("panta_rei.imaging.runner._ensure_casatools", return_value=mock_casatools):
@@ -221,20 +222,20 @@ class TestTrustedPreflight:
         assert "No matching SPW" in msg
 
     def test_preflight_fails_on_missing_field(self, basic_unit):
-        """If field name doesn't resolve in an MS, preflight should fail."""
+        """If field name doesn't resolve in any MS, preflight should fail."""
         mock_casatools = MagicMock()
         mock_msmd = MagicMock()
         import numpy as np
         mock_msmd.spwsforintent.return_value = np.array([1])
         mock_msmd.chanfreqs.side_effect = lambda spw_id: np.linspace(86.0e9, 86.3e9, 960)
-        mock_msmd.fieldsforname.return_value = []  # Field not found
+        mock_msmd.fieldsforname.return_value = []  # Field not found in any MS
         mock_casatools.msmetadata.return_value = mock_msmd
 
         with patch("panta_rei.imaging.runner._ensure_casatools", return_value=mock_casatools):
             ok, msg = run_trusted_preflight(basic_unit)
 
         assert not ok
-        assert "not found" in msg
+        assert "not found in any MS" in msg
 
     def test_preflight_always_uses_corrected(self, basic_unit):
         """Even if no CORRECTED_DATA, datacolumn should be 'corrected' (CASA falls back to data)."""
