@@ -462,6 +462,42 @@ def build_tclean_only_output_path(
     return output_dir / subdir / filename
 
 
+# Aux products (QA artefacts produced by tclean) — each is published as
+# FITS alongside the canonical .pbcor pair.  Order is just for stable
+# logging.
+AUX_PRODUCT_KINDS: tuple[str, ...] = ("mask", "residual", "pb")
+
+
+def build_aux_output_path(
+    output_dir: Path,
+    gous_id: str,
+    source_name: str,
+    freq_min_hz: float,
+    freq_max_hz: float,
+    kind: str,
+) -> Path:
+    """Build the output FITS path for a tclean aux product.
+
+    Aux products (mask, residual, pb) come from the tclean step and so
+    inherit the 12m7m naming.  Pattern:
+    ``{output_dir}/group.uid___A001_{gous_id}.lp_nperetto/
+    group.uid___A001_{gous_id}.lp_nperetto.{source}.12m7m.{freq}GHz.cube.{kind}.fits``
+    """
+    if kind not in AUX_PRODUCT_KINDS:
+        raise ValueError(
+            f"unknown aux product kind: {kind!r}; "
+            f"expected one of {AUX_PRODUCT_KINDS}"
+        )
+    sanitized = sanitize_source_name(source_name)
+    freq_range = get_freq_range_string(freq_min_hz, freq_max_hz)
+    subdir = f"group.uid___A001_{gous_id}.lp_nperetto"
+    filename = (
+        f"group.uid___A001_{gous_id}.lp_nperetto."
+        f"{sanitized}.12m7m.{freq_range}GHz.cube.{kind}.fits"
+    )
+    return output_dir / subdir / filename
+
+
 # ---------------------------------------------------------------------------
 # Preflight assembly (advisory mode)
 # ---------------------------------------------------------------------------

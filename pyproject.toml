@@ -30,6 +30,7 @@ panta-rei-calibrate = "panta_rei.cli.run_calibration:main"
 panta-rei-reset = "panta_rei.cli.reset_mous:main"
 panta-rei-migrate-db = "panta_rei.cli.migrate_db:main"
 panta-rei-imaging = "panta_rei.cli.run_imaging:main"
+panta-rei-imaging-dispatch = "panta_rei.cli.run_imaging_dispatch:main"
 panta-rei-contsub = "panta_rei.cli.run_contsub:main"
 
 [tool.setuptools.packages.find]

@@ -417,6 +417,12 @@ class ImagingRunStatus:
     FAILED = "failed"
 
 
+class DispatchState:
+    RUNNING = "running"
+    DONE = "done"
+    ABORTED = "aborted"
+
+
 # ---------------------------------------------------------------------------
 # Imaging params table queries
 # ---------------------------------------------------------------------------
@@ -657,3 +663,180 @@ class ImagingRunsQueries:
             f"{k}={v}" for k, v in sorted(totals.items())
         ]
         return " | ".join(parts)
+
+    # --- distributed dispatch helpers (migration #14) -----------------
+
+    @staticmethod
+    def set_dispatch_meta(
+        con: sqlite3.Connection,
+        run_id: int,
+        *,
+        dispatch_id: Optional[str] = None,
+        remote_workdir: Optional[str] = None,
+        worker_pid: Optional[int] = None,
+        worker_pgid: Optional[int] = None,
+        hostname: Optional[str] = None,
+    ) -> None:
+        """Record dispatch identity + remote location for a run row."""
+        con.execute(
+            """
+            UPDATE imaging_runs
+               SET dispatch_id    = COALESCE(?, dispatch_id),
+                   remote_workdir = COALESCE(?, remote_workdir),
+                   worker_pid     = COALESCE(?, worker_pid),
+                   worker_pgid    = COALESCE(?, worker_pgid),
+                   hostname       = COALESCE(?, hostname)
+             WHERE id = ?
+            """,
+            (dispatch_id, remote_workdir, worker_pid, worker_pgid,
+             hostname, run_id),
+        )
+
+    @staticmethod
+    def update_heartbeat(
+        con: sqlite3.Connection, run_id: int, ts: str,
+    ) -> None:
+        """Bump last_heartbeat for a run row."""
+        con.execute(
+            "UPDATE imaging_runs SET last_heartbeat=? WHERE id=?",
+            (ts, run_id),
+        )
+
+    @staticmethod
+    def set_error_message(
+        con: sqlite3.Connection, run_id: int, msg: Optional[str],
+    ) -> None:
+        """Persist a (possibly truncated) error message."""
+        con.execute(
+            "UPDATE imaging_runs SET error_message=? WHERE id=?",
+            (msg, run_id),
+        )
+
+    @staticmethod
+    def list_active_for_params(
+        con: sqlite3.Connection, params_id: int,
+    ) -> list[dict]:
+        """Return queued/running runs for a params_id, joined to dispatch state.
+
+        Used to filter selection so a new dispatch never enqueues a unit
+        whose previous run is still active under an unfinished dispatch.
+        """
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                SELECT r.id, r.status, r.dispatch_id, d.state AS dispatch_state
+                  FROM imaging_runs r
+                  LEFT JOIN dispatches d ON d.dispatch_id = r.dispatch_id
+                 WHERE r.params_id = ?
+                   AND r.status IN (?, ?)
+                """,
+                (params_id, ImagingRunStatus.QUEUED, ImagingRunStatus.RUNNING),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.row_factory = None
+
+    @staticmethod
+    def list_running_for_dispatch(
+        con: sqlite3.Connection, dispatch_id: str,
+    ) -> list[dict]:
+        """Return imaging_runs rows in non-terminal state for a dispatch."""
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                SELECT * FROM imaging_runs
+                 WHERE dispatch_id = ?
+                   AND status IN (?, ?)
+                """,
+                (dispatch_id, ImagingRunStatus.QUEUED,
+                 ImagingRunStatus.RUNNING),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.row_factory = None
+
+    @staticmethod
+    def get_by_id(con: sqlite3.Connection, run_id: int) -> Optional[dict]:
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT * FROM imaging_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.row_factory = None
+
+
+# ---------------------------------------------------------------------------
+# Dispatches table queries (distributed imaging coordination)
+# ---------------------------------------------------------------------------
+
+class DispatchesQueries:
+    """Query helpers for the dispatches table (migration #14)."""
+
+    @staticmethod
+    def insert(
+        con: sqlite3.Connection,
+        *,
+        dispatch_id: str,
+        coordinator_host: str,
+        coordinator_pid: int,
+        machines_json: str,
+        cli_args: str,
+        git_commit: Optional[str] = None,
+        git_dirty: bool = False,
+    ) -> None:
+        con.execute(
+            """
+            INSERT INTO dispatches (
+                dispatch_id, started_at, coordinator_host, coordinator_pid,
+                git_commit, git_dirty, machines_json, cli_args, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dispatch_id, now_iso(), coordinator_host, int(coordinator_pid),
+                git_commit, 1 if git_dirty else 0,
+                machines_json, cli_args, DispatchState.RUNNING,
+            ),
+        )
+
+    @staticmethod
+    def list_running(con: sqlite3.Connection) -> list[dict]:
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT * FROM dispatches WHERE state = ?",
+                (DispatchState.RUNNING,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.row_factory = None
+
+    @staticmethod
+    def mark_terminal(
+        con: sqlite3.Connection,
+        dispatch_id: str,
+        state: str = DispatchState.DONE,
+    ) -> None:
+        con.execute(
+            """
+            UPDATE dispatches
+               SET state=?, finished_at=?
+             WHERE dispatch_id=?
+            """,
+            (state, now_iso(), dispatch_id),
+        )
+
+    @staticmethod
+    def get(con: sqlite3.Connection, dispatch_id: str) -> Optional[dict]:
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT * FROM dispatches WHERE dispatch_id = ?",
+                (dispatch_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.row_factory = None

@@ -62,6 +62,65 @@ class TestDiscoverScriptForPI:
         assert "uid___a001_x3833_x64bc" in uids
         assert "uid___a001_x3833_x64bd" in uids
 
+    def test_doubled_layout_dedups_by_uid(self, tmp_path, caplog):
+        """Regression: when the same MOUS UID appears under both
+        ``<base>/science_goal/...`` AND ``<base>/<wrapper>/science_goal/...``
+        (real layout artifact from doubled tar-extracts), discover must
+        yield the MOUS only ONCE, preferring the shallower copy, and
+        emit a duplicate warning."""
+        # Shallow copy
+        shallow_member = (tmp_path / "science_goal.uid___A001_X3833_X64b8"
+                          / "group.uid___A001_X3833_X64b9"
+                          / "member.uid___A001_X3833_X64bc"
+                          / "script")
+        shallow_member.mkdir(parents=True)
+        (shallow_member / "scriptForPI.py").write_text("# shallow\n")
+        # Deep copy of the SAME UID under a wrapper dir
+        deep_member = (tmp_path / "extra_wrapper"
+                       / "science_goal.uid___A001_X3833_X64b8"
+                       / "group.uid___A001_X3833_X64b9"
+                       / "member.uid___A001_X3833_X64bc"
+                       / "script")
+        deep_member.mkdir(parents=True)
+        (deep_member / "scriptForPI.py").write_text("# deep\n")
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            found = list(discover_scriptforpi(tmp_path))
+
+        # Only one yielded entry
+        assert len(found) == 1
+        # Shallow copy wins
+        _uid, script_path, _mous_dir, _hier = found[0]
+        assert "extra_wrapper" not in str(script_path)
+        # Warning emitted
+        assert any("Duplicate MOUS" in r.message for r in caplog.records)
+
+    def test_disjoint_doubled_layout_yields_both(self, tmp_path):
+        """Counterpart: when the doubled layer has DIFFERENT MOUSs
+        (the actual production case), all of them are discovered."""
+        # Shallow MOUS A
+        sa = (tmp_path / "science_goal.uid___A001_X3833_X64b8"
+              / "group.uid___A001_X3833_X64b9"
+              / "member.uid___A001_X3833_X64bc"
+              / "script")
+        sa.mkdir(parents=True)
+        (sa / "scriptForPI.py").write_text("# A\n")
+        # Deep MOUS B (different UID under wrapper)
+        sb = (tmp_path / "extra_wrapper"
+              / "science_goal.uid___A001_X3833_X65aa"
+              / "group.uid___A001_X3833_X65ab"
+              / "member.uid___A001_X3833_X65ac"
+              / "script")
+        sb.mkdir(parents=True)
+        (sb / "scriptForPI.py").write_text("# B\n")
+
+        found = list(discover_scriptforpi(tmp_path))
+        uids = {uid for uid, *_ in found}
+        assert "uid___a001_x3833_x64bc" in uids
+        assert "uid___a001_x3833_x65ac" in uids
+        assert len(found) == 2
+
     def test_script_path_is_under_script_dir(self, alma_tree):
         """Each discovered script lives in a member/script/ directory."""
         for _uid, script_path, _mous_dir, _hier in discover_scriptforpi(alma_tree):

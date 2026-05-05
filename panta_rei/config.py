@@ -78,6 +78,20 @@ class PipelineConfig:
 
     def __post_init__(self) -> None:
         # frozen=True requires object.__setattr__ for post-init
+        # Guard against the doubled-down misconfiguration where
+        # panta_rei_base already ends with project_code (e.g. caller
+        # passed project_dir where panta_rei_base was expected).
+        # Without this, ``data_dir`` silently becomes
+        # ``<base>/<project>/<project>/<project>/`` and tarball extracts
+        # land in a third nesting level.  See the "two data layers"
+        # incident in docs/distributed-imaging-handoff.md (2026-05-01).
+        if self.panta_rei_base.name == self.project_code:
+            raise ConfigError(
+                f"panta_rei_base ({self.panta_rei_base}) already ends in the "
+                f"project_code ({self.project_code!r}). This usually means the "
+                f"caller passed project_dir where panta_rei_base was expected. "
+                f"panta_rei_base must be the PARENT of <project_code>/."
+            )
         object.__setattr__(
             self, "project_dir", self.panta_rei_base / self.project_code
         )

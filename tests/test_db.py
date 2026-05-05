@@ -52,7 +52,7 @@ class TestSchemaCreation:
 
     def test_all_migrations_recorded(self, con):
         count = con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
-        assert count == 13
+        assert count == 15
 
     def test_obs_has_all_columns(self, con):
         cols = {row[1] for row in con.execute("PRAGMA table_info(obs)")}

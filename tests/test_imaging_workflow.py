@@ -239,6 +239,60 @@ class TestJointImagingStep:
         reason = step.should_skip(imaging_ctx)
         assert reason is not None
 
+    def test_preflight_reports_units_independent_of_prior_success(
+        self, imaging_ctx, imaging_tree,
+    ):
+        """``--step preflight`` should report all matching ready/not-ready
+        units regardless of whether they have a successful run already.
+        Pre-fix, the shared selection helper applied success_exists()
+        and would shrink the preflight count."""
+        from panta_rei.db.models import (
+            ImagingParamsQueries, ImagingParamsStatus,
+            ImagingRunsQueries, ImagingRunStatus,
+        )
+        # Recover params first (gives us at least one params row).
+        recover_opts = ImagingOptions(
+            weblog_dir=imaging_tree["weblog_dir"],
+            obs_csv=imaging_tree["csv_path"],
+            step="recover",
+        )
+        RecoverParamsStep(recover_opts).run(imaging_ctx)
+
+        # Run preflight once to get the baseline counts.
+        baseline = JointImagingStep(ImagingOptions(
+            obs_csv=imaging_tree["csv_path"], step="preflight",
+        )).run(imaging_ctx)
+        assert baseline.success
+        baseline_processed = baseline.items_processed
+
+        # Inject a SUCCESS imaging_runs row for one of the params.
+        with imaging_ctx.db_manager.connect() as con:
+            params_rows = ImagingParamsQueries.get_all_recovered(con)
+            assert params_rows, "fixture should have produced recovered params"
+            pid = params_rows[0]["id"]
+            ImagingRunsQueries.insert_row(
+                con,
+                params_id=pid,
+                gous_uid=params_rows[0]["gous_uid"],
+                source_name=params_rows[0]["source_name"],
+                line_group=params_rows[0].get("line_group"),
+                spw_id=params_rows[0]["spw_id"],
+                started_at="2026-01-01T00:00:00",
+                status=ImagingRunStatus.SUCCESS,
+                method="tclean_feather",
+                deconvolver="multiscale",
+                scales="[0, 5, 10, 15, 20]",
+            )
+            con.commit()
+
+        # Re-run preflight; the count must be unchanged because preflight
+        # ignores prior successes.
+        after = JointImagingStep(ImagingOptions(
+            obs_csv=imaging_tree["csv_path"], step="preflight",
+        )).run(imaging_ctx)
+        assert after.success
+        assert after.items_processed == baseline_processed
+
 
 # ---------------------------------------------------------------------------
 # run_imaging orchestration

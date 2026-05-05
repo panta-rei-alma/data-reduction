@@ -9,6 +9,9 @@ shadow-test/
 # Reference PDFs (local-only, not versioned)
 reference/
 
+# Operational scripts (deployment-specific, not part of the public package)
+scripts/
+
 # Handoff / internal docs (personal reference only)
 docs/
 
