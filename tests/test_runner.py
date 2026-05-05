@@ -13,6 +13,8 @@ from panta_rei.imaging.matching import ImagingUnit
 from panta_rei.imaging.runner import (
     FIXED_PARAMS,
     FIXED_TCLEAN_PARAMS,
+    _publish,
+    _publish_pair,
     build_sdintimaging_params,
     build_tclean_params,
     cleanup_intermediates,
@@ -663,3 +665,234 @@ class TestRunTcleanFeatherParallel:
         # Verify canonical FITS were published
         assert Path(output).exists()
         assert "fake feathered" in Path(output).read_text()
+
+    def test_subprocess_success_publishes_aux_products(self, basic_unit, tmp_path):
+        """When the CASA script reports aux_fits, the runner publishes
+        each alongside the canonical pair using the canonical aux paths
+        passed in the job spec."""
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+
+        output_dir = tmp_path / "output"
+        observed_spec = {}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            job_json = Path(cmd[-1])
+            spec = json.loads(job_json.read_text())
+            observed_spec.update(spec)
+            run_dir = Path(spec["run_dir"])
+
+            feathered_name = Path(spec["canonical_paths"]["feathered"]).name
+            tclean_name = Path(spec["canonical_paths"]["tclean_only"]).name
+            aux_paths = spec["canonical_paths"]["aux"]
+            (run_dir / feathered_name).write_text("F")
+            (run_dir / tclean_name).write_text("T")
+
+            aux_fits: dict[str, str] = {}
+            # Simulate CASA exporting all 3 aux products successfully
+            for kind, canonical in aux_paths.items():
+                local = run_dir / Path(canonical).name
+                local.write_text(f"AUX-{kind}")
+                aux_fits[kind] = str(local)
+
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True,
+                "feathered_fits": str(run_dir / feathered_name),
+                "tclean_fits": str(run_dir / tclean_name),
+                "aux_fits": aux_fits,
+                "error_message": None,
+            }))
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            return mock_result
+
+        with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(True, "OK")), \
+             patch("panta_rei.imaging.runner.get_casa_version", return_value="6.6.6"), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            success, msg, output = run_tclean_feather_parallel(
+                unit=basic_unit,
+                output_dir=output_dir,
+                row_id=77,
+                nproc=4,
+                casa_path=str(casa_path),
+            )
+
+        assert success, msg
+        # job spec should advertise the 3 default aux products + canonical
+        # paths for each
+        assert observed_spec["aux_products"] == ["mask", "residual", "pb"]
+        for kind in ("mask", "residual", "pb"):
+            canonical = Path(observed_spec["canonical_paths"]["aux"][kind])
+            # Lives in same group subdir as the .pbcor.fits, named .cube.<kind>.fits
+            assert canonical.parent == Path(output).parent
+            assert canonical.name.endswith(f".cube.{kind}.fits")
+            assert "12m7m." in canonical.name and "12m7mTP" not in canonical.name
+            assert canonical.exists()
+            assert canonical.read_text() == f"AUX-{kind}"
+
+    def test_subprocess_success_aux_missing_does_not_fail(self, basic_unit, tmp_path):
+        """If the CASA script reports no aux_fits, the unit still
+        succeeds — aux is best-effort."""
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        output_dir = tmp_path / "output"
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            run_dir = Path(spec["run_dir"])
+            feathered_name = Path(spec["canonical_paths"]["feathered"]).name
+            tclean_name = Path(spec["canonical_paths"]["tclean_only"]).name
+            (run_dir / feathered_name).write_text("F")
+            (run_dir / tclean_name).write_text("T")
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True,
+                "feathered_fits": str(run_dir / feathered_name),
+                "tclean_fits": str(run_dir / tclean_name),
+                # No aux_fits key at all — older CASA scripts won't have it
+                "error_message": None,
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(True, "OK")), \
+             patch("panta_rei.imaging.runner.get_casa_version", return_value="6.6.6"), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            success, msg, output = run_tclean_feather_parallel(
+                unit=basic_unit,
+                output_dir=output_dir,
+                row_id=78,
+                nproc=4,
+                casa_path=str(casa_path),
+            )
+        assert success, msg
+        assert Path(output).exists()
+        # No aux files published
+        for kind in ("mask", "residual", "pb"):
+            assert not list(Path(output).parent.glob(f"*.cube.{kind}.fits"))
+
+
+# ---------------------------------------------------------------------------
+# _publish + _publish_pair
+# ---------------------------------------------------------------------------
+
+class TestPublish:
+    def test_publish_overwrite_replaces_existing(self, tmp_path):
+        src = tmp_path / "src.fits"
+        src.write_text("new")
+        dst = tmp_path / "dst.fits"
+        dst.write_text("old")
+        _publish(str(src), str(dst), policy="overwrite")
+        assert dst.read_text() == "new"
+
+    def test_publish_fail_if_exists_raises(self, tmp_path):
+        src = tmp_path / "src.fits"
+        src.write_text("new")
+        dst = tmp_path / "dst.fits"
+        dst.write_text("old")
+        with pytest.raises(FileExistsError):
+            _publish(str(src), str(dst), policy="fail_if_exists")
+        # Pre-existing dst is untouched
+        assert dst.read_text() == "old"
+
+    def test_publish_fail_if_exists_succeeds_when_missing(self, tmp_path):
+        src = tmp_path / "src.fits"
+        src.write_text("new")
+        dst = tmp_path / "out" / "dst.fits"
+        _publish(str(src), str(dst), policy="fail_if_exists")
+        assert dst.read_text() == "new"
+
+
+class TestPublishPair:
+    def test_pair_both_succeed(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        a_dst = tmp_path / "out" / "A.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="fail_if_exists",
+        )
+        assert ok
+        assert a_dst.read_text() == "A"
+        assert b_dst.read_text() == "B"
+
+    def test_pair_second_fails_rolls_back_first(self, tmp_path):
+        """If the second publish fails, the first must be unlinked
+        so retries see a clean canonical area."""
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        a_dst = tmp_path / "out" / "A.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        b_dst.parent.mkdir(parents=True, exist_ok=True)
+        b_dst.write_text("preexisting")  # forces fail_if_exists to error
+
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="fail_if_exists",
+        )
+        assert not ok
+        assert "rolled back 1" in msg
+        # First publish was rolled back
+        assert not a_dst.exists()
+        # Pre-existing second target is untouched
+        assert b_dst.read_text() == "preexisting"
+
+    def test_pair_first_fails_no_publishes(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        a_dst = tmp_path / "out" / "A.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        a_dst.parent.mkdir(parents=True, exist_ok=True)
+        a_dst.write_text("preexisting")  # forces failure on first
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="fail_if_exists",
+        )
+        assert not ok
+        assert not b_dst.exists()
+        assert a_dst.read_text() == "preexisting"
+
+    def test_pair_overwrite_rollback_restores_prior_canonical(self, tmp_path):
+        """Under policy=overwrite, a failed second publish must restore
+        the prior canonical FITS that the first publish replaced —
+        otherwise --re-run can permanently destroy existing data."""
+        a_src = tmp_path / "a.fits"; a_src.write_text("A_NEW")
+        a_dst = tmp_path / "out" / "A.fits"
+        a_dst.parent.mkdir(parents=True, exist_ok=True)
+        a_dst.write_text("A_PRIOR_CANONICAL")
+        # b_src does not exist, so the second _publish raises on copy
+        b_src = tmp_path / "ghost_b.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        b_dst.write_text("B_PRIOR_CANONICAL")
+
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="overwrite",
+        )
+        assert not ok, msg
+        # Both prior canonicals must be intact
+        assert a_dst.read_text() == "A_PRIOR_CANONICAL"
+        assert b_dst.read_text() == "B_PRIOR_CANONICAL"
+        # No leftover backup files
+        assert not list(a_dst.parent.glob("*.bak.*"))
+
+    def test_pair_overwrite_success_drops_backups(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("A_NEW")
+        b_src = tmp_path / "b.fits"; b_src.write_text("B_NEW")
+        a_dst = tmp_path / "out" / "A.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        a_dst.parent.mkdir(parents=True, exist_ok=True)
+        a_dst.write_text("A_PRIOR")
+        b_dst.write_text("B_PRIOR")
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="overwrite",
+        )
+        assert ok
+        assert a_dst.read_text() == "A_NEW"
+        assert b_dst.read_text() == "B_NEW"
+        assert not list(a_dst.parent.glob("*.bak.*"))

@@ -389,4 +389,52 @@ MIGRATIONS: list[Migration] = [
             ("imaging_runs", "parallel", "INTEGER DEFAULT 0"),
         ],
     ),
+
+    # --- distributed dispatch tracking ---
+    Migration(
+        version=14,
+        description="add dispatch tracking columns + dispatches table",
+        probe=lambda con: (
+            all(
+                column_exists(con, "imaging_runs", c)
+                for c in [
+                    "dispatch_id", "remote_workdir", "error_message",
+                    "last_heartbeat", "worker_pid", "worker_pgid",
+                ]
+            )
+            and table_exists(con, "dispatches")
+        ),
+        conditional_columns=[
+            ("imaging_runs", "dispatch_id", "TEXT"),
+            ("imaging_runs", "remote_workdir", "TEXT"),
+            ("imaging_runs", "error_message", "TEXT"),
+            ("imaging_runs", "last_heartbeat", "TEXT"),
+            ("imaging_runs", "worker_pid", "INTEGER"),
+            ("imaging_runs", "worker_pgid", "INTEGER"),
+        ],
+        sql=[
+            """\
+CREATE TABLE IF NOT EXISTS dispatches (
+    dispatch_id      TEXT PRIMARY KEY,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT,
+    coordinator_host TEXT NOT NULL,
+    coordinator_pid  INTEGER NOT NULL,
+    git_commit       TEXT,
+    git_dirty        INTEGER NOT NULL DEFAULT 0,
+    machines_json    TEXT NOT NULL,
+    cli_args         TEXT NOT NULL,
+    state            TEXT NOT NULL
+)""",
+        ],
+    ),
+    Migration(
+        version=15,
+        description="add idx_runs_dispatch index on imaging_runs.dispatch_id",
+        probe=lambda con: index_exists(con, "idx_runs_dispatch"),
+        sql=[
+            "CREATE INDEX IF NOT EXISTS idx_runs_dispatch "
+            "ON imaging_runs(dispatch_id)",
+        ],
+    ),
 ]

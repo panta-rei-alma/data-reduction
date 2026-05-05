@@ -150,22 +150,39 @@ def _ensure_db_success_for_existing_outputs(
 def _discover_scriptforpi(
     base_dir: Path,
 ) -> Iterator[Tuple[str, Path, Path, Dict[str, Optional[str]]]]:
-    for script_path in base_dir.rglob("script/*.py"):
-        if not _SCRIPT_NAME_RE.search(script_path.name):
-            continue
-        mous_dir = script_path.parent.parent
+    """Mirror of :func:`panta_rei.workflows.calibration.discover_scriptforpi`
+    using bounded globs (avoids the rglob hang on large projects)."""
+    from panta_rei.workflows.calibration import _SCRIPT_PATTERNS
 
-        uid = (
-            canonical_uid(script_path.name)
-            or _last_uid_in(str(mous_dir))
-            or canonical_uid(str(mous_dir))
-        )
-        if not uid:
-            log.debug("Skipping script with no parseable UID: %s", script_path)
-            continue
+    seen_uids: set[str] = set()
+    for pat in _SCRIPT_PATTERNS:
+        for script_path in sorted(base_dir.glob(pat)):
+            if not script_path.is_file():
+                continue
+            if not _SCRIPT_NAME_RE.search(script_path.name):
+                continue
+            mous_dir = script_path.parent.parent
 
-        hierarchy = _parse_hierarchy_from_path(mous_dir)
-        yield (uid.lower(), script_path.resolve(), mous_dir.resolve(), hierarchy)
+            uid = (
+                canonical_uid(script_path.name)
+                or _last_uid_in(str(mous_dir))
+                or canonical_uid(str(mous_dir))
+            )
+            if not uid:
+                log.debug("Skipping script with no parseable UID: %s", script_path)
+                continue
+
+            uid_lower = uid.lower()
+            if uid_lower in seen_uids:
+                log.warning(
+                    "Duplicate MOUS %s discovered at %s; using shallower copy",
+                    uid_lower, script_path,
+                )
+                continue
+            seen_uids.add(uid_lower)
+
+            hierarchy = _parse_hierarchy_from_path(mous_dir)
+            yield (uid_lower, script_path.resolve(), mous_dir.resolve(), hierarchy)
 
 
 # ---------------------------------------------------------------------------

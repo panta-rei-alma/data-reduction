@@ -126,9 +126,21 @@ def main() -> int:
     # IMPORTANT: --base-dir is the PROJECT directory (e.g. .../2025.1.00383.L),
     # not panta_rei_base.  Legacy: db, csv, and weblogs all live at this level.
     from panta_rei.config import PipelineConfig
+    from panta_rei.core.errors import ConfigError
 
     base_dir = Path(args.base_dir or f"./{args.project_code}").resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Friendly user-facing check: if the user accidentally passed the
+    # data_dir (= <project_dir>/<project_code>/) instead of the
+    # project_dir, --base-dir would be doubled-named and we'd silently
+    # extract another nesting level.  See the "two data layers" incident.
+    if base_dir.name == args.project_code and base_dir.parent.name == args.project_code:
+        raise ConfigError(
+            f"--base-dir ({base_dir}) appears to be the data_dir, not the "
+            f"project_dir.  Pass .../{args.project_code}, not "
+            f".../{args.project_code}/{args.project_code}."
+        )
 
     db_path = Path(args.db) if args.db else (base_dir / "alma_retrieval_state.sqlite3")
     csv_out = Path(args.csv_out) if args.csv_out else (base_dir / "targets_by_array.csv")

@@ -69,7 +69,7 @@ ALL_INDEXES = {
 }
 
 
-ALL_VERSIONS = set(range(1, 14))  # migrations 1-13
+ALL_VERSIONS = set(range(1, 16))  # migrations 1-15
 
 
 def assert_full_schema(con: sqlite3.Connection) -> None:

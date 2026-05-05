@@ -96,10 +96,17 @@ def main():
     canonical = spec["canonical_paths"]
     unit = spec["unit"]
 
+    # Aux QA products to also export to FITS alongside the science cubes.
+    # Each entry maps a CASA image suffix (relative to ``imagename``) to
+    # the canonical FITS suffix used in the published file name.  Best
+    # effort: a missing or failing export does NOT fail the whole job.
+    aux_products = spec.get("aux_products") or ["mask", "residual", "pb"]
+
     result = {
         "success": False,
         "feathered_fits": None,
         "tclean_fits": None,
+        "aux_fits": {},
         "error_message": None,
     }
     result_path = run_dir / "result.json"
@@ -169,6 +176,35 @@ def main():
         log.info("Exporting feathered FITS: %s", feathered_fits_name)
         exportfits(imagename=feathered_image, fitsimage=local_feathered_fits, overwrite=True)
         result["feathered_fits"] = local_feathered_fits
+
+        # Best-effort export of QA aux products (mask/residual/pb).  The
+        # canonical paths come from the spec (so the runner controls
+        # filenames); we just produce the local FITS in run_dir and
+        # report each path under ``aux_fits[kind]``.  Failure of one
+        # aux export must not fail the job.
+        aux_canonical = spec.get("canonical_paths", {}).get("aux", {})
+        for kind in aux_products:
+            casa_image = f"{imagename}.{kind}"
+            if not Path(casa_image).exists():
+                log.warning("aux %s: CASA image not found at %s — skipping",
+                            kind, casa_image)
+                continue
+            canonical_aux = aux_canonical.get(kind)
+            if not canonical_aux:
+                log.warning("aux %s: no canonical path in spec — skipping",
+                            kind)
+                continue
+            local_aux_fits = str(run_dir / Path(canonical_aux).name)
+            try:
+                log.info("Exporting aux FITS: %s", Path(local_aux_fits).name)
+                exportfits(
+                    imagename=casa_image,
+                    fitsimage=local_aux_fits,
+                    overwrite=True,
+                )
+                result["aux_fits"][kind] = local_aux_fits
+            except Exception as aux_e:
+                log.warning("aux %s export failed: %s", kind, aux_e)
 
         result["success"] = True
         log.info("SUCCESS: %s", feathered_fits_name)

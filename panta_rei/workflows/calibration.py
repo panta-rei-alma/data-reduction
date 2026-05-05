@@ -72,6 +72,24 @@ def _extract_xpair(uid: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+# Depth-bounded glob patterns for ALMA layout.  The standard QA2
+# delivery places ``script/scriptForPI*.py`` at:
+#
+#     <data_dir>/science_goal.uid___*/group.uid___*/member.uid___*/script/*.py
+#
+# Some sites (notably this project) also have a re-extracted copy nested
+# under an extra wrapper dir (e.g. doubled project-name dir from a tar
+# extract).  We try a few wrapper depths but cap at 2 — beyond that
+# we'd be back to ``rglob``-style explosions.  ``Path.glob`` does NOT
+# descend below the literal pattern depth, so this never enters
+# ``calibrated/``, ``pipeline-*``, MS internals, etc.
+_SCRIPT_PATTERNS: tuple[str, ...] = (
+    "science_goal.*/group.*/member.*/script/*.py",
+    "*/science_goal.*/group.*/member.*/script/*.py",
+    "*/*/science_goal.*/group.*/member.*/script/*.py",
+)
+
+
 def discover_scriptforpi(
     base_dir: Path,
 ) -> Iterator[Tuple[str, Path, Path, Dict[str, Optional[str]]]]:
@@ -81,24 +99,47 @@ def discover_scriptforpi(
       1. From script filename (member/MOUS UID).
       2. Last UID in the directory path.
       3. ``canonical_uid(str(mous_dir))``.
+
+    Bounded-glob search (no ``rglob``): on large projects rglob hangs
+    indefinitely walking through ``pipeline-*/html/...`` weblog MS
+    subtrees.  Patterns above match only the legitimate ALMA layout.
+
+    Dedup: if the same UID appears at multiple depths (e.g. a project
+    with both ``base/science_goal/...`` and
+    ``base/<wrapper>/science_goal/...`` containing the same MOUS), the
+    shallowest match wins and a warning is emitted.  Without UID-based
+    dedup we'd silently process the same MOUS twice.
     """
-    for script_path in base_dir.rglob("script/*.py"):
-        if not _SCRIPT_NAME_RE.search(script_path.name):
-            continue
-        mous_dir = script_path.parent.parent
+    seen_uids: set[str] = set()
+    for pat in _SCRIPT_PATTERNS:
+        for script_path in sorted(base_dir.glob(pat)):
+            if not script_path.is_file():
+                continue
+            if not _SCRIPT_NAME_RE.search(script_path.name):
+                continue
+            mous_dir = script_path.parent.parent  # lexical, not resolved
 
-        uid = (
-            canonical_uid(script_path.name)
-            or _last_uid_in(str(mous_dir))
-            or canonical_uid(str(mous_dir))
-        )
+            uid = (
+                canonical_uid(script_path.name)
+                or _last_uid_in(str(mous_dir))
+                or canonical_uid(str(mous_dir))
+            )
 
-        if not uid:
-            log.debug("Skipping script with no parseable UID: %s", script_path)
-            continue
+            if not uid:
+                log.debug("Skipping script with no parseable UID: %s", script_path)
+                continue
 
-        hierarchy = parse_hierarchy_from_path(mous_dir)
-        yield (uid.lower(), script_path.resolve(), mous_dir.resolve(), hierarchy)
+            uid_lower = uid.lower()
+            if uid_lower in seen_uids:
+                log.warning(
+                    "Duplicate MOUS %s discovered at %s; using shallower copy",
+                    uid_lower, script_path,
+                )
+                continue
+            seen_uids.add(uid_lower)
+
+            hierarchy = parse_hierarchy_from_path(mous_dir)
+            yield (uid_lower, script_path.resolve(), mous_dir.resolve(), hierarchy)
 
 
 # ---------------------------------------------------------------------------

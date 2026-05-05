@@ -179,6 +179,50 @@ class TestBuildOutputPath:
         assert "group.uid___A001_X3833_X64b9.lp_nperetto" in str(p.parent)
 
 
+class TestBuildAuxOutputPath:
+    """Aux QA products inherit the 12m7m naming (they come from tclean,
+    not from feather), so their canonical paths sit alongside the
+    .pbcor.fits pair in the same group subdir."""
+
+    def test_each_kind(self):
+        from panta_rei.imaging.matching import build_aux_output_path
+        for kind in ("mask", "residual", "pb"):
+            p = build_aux_output_path(
+                Path("/out"),
+                "X3833_X64b9",
+                "AG231.7986-1.9684",
+                86e9, 87e9, kind,
+            )
+            assert p.name == (
+                "group.uid___A001_X3833_X64b9.lp_nperetto."
+                f"AG231.7986m1.9684.12m7m.86.0-87.0GHz.cube.{kind}.fits"
+            )
+            assert "group.uid___A001_X3833_X64b9.lp_nperetto" in str(p.parent)
+
+    def test_unknown_kind_rejected(self):
+        from panta_rei.imaging.matching import build_aux_output_path
+        with pytest.raises(ValueError, match="unknown aux product kind"):
+            build_aux_output_path(
+                Path("/out"), "X3833_X64b9", "AG231.7986-1.9684",
+                86e9, 87e9, "psf",
+            )
+
+    def test_lives_in_same_group_subdir_as_pbcor(self):
+        from panta_rei.imaging.matching import (
+            build_aux_output_path, build_tclean_only_output_path,
+        )
+        kw = dict(
+            output_dir=Path("/out"),
+            gous_id="X3833_X64b9",
+            source_name="AG231.7986-1.9684",
+            freq_min_hz=86e9,
+            freq_max_hz=87e9,
+        )
+        pbcor = build_tclean_only_output_path(**kw)
+        residual = build_aux_output_path(kind="residual", **kw)
+        assert residual.parent == pbcor.parent
+
+
 # ---------------------------------------------------------------------------
 # TP validation (requires astropy)
 # ---------------------------------------------------------------------------

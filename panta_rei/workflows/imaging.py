@@ -368,54 +368,38 @@ class JointImagingStep(Step):
                 errors=[str(csv_path)],
             )
 
-        targets = load_targets_csv(csv_path)
-
-        # Load all recovered params from DB
-        with ctx.db_manager.connect() as con:
-            all_params = ImagingParamsQueries.get_all_recovered(con)
-
-        if not all_params:
-            return StepResult(
-                success=True,
-                summary="No recovered params to process",
-                items_processed=0,
-            )
-
-        # Apply filters
-        regex: Optional[re.Pattern] = None
-        if opts.match:
-            try:
-                regex = re.compile(opts.match, re.IGNORECASE)
-            except re.error:
-                regex = None
-
-        filtered = []
-        for row in all_params:
-            src = row["source_name"]
-            gous = row["gous_uid"]
-            lg = row.get("line_group")
-            if opts.include_sources and src not in opts.include_sources:
-                continue
-            if opts.include_line_groups and lg not in opts.include_line_groups:
-                continue
-            if regex and not regex.search(src) and not regex.search(gous):
-                continue
-            filtered.append(row)
-
-        if not filtered:
-            return StepResult(
-                success=True,
-                summary="No params match filters",
-                items_processed=0,
-            )
-
-        # Build imaging units with advisory preflight
-        units = build_imaging_units_advisory(
-            filtered, targets, ctx.data_dir
+        # Single source of truth: select_units_to_image() handles
+        # filter, advisory preflight, and idempotency the same way as
+        # the distributed dispatcher.  exclude_active=False here keeps
+        # the legacy single-host serial path untouched (the dispatcher
+        # is the only caller that needs to gate on in-flight rows).
+        #
+        # ``--step preflight`` deliberately reports the full ready/not-
+        # ready picture independent of prior successful runs, matching
+        # the legacy behaviour.  Bypass success_exists() + limit by
+        # forcing re_run=True and limit=None just for that mode.
+        from panta_rei.imaging.unit_selection import (
+            SelectionFilters,
+            select_units_to_image,
         )
-
-        ready_units = [u for u in units if u.ready]
-        not_ready = [u for u in units if not u.ready]
+        is_preflight = (opts.step == "preflight")
+        filters = SelectionFilters(
+            match=opts.match,
+            include_sources=opts.include_sources,
+            include_line_groups=opts.include_line_groups,
+            limit=None if is_preflight else opts.limit,
+            method=opts.method,
+            sdgain=opts.sdgain,
+            deconvolver=opts.deconvolver,
+            scales=list(opts.scales),
+            re_run=True if is_preflight else opts.re_run,
+            exclude_active=False,
+        )
+        selection = select_units_to_image(
+            ctx.db_manager, csv_path, ctx.data_dir, filters,
+        )
+        ready_units = selection.ready
+        not_ready = selection.not_ready
 
         for u in not_ready:
             log.info(
@@ -424,16 +408,24 @@ class JointImagingStep(Step):
             )
 
         log.info(
-            "Preflight: %d ready, %d not ready out of %d",
-            len(ready_units), len(not_ready), len(units),
+            "Selection: %d ready, %d not ready, %d already done, "
+            "%d filtered out",
+            len(ready_units), len(not_ready),
+            selection.skipped_already_done,
+            selection.skipped_filtered_out,
         )
 
         # If preflight-only mode, stop here
         if opts.step == "preflight":
+            total_units = (len(ready_units) + len(not_ready)
+                           + selection.skipped_already_done)
             return StepResult(
                 success=True,
-                summary=f"Preflight: {len(ready_units)} ready, {len(not_ready)} not ready",
-                items_processed=len(units),
+                summary=(
+                    f"Preflight: {len(ready_units)} ready, "
+                    f"{len(not_ready)} not ready"
+                ),
+                items_processed=total_units,
                 items_skipped=len(not_ready),
             )
 
@@ -468,36 +460,19 @@ class JointImagingStep(Step):
                     )
             # parallel mode: skip check — tclean runs via mpicasa subprocess
 
-        # Idempotence: filter out already-successful runs
+        # Selection has already applied success_exists() and limit;
+        # the result is the units to actually run.
         scales_str = json.dumps(opts.scales)
-        to_run: list[ImagingUnit] = []
-        for u in ready_units:
-            if not opts.re_run:
-                with ctx.db_manager.connect() as con:
-                    if ImagingRunsQueries.success_exists(
-                        con,
-                        u.params_id,
-                        method=opts.method,
-                        sdgain=opts.sdgain if opts.method == "sdintimaging" else None,
-                        deconvolver=opts.deconvolver,
-                        scales=scales_str,
-                    ):
-                        log.info(
-                            "Skipping %s/%s/spw%s (already successful with %s)",
-                            u.gous_uid, u.source_name, u.spw_id, opts.method,
-                        )
-                        continue
-            to_run.append(u)
-
-        if opts.limit:
-            to_run = to_run[: opts.limit]
+        to_run = ready_units
 
         if not to_run:
             return StepResult(
                 success=True,
                 summary="All ready units already have successful runs",
                 items_processed=0,
-                items_skipped=len(ready_units),
+                items_skipped=(
+                    len(not_ready) + selection.skipped_already_done
+                ),
             )
 
         # Execute imaging for each ready unit

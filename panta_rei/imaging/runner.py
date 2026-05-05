@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -856,8 +857,35 @@ def export_to_fits(casa_image: str, output_fits: str) -> None:
     exportfits(imagename=casa_image, fitsimage=output_fits, overwrite=True)
 
 
-def _atomic_publish(src: str, dst: str) -> None:
-    """Copy *src* to *dst* atomically via temp file + ``os.replace``."""
+def _tail_text(path: Path, max_lines: int = 200) -> str:
+    """Return the last *max_lines* lines of *path*, or a short error string."""
+    try:
+        with open(path, "rb") as fp:
+            try:
+                fp.seek(0, os.SEEK_END)
+                size = fp.tell()
+                # Read at most ~64KB from the tail; fine for line counting.
+                read_n = min(size, 64 * 1024)
+                fp.seek(size - read_n, os.SEEK_SET)
+                blob = fp.read(read_n)
+            except OSError:
+                blob = fp.read()
+        text = blob.decode("utf-8", errors="replace")
+        lines = text.splitlines()[-max_lines:]
+        return "\n".join(lines)
+    except OSError as exc:
+        return f"<could not read log {path}: {exc}>"
+
+
+def _publish(src: str, dst: str, *, policy: str = "overwrite") -> None:
+    """Copy *src* to *dst* atomically.
+
+    policy="overwrite": temp + os.replace (current behaviour).
+    policy="fail_if_exists": temp + os.link (atomic claim; raises
+    FileExistsError if dst already exists). Used by the distributed
+    dispatcher so concurrent retries cannot silently overwrite each
+    other's output.
+    """
     dst_path = Path(dst)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -869,12 +897,122 @@ def _atomic_publish(src: str, dst: str) -> None:
     os.close(fd)
     try:
         shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
+        if policy == "fail_if_exists":
+            os.link(tmp, str(dst_path))  # atomic; FileExistsError if exists
+            os.unlink(tmp)
+        elif policy == "overwrite":
+            os.replace(tmp, str(dst_path))
+        else:
+            raise ValueError(f"unknown publish policy: {policy!r}")
         log.info("Published: %s", dst_path.name)
     except Exception:
         if os.path.exists(tmp):
-            os.unlink(tmp)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise
+
+
+def _atomic_publish(src: str, dst: str) -> None:
+    """Backward-compatible alias for ``_publish(..., policy="overwrite")``."""
+    _publish(src, dst, policy="overwrite")
+
+
+def _publish_pair(
+    pairs: list[tuple[str, str]], *, policy: str = "overwrite",
+) -> tuple[bool, str]:
+    """Publish a list of (src, dst) pairs as one logical transaction.
+
+    Each individual publish is atomic via ``_publish``.  If any one
+    fails after others succeeded, the already-published destinations
+    are rolled back so retries see a coherent canonical area.
+
+    Rollback semantics:
+    - ``policy="fail_if_exists"``: a successful publish proves the
+      destination did not previously exist, so rollback simply
+      unlinks the file we created.
+    - ``policy="overwrite"``: the destination may have held a
+      prior canonical FITS that we just replaced.  Before the publish
+      we rename the existing destination aside (``<dst>.bak.<pid>``);
+      on rollback we ``os.replace`` the backup back into place.  On
+      successful commit of the whole pair we unlink the backups.
+
+    Returns ``(ok, message)``.
+    """
+    backups: list[tuple[str, str]] = []          # (canonical, backup)
+    published: list[str] = []                    # canonical paths written
+
+    if policy == "overwrite":
+        # Snapshot pre-existing destinations *before* any publish so a
+        # mid-pair failure can restore the prior canonical state.
+        for _src, dst in pairs:
+            dst_path = Path(dst)
+            if dst_path.exists():
+                bak = (
+                    f"{dst_path}.bak.{os.getpid()}.{int(time.time())}"
+                )
+                try:
+                    os.rename(str(dst_path), bak)
+                    backups.append((str(dst_path), bak))
+                except OSError as exc:
+                    # Couldn't snapshot — undo any backups we did take
+                    # and refuse to continue.
+                    for canonical, b in backups:
+                        try:
+                            os.replace(b, canonical)
+                        except OSError:
+                            log.exception(
+                                "backup restore failed: %s -> %s",
+                                b, canonical,
+                            )
+                    return False, (
+                        f"could not snapshot existing {dst}: {exc}"
+                    )
+
+    for src, dst in pairs:
+        try:
+            _publish(src, dst, policy=policy)
+            published.append(dst)
+        except Exception as exc:
+            # Roll back what we just published.
+            for done_dst in published:
+                try:
+                    os.unlink(done_dst)
+                    log.warning("rolled back publish: %s", done_dst)
+                except OSError:
+                    log.exception(
+                        "rollback failed for %s; manual cleanup may be needed",
+                        done_dst,
+                    )
+            # Restore pre-existing destinations from their backups.
+            for canonical, bak in backups:
+                try:
+                    if Path(bak).exists():
+                        os.replace(bak, canonical)
+                        log.warning(
+                            "restored pre-existing publish target: %s",
+                            canonical,
+                        )
+                except OSError:
+                    log.exception(
+                        "could not restore backup %s -> %s; manual "
+                        "intervention may be needed",
+                        bak, canonical,
+                    )
+            return False, (
+                f"publish failed for {dst} (rolled back "
+                f"{len(published)} new file(s), restored "
+                f"{len(backups)} backup(s)): {exc}"
+            )
+
+    # Whole pair succeeded — drop backups.
+    for _canonical, bak in backups:
+        try:
+            os.unlink(bak)
+        except OSError:
+            log.warning("could not unlink backup: %s", bak)
+    return True, "ok"
 
 
 def run_tclean_feather(
@@ -886,18 +1024,33 @@ def run_tclean_feather(
     parallel: bool = False,
     keep_intermediates: bool = False,
     dry_run: bool = False,
+    *,
+    work_dir: Optional[Path] = None,
+    publish_policy: str = "overwrite",
+    aux_products: tuple[str, ...] = ("mask", "residual", "pb"),
 ) -> tuple[bool, str, Optional[str]]:
     """Execute tclean (12m+7m) followed by feather (with TP).
 
-    All CASA products are written under a per-run work directory
-    ``output_dir/runs/{row_id}/``.  Final FITS are atomically published
-    to canonical output paths on success.
+    Parameters
+    ----------
+    output_dir
+        Publish directory: canonical FITS paths derive from this.
+    work_dir
+        Optional CASA scratch + intermediates directory.  Defaults to
+        ``output_dir`` (existing behaviour).  The distributed dispatcher
+        sets this to a fast local /raid/ path while keeping
+        ``output_dir`` on NAS so canonical FITS publish to NAS.
+    publish_policy
+        ``"overwrite"`` (default, existing behaviour) or
+        ``"fail_if_exists"`` (atomic claim via ``os.link``; the
+        dispatcher uses this to make parallel retries safe).
 
     Returns ``(success, message, canonical_12m7mTP_fits_path)``.
     """
     from panta_rei.imaging.matching import (
         build_output_path,
         build_tclean_only_output_path,
+        build_aux_output_path,
         _compute_tm_freq_range,
     )
 
@@ -928,13 +1081,23 @@ def run_tclean_feather(
     canonical_tclean = build_tclean_only_output_path(
         output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max,
     )
+    canonical_aux: dict[str, str] = {
+        kind: str(build_aux_output_path(
+            output_dir, unit.gous_uid, unit.source_name,
+            freq_min, freq_max, kind,
+        ))
+        for kind in aux_products
+    }
 
     if dry_run:
         log.info("[DRY] Would run tclean+feather → %s", canonical_feathered.name)
         return True, "dry-run", str(canonical_feathered)
 
-    # 4. Set up per-run work directory
-    run_dir = output_dir / "runs" / str(row_id)
+    # 4. Set up per-run work directory.  ``work_dir`` lets the dispatcher
+    #    point CASA scratch at fast local storage (/raid/) while
+    #    publishing canonical FITS to NAS via ``output_dir``.
+    work_root = Path(work_dir) if work_dir is not None else output_dir
+    run_dir = work_root / "runs" / str(row_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # imagename prefix for tclean products (under run_dir).
@@ -976,7 +1139,9 @@ def run_tclean_feather(
         "canonical_paths": {
             "feathered": str(canonical_feathered),
             "tclean_only": str(canonical_tclean),
+            "aux": canonical_aux,
         },
+        "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": get_casa_version(),
     }
@@ -1020,9 +1185,41 @@ def run_tclean_feather(
     local_feathered_fits = str(run_dir / canonical_feathered.name)
     export_to_fits(feathered_image, local_feathered_fits)
 
-    # 12. Atomic publish to canonical paths (only on success)
-    _atomic_publish(local_tclean_fits, str(canonical_tclean))
-    _atomic_publish(local_feathered_fits, str(canonical_feathered))
+    # 11b. Best-effort export of aux QA products (mask/residual/pb) to
+    # FITS.  Each is sourced from <imagename>.<kind> in the run_dir.  A
+    # failure here is logged but does NOT fail the imaging run; the aux
+    # is simply omitted from the publish transaction.
+    aux_local: dict[str, str] = {}
+    for kind in aux_products:
+        casa_image = f"{imagename}.{kind}"
+        if not Path(casa_image).exists():
+            log.warning("aux %s: CASA image not found at %s — skipping",
+                        kind, Path(casa_image).name)
+            continue
+        canonical = canonical_aux.get(kind)
+        if not canonical:
+            continue
+        local_path = str(run_dir / Path(canonical).name)
+        try:
+            export_to_fits(casa_image, local_path)
+            aux_local[kind] = local_path
+        except Exception as exc:
+            log.warning("aux %s export failed: %s", kind, exc)
+
+    # 12. Atomic publish to canonical paths (only on success).  Treat the
+    # tclean + feathered + aux outputs as a single transaction: if any
+    # publish fails after others succeeded, the already-published files
+    # are rolled back so retries see a coherent canonical area.
+    pair: list[tuple[str, str]] = [
+        (local_tclean_fits, str(canonical_tclean)),
+        (local_feathered_fits, str(canonical_feathered)),
+    ]
+    for kind, local_path in aux_local.items():
+        pair.append((local_path, canonical_aux[kind]))
+
+    ok, msg = _publish_pair(pair, policy=publish_policy)
+    if not ok:
+        return False, msg, None
 
     log.info("SUCCESS: %s", canonical_feathered.name)
     return True, "success", str(canonical_feathered)
@@ -1042,12 +1239,40 @@ def run_tclean_feather_parallel(
     scales: Optional[list[int]] = None,
     keep_intermediates: bool = False,
     dry_run: bool = False,
+    *,
+    work_dir: Optional[Path] = None,
+    publish_policy: str = "overwrite",
+    log_path: Optional[Path] = None,
+    extra_env: Optional[dict] = None,
+    aux_products: tuple[str, ...] = ("mask", "residual", "pb"),
 ) -> tuple[bool, str, Optional[str]]:
     """Execute tclean+feather via mpicasa subprocess for MPI parallelism.
 
     The pipeline handles preflight and DB tracking.  The actual CASA
     execution is delegated to a standalone script
     (``panta_rei/casa/tclean_feather.py``) launched via mpicasa.
+
+    Parameters
+    ----------
+    output_dir
+        Publish directory: canonical FITS paths derive from this.
+    work_dir
+        Optional CASA scratch + intermediates directory.  Defaults to
+        ``output_dir`` (existing behaviour).  The distributed dispatcher
+        sets this to a fast local /raid/ path while keeping
+        ``output_dir`` on NAS so canonical FITS publish to NAS.
+    publish_policy
+        ``"overwrite"`` (default, existing behaviour) or
+        ``"fail_if_exists"`` (atomic claim via ``os.link``).
+    log_path
+        Optional path to redirect mpicasa stdout+stderr to.  Defaults to
+        an in-memory capture (current behaviour) which is unsafe for
+        long-running jobs at scale.  Distributed workers set this to a
+        per-unit log file under /raid/ to avoid pipe-deadlock risk.
+    extra_env
+        Optional dict of env vars merged on top of ``os.environ`` for the
+        mpicasa subprocess.  Used to inject thread-pinning knobs
+        (``OMP_NUM_THREADS=1`` etc.) when running 30 concurrent jobs.
 
     Returns ``(success, message, canonical_12m7mTP_fits_path)``.
     """
@@ -1056,6 +1281,7 @@ def run_tclean_feather_parallel(
     from panta_rei.imaging.matching import (
         build_output_path,
         build_tclean_only_output_path,
+        build_aux_output_path,
         _compute_tm_freq_range,
     )
 
@@ -1099,13 +1325,22 @@ def run_tclean_feather_parallel(
     canonical_tclean = build_tclean_only_output_path(
         output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max,
     )
+    canonical_aux: dict[str, str] = {
+        kind: str(build_aux_output_path(
+            output_dir, unit.gous_uid, unit.source_name,
+            freq_min, freq_max, kind,
+        ))
+        for kind in aux_products
+    }
 
     if dry_run:
         log.info("[DRY] Would run parallel tclean+feather → %s", canonical_feathered.name)
         return True, "dry-run", str(canonical_feathered)
 
-    # 4. Per-run work directory
-    run_dir = output_dir / "runs" / str(row_id)
+    # 4. Per-run work directory.  ``work_dir`` lets the dispatcher keep
+    #    CASA scratch on /raid/ while publishing to NAS via output_dir.
+    work_root = Path(work_dir) if work_dir is not None else output_dir
+    run_dir = work_root / "runs" / str(row_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     imagename = str(run_dir / canonical_tclean.stem.replace(".pbcor", ""))
@@ -1143,7 +1378,9 @@ def run_tclean_feather_parallel(
         "canonical_paths": {
             "feathered": str(canonical_feathered),
             "tclean_only": str(canonical_tclean),
+            "aux": canonical_aux,
         },
+        "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": "unknown",  # determined inside CASA
     }
@@ -1165,11 +1402,39 @@ def run_tclean_feather_parallel(
     ]
     log.info("Launching: %s", " ".join(cmd))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Build env with thread-pinning defaults; caller can override via extra_env.
+    merged_env = os.environ.copy()
+    merged_env.setdefault("OMP_NUM_THREADS", "1")
+    merged_env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    merged_env.setdefault("MKL_NUM_THREADS", "1")
+    if extra_env:
+        merged_env.update({k: str(v) for k, v in extra_env.items()})
+
+    # Stream stdout+stderr directly to log_path (no Pipes → no deadlock).
+    # When log_path is unset we keep the legacy in-memory capture for
+    # backward compat but warn — long jobs at scale should pass log_path.
+    if log_path is not None:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as logfp:
+            result = subprocess.run(
+                cmd,
+                stdout=logfp,
+                stderr=subprocess.STDOUT,
+                cwd=str(run_dir),
+                env=merged_env,
+            )
+        tail_str = _tail_text(log_path, max_lines=200)
+    else:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=str(run_dir), env=merged_env,
+        )
+        tail_str = (result.stderr or "")[-2000:]
 
     if result.returncode != 0:
-        log.error("mpicasa stderr:\n%s", result.stderr[-2000:] if result.stderr else "")
-        return False, f"mpicasa exited with code {result.returncode}", None
+        log.error("mpicasa output tail:\n%s", tail_str[-2000:])
+        return False, f"mpicasa exited with code {result.returncode}: {tail_str[-500:]}", None
 
     # 9. Parse result JSON
     result_json_path = run_dir / "result.json"
@@ -1181,17 +1446,34 @@ def run_tclean_feather_parallel(
     if not casa_result.get("success"):
         return False, casa_result.get("error_message", "unknown error"), None
 
-    # 10. Atomic publish
+    # 10. Atomic publish — transactional across the (tclean, feathered,
+    # aux...) tuple so a failed unit cannot leave a half-published
+    # canonical area that would poison retries under fail_if_exists.
     local_feathered = casa_result.get("feathered_fits")
     local_tclean = casa_result.get("tclean_fits")
 
-    if local_feathered and Path(local_feathered).exists():
-        _atomic_publish(local_feathered, str(canonical_feathered))
-    else:
+    if not (local_feathered and Path(local_feathered).exists()):
         return False, "Feathered FITS not produced by CASA script", None
 
+    pair = [(local_feathered, str(canonical_feathered))]
     if local_tclean and Path(local_tclean).exists():
-        _atomic_publish(local_tclean, str(canonical_tclean))
+        pair.append((local_tclean, str(canonical_tclean)))
+    # Aux products are best-effort: include only those the CASA script
+    # successfully exported, but include them in the same transaction so
+    # rollback semantics stay coherent.
+    for kind, local_aux in (casa_result.get("aux_fits") or {}).items():
+        if not local_aux or not Path(local_aux).exists():
+            log.warning("aux %s: missing local FITS, skipping publish", kind)
+            continue
+        canonical = canonical_aux.get(kind)
+        if not canonical:
+            log.warning("aux %s: no canonical path resolved, skipping", kind)
+            continue
+        pair.append((local_aux, canonical))
+
+    ok, msg = _publish_pair(pair, policy=publish_policy)
+    if not ok:
+        return False, msg, None
 
     log.info("SUCCESS (parallel): %s", canonical_feathered.name)
     return True, "success", str(canonical_feathered)

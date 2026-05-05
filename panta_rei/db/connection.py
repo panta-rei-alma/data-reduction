@@ -54,10 +54,25 @@ class DatabaseManager:
 
         For in-memory databases, returns the single persistent connection.
         For file databases, returns a new connection each call.
+
+        Sets ``timeout=30`` and ``PRAGMA busy_timeout=30000`` so concurrent
+        writers (e.g. multi-host calibration fan-out, the imaging
+        dispatcher's DBWriter thread + per-worker MARK_RUNNING events)
+        wait politely instead of crashing on ``database is locked``.
+        SQLite's busy handler retries silently up to the timeout; only
+        truly stuck contention surfaces as ``OperationalError``.
         """
         if self._memory_con is not None:
             return self._memory_con
-        return sqlite3.connect(self._db_path)
+        con = sqlite3.connect(self._db_path, timeout=30.0)
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.OperationalError:
+            # Best-effort — if PRAGMA fails for some reason, the
+            # ``timeout=30`` arg above still gives us 30s of polite
+            # retry on lock acquisition.
+            pass
+        return con
 
     def _bootstrap(self, con: sqlite3.Connection) -> None:
         """Run migration bootstrap: create schema_version, probe, apply."""

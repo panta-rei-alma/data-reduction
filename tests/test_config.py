@@ -64,6 +64,20 @@ class TestPipelineConfig:
         assert config.state_db_path == tmp_path / "2025.1.00383.L" / "alma_retrieval_state.sqlite3"
         assert config.targets_csv_path == tmp_path / "2025.1.00383.L" / "targets_by_array.csv"
 
+    def test_doubled_panta_rei_base_raises(self, tmp_path):
+        """Regression: passing project_dir as panta_rei_base must fail loudly.
+
+        Without this guard, ``data_dir = base / project / project`` silently
+        becomes a third nesting level when ``base`` already ends in
+        ``project_code``.  See the "two data layers" incident
+        (2026-05-01).
+        """
+        from panta_rei.core.errors import ConfigError
+        bad = tmp_path / "2025.1.00383.L"
+        bad.mkdir()
+        with pytest.raises(ConfigError, match="already ends in the project_code"):
+            PipelineConfig(panta_rei_base=bad)
+
     def test_cron_log_dir_default(self, tmp_path):
         config = PipelineConfig(panta_rei_base=tmp_path)
         assert config.cron_log_dir == tmp_path / "cron_logs"
