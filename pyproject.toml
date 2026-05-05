@@ -13,6 +13,7 @@ dependencies = [
     "numpy",
     "requests",
     "ghapi",
+    "spectral-cube",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,7 @@ panta-rei-migrate-db = "panta_rei.cli.migrate_db:main"
 panta-rei-imaging = "panta_rei.cli.run_imaging:main"
 panta-rei-imaging-dispatch = "panta_rei.cli.run_imaging_dispatch:main"
 panta-rei-contsub = "panta_rei.cli.run_contsub:main"
+panta-rei-moments = "panta_rei.cli.run_moments:main"
 
 [tool.setuptools.packages.find]
 include = ["panta_rei*"]
