@@ -208,10 +208,21 @@ def run_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
             )
             continue
 
-        # SPW resolution
+        # SPW resolution.  An MS that has the field but no science SPW
+        # near the target frequency is treated like a field-skip: the EB
+        # has nothing usable to contribute, so we drop it from the joint
+        # imaging input rather than failing the whole unit.  This is
+        # normal when an EB has the science SPW heavily flagged upstream
+        # (the ALMA pipeline strips OBSERVE_TARGET in that case), so
+        # joint imaging just proceeds with the surviving sibling EBs.
         spw = resolve_spw_for_ms(ms_path, tm_center)
         if spw is None:
-            return False, f"No matching SPW in {Path(ms_path).name} for center freq {tm_center/1e9:.3f} GHz"
+            log.info(
+                "No science SPW in %s near %.3f GHz — skipping "
+                "(EB likely has this SPW flagged or not observed)",
+                Path(ms_path).name, tm_center / 1e9,
+            )
+            continue
 
         kept_vis.append(ms_path)
         spw_sel.append(spw)
@@ -222,11 +233,29 @@ def run_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
         datacolumns.add(dc)
 
     if not kept_vis:
-        return False, f"Field '{unit.source_name}' not found in any MS"
+        return False, (
+            f"No MS has both field '{unit.source_name}' and a usable "
+            f"science SPW near {tm_center/1e9:.3f} GHz"
+        )
 
-    # Update the unit's vis lists to only include MSes with the field
+    # Update the unit's vis lists to only include MSes that survived
+    # field + SPW filtering.
     unit.vis_tm = [v for v in unit.vis_tm if v in kept_vis]
     unit.vis_sm = [v for v in unit.vis_sm if v in kept_vis]
+
+    # Joint imaging needs both arrays — if either is now empty, fail
+    # the unit with an explicit reason rather than letting tclean
+    # crash with an obscure "Data selection ended with 0 rows".
+    if not unit.vis_tm:
+        return False, (
+            f"No TM EB has both field '{unit.source_name}' and a usable "
+            f"science SPW near {tm_center/1e9:.3f} GHz"
+        )
+    if not unit.vis_sm:
+        return False, (
+            f"No SM EB has both field '{unit.source_name}' and a usable "
+            f"science SPW near {tm_center/1e9:.3f} GHz"
+        )
 
     unit.spw_selection = spw_sel
     unit.field_selection = field_sel

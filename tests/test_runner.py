@@ -206,8 +206,9 @@ class TestTrustedPreflight:
         assert len(basic_unit.field_selection) == 3
         assert basic_unit.datacolumn == "corrected"
 
-    def test_preflight_fails_on_missing_spw(self, basic_unit):
-        """If no SPW matches in an MS, preflight should fail."""
+    def test_preflight_fails_when_no_eb_has_spw(self, basic_unit):
+        """If every EB lacks a matching science SPW, preflight should fail
+        with a clear no-usable-SPW message (not 'field not found')."""
         mock_casatools = MagicMock()
         mock_msmd = MagicMock()
         import numpy as np
@@ -221,7 +222,118 @@ class TestTrustedPreflight:
             ok, msg = run_trusted_preflight(basic_unit)
 
         assert not ok
-        assert "No matching SPW" in msg
+        assert "usable" in msg and "SPW" in msg
+
+    def test_preflight_skips_ebs_without_spw(self, basic_unit):
+        """An EB that has the field but no matching science SPW (e.g. one
+        whose science SPW was fully flagged upstream and lost its
+        OBSERVE_TARGET intent) must be dropped from the joint imaging
+        input rather than failing the whole unit, as long as at least
+        one TM and one SM EB still survive."""
+        import numpy as np
+        mock_casatools = MagicMock()
+        mock_msmd = MagicMock()
+
+        # Per-MS behaviour: tm1.ms is the "buggy" EB whose science SPW
+        # is missing from OBSERVE_TARGET.  All other MSes have it.
+        path_state = {"current": None}
+
+        def open_path(p):
+            path_state["current"] = Path(p).name
+
+        def spws_side(_):
+            if path_state["current"] == "tm1.ms":
+                return np.array([])  # no science SPW flagged here
+            return np.array([1])
+
+        def chanfreqs_side(spw_id):
+            return np.linspace(86.0e9, 86.3e9, 960)
+
+        mock_msmd.open.side_effect = open_path
+        mock_msmd.spwsforintent.side_effect = spws_side
+        mock_msmd.chanfreqs.side_effect = chanfreqs_side
+        mock_msmd.fieldsforname.return_value = [0]
+        mock_casatools.msmetadata.return_value = mock_msmd
+
+        mock_tb = MagicMock()
+        mock_tb.colnames.return_value = ["DATA", "CORRECTED_DATA", "FLAG"]
+        mock_casatools.table.return_value = mock_tb
+
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=mock_casatools):
+            ok, msg = run_trusted_preflight(basic_unit)
+
+        assert ok, msg
+        # tm1.ms dropped; tm2.ms and sm1.ms survive.
+        assert basic_unit.vis_tm == ["/data/tm2.ms"]
+        assert basic_unit.vis_sm == ["/data/sm1.ms"]
+        assert basic_unit.spw_selection == ["1", "1"]
+        assert basic_unit.field_selection == ["SRC1", "SRC1"]
+
+    def test_preflight_fails_when_no_tm_eb_has_spw(self, basic_unit):
+        """If skip-on-miss leaves zero TM EBs, the unit must fail with
+        a clear TM-specific message — joint imaging needs both arrays."""
+        import numpy as np
+        mock_casatools = MagicMock()
+        mock_msmd = MagicMock()
+
+        path_state = {"current": None}
+
+        def open_path(p):
+            path_state["current"] = Path(p).name
+
+        def spws_side(_):
+            # Both TM EBs lack the science SPW; SM EB has it.
+            if path_state["current"].startswith("tm"):
+                return np.array([])
+            return np.array([1])
+
+        mock_msmd.open.side_effect = open_path
+        mock_msmd.spwsforintent.side_effect = spws_side
+        mock_msmd.chanfreqs.side_effect = lambda _: np.linspace(86.0e9, 86.3e9, 960)
+        mock_msmd.fieldsforname.return_value = [0]
+        mock_casatools.msmetadata.return_value = mock_msmd
+
+        mock_tb = MagicMock()
+        mock_tb.colnames.return_value = ["DATA", "CORRECTED_DATA", "FLAG"]
+        mock_casatools.table.return_value = mock_tb
+
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=mock_casatools):
+            ok, msg = run_trusted_preflight(basic_unit)
+
+        assert not ok
+        assert "No TM EB" in msg
+
+    def test_preflight_fails_when_no_sm_eb_has_spw(self, basic_unit):
+        """Symmetric SM-side check."""
+        import numpy as np
+        mock_casatools = MagicMock()
+        mock_msmd = MagicMock()
+
+        path_state = {"current": None}
+
+        def open_path(p):
+            path_state["current"] = Path(p).name
+
+        def spws_side(_):
+            if path_state["current"].startswith("sm"):
+                return np.array([])
+            return np.array([1])
+
+        mock_msmd.open.side_effect = open_path
+        mock_msmd.spwsforintent.side_effect = spws_side
+        mock_msmd.chanfreqs.side_effect = lambda _: np.linspace(86.0e9, 86.3e9, 960)
+        mock_msmd.fieldsforname.return_value = [0]
+        mock_casatools.msmetadata.return_value = mock_msmd
+
+        mock_tb = MagicMock()
+        mock_tb.colnames.return_value = ["DATA", "CORRECTED_DATA", "FLAG"]
+        mock_casatools.table.return_value = mock_tb
+
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=mock_casatools):
+            ok, msg = run_trusted_preflight(basic_unit)
+
+        assert not ok
+        assert "No SM EB" in msg
 
     def test_preflight_fails_on_missing_field(self, basic_unit):
         """If field name doesn't resolve in any MS, preflight should fail."""
@@ -237,7 +349,9 @@ class TestTrustedPreflight:
             ok, msg = run_trusted_preflight(basic_unit)
 
         assert not ok
-        assert "not found in any MS" in msg
+        # Field skips collapse to the same "no MS has both field and SPW"
+        # error since neither survives the per-EB filter.
+        assert "SRC1" in msg
 
     def test_preflight_always_uses_corrected(self, basic_unit):
         """Even if no CORRECTED_DATA, datacolumn should be 'corrected' (CASA falls back to data)."""
