@@ -30,6 +30,18 @@ _CUBE_SECTION_RE = re.compile(
 # Regex to detect the start of a tclean call
 _TCLEAN_START_RE = re.compile(r"^tclean\(")
 
+# Repair the dash-space artefact introduced by the multi-line tclean
+# assembler: when ``casa_commands.log`` line-wraps a hyphenated value
+# like ``auto-multithresh`` between the ``-`` and ``multithresh``, the
+# ``" ".join(stripped_lines)`` step in ``parse_tclean_calls`` produces
+# ``"auto- multithresh"``.  Collapse whitespace that sits between an
+# ASCII hyphen+letter boundary and another ASCII letter — narrow enough
+# that legitimate values containing hyphens followed by space-then-word
+# would never be touched (no such CASA tclean param value exists; all
+# affected enums are single hyphenated tokens like ``auto-multithresh``,
+# ``pb-based`` etc.).
+_HYPHEN_LINEBREAK_RE = re.compile(r"(?<=[A-Za-z])-\s+(?=[A-Za-z])")
+
 # Parameters that identify an iter1 (final) tclean call
 _ITER1_MARKERS = {"restoration": True, "pbcor": True}
 
@@ -211,12 +223,21 @@ def _normalize_string_values(params: dict) -> dict:
 
     The multi-line tclean parser joins lines with ``" ".join()``, which
     can introduce spaces inside string values when a value is split
-    across lines in ``casa_commands.log`` (e.g. ``'auto-\\nmultithresh'``
-    becomes ``'auto- multithresh'``).
+    across lines in ``casa_commands.log``.  Two cleanups happen here:
+
+    1. ``re.sub(_HYPHEN_LINEBREAK_RE, "-", v)`` rejoins hyphenated
+       identifiers that got split across a line break — e.g.
+       ``'auto-\\nmultithresh'`` → joined as ``'auto- multithresh'`` →
+       repaired to ``'auto-multithresh'``.  Without this, tclean
+       rejects ``usemask='auto- multithresh'`` with
+       ``{'usemask': ['unallowed value auto- multithresh']}``.
+    2. ``" ".join(v.split())`` collapses any other run of internal
+       whitespace into a single space.
     """
     cleaned = {}
     for k, v in params.items():
         if isinstance(v, str):
+            v = _HYPHEN_LINEBREAK_RE.sub("-", v)
             cleaned[k] = " ".join(v.split())
         else:
             cleaned[k] = v
