@@ -137,6 +137,54 @@ class TestExtractByFieldSpw:
         result = extract_by_field_spw(iter1)
         assert ("AG231.7986-1.9684", "23") in result
 
+    def test_repairs_dash_linebreak_in_usemask(self, tmp_path):
+        """When the multi-line tclean assembler line-wraps a hyphenated
+        value (e.g. 'auto-multithresh'), the resulting ' ' join produces
+        'auto- multithresh', which tclean rejects.  The post-parse
+        normalizer must rejoin it.
+
+        Reproduction: a real ALMA pipeline weblog from this project's
+        recovered/ tree shows ``usemask='auto-`` at the end of one line
+        and ``multithresh'`` at the start of the next.  This test pins
+        the repair behaviour."""
+        log_text = (
+            "# 2026-01-23 ... cube imaging\n"
+            "# hif_makeimlist(specmode='cube')\n"
+            "tclean(field='SRC1', spw=['23', '23'], specmode='cube', "
+            "usemask='auto-\n"
+            "multithresh', restoration=True, pbcor=True, "
+            "imagename='/x/SRC1.cube.iter1', niter=100)\n"
+        )
+        p = tmp_path / "casa_commands.log"
+        p.write_text(log_text)
+        calls = parse_tclean_calls(p)
+        iter1 = filter_cube_iter1_calls(calls, p)
+        result = extract_by_field_spw(iter1)
+
+        params = result.get(("SRC1", "23"))
+        assert params is not None, result
+        assert params["usemask"] == "auto-multithresh", repr(params["usemask"])
+
+    def test_normalize_preserves_unrelated_strings(self):
+        """The dash-space repair must only affect ``letter-WS-letter``;
+        legitimate strings containing hyphens or spaces are untouched."""
+        from panta_rei.imaging.recovery import _normalize_string_values
+        out = _normalize_string_values({
+            "specmode": "cube",
+            "outframe": "LSRK",
+            "weighting": "briggsbwtaper",
+            "usemask": "auto- multithresh",  # the bug we fix
+            "phasecenter": "ICRS 12:00:00.000 -30.00.00.000",  # has dash, no fix
+            "field": "AG231.7986-1.9684",  # source name with dash
+        })
+        assert out["usemask"] == "auto-multithresh"
+        # Numeric/space-after-dash patterns inside coords/names must not change:
+        assert out["phasecenter"] == "ICRS 12:00:00.000 -30.00.00.000"
+        assert out["field"] == "AG231.7986-1.9684"
+        # Unrelated values pass through with internal whitespace collapsed:
+        assert out["specmode"] == "cube"
+        assert out["weighting"] == "briggsbwtaper"
+
 
 # ---------------------------------------------------------------------------
 # find_casa_commands_log
