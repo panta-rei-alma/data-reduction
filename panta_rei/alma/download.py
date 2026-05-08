@@ -56,15 +56,28 @@ def retrieve_uids(alma: Alma, uids: List[str]) -> List[Path]:
     return paths
 
 
-def extract_single_tar(tar_path: Path, base_dir: Path) -> Tuple[int, int, bool]:
+def extract_single_tar(
+    tar_path: Path,
+    base_dir: Path,
+    *,
+    strip_top_level: Optional[str] = None,
+) -> Tuple[int, int, bool]:
     """Extract one tarball into *base_dir*.
+
+    *strip_top_level* is forwarded to :func:`safe_extract_tar` to
+    handle ALMA tarballs whose internal layout is
+    ``<project_code>/<sg>/<g>/<member>/…``.  Without stripping, those
+    cause the triple-nested ``…/<project>/<project>/<project>/<sg>/…``
+    layout when *base_dir* is the project's data_dir.
 
     Returns ``(extracted_count, skipped_count, ok)``.
     """
     log.info(f"Extracting {tar_path.name} -> {base_dir}")
     try:
         with tarfile.open(tar_path, "r") as tf:
-            extracted, skipped = safe_extract_tar(tf, base_dir)
+            extracted, skipped = safe_extract_tar(
+                tf, base_dir, strip_top_level=strip_top_level,
+            )
         log.info(f"Completed {tar_path.name}: extracted {extracted}, skipped {skipped}")
         return extracted, skipped, True
     except tarfile.TarError as e:
@@ -150,7 +163,12 @@ def retrieve_and_extract(
                 if tar_path.suffix.lower() != ".tar":
                     continue
                 uidc = extract_uid_from_path(tar_path.name) or "unknown"
-                extracted, skipped, ok = extract_single_tar(tar_path, base_dir)
+                # Strip the project_code top-level dir if the archive
+                # wraps everything under it — this avoids the
+                # triple-nesting issue (see safe_extract_tar docstring).
+                extracted, skipped, ok = extract_single_tar(
+                    tar_path, base_dir, strip_top_level=project_code,
+                )
                 if ok:
                     tar_deleted = False
                     try:
