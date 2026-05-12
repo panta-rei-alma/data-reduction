@@ -34,7 +34,9 @@ def test_derive_output_paths_default_products(tmp_path: Path):
     out = derive_output_paths(cube, analysis)
 
     assert set(out) == set(PRODUCT_KINDS)
-    expected_dir = analysis / "group.uid___A001_X3833_X64b9.lp_nperetto"
+    expected_dir = (
+        analysis / "group.uid___A001_X3833_X64b9.lp_nperetto" / "fits"
+    )
     base = (
         "group.uid___A001_X3833_X64b9.lp_nperetto.AG221.12m7m."
         "102.5-102.6GHz.cube.pbcor"
@@ -226,6 +228,7 @@ def test_process_cube_writes_three_products(synthetic_cube):
     for kind in PRODUCT_KINDS:
         out = (
             synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
+            / "fits"
             / f"{synthetic_cube['cube_path'].name[:-len('.fits')]}.{kind}.fits"
         )
         assert out.exists(), f"missing: {out}"
@@ -242,12 +245,13 @@ def test_process_cube_writes_plot_pngs(synthetic_cube):
     assert set(res.products) == expected, res.products
     assert all(s == "written" for s in res.products.values()), res.products
 
-    out_dir = (
-        synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
+    png_dir = (
+        synthetic_cube["analysis_dir"]
+        / synthetic_cube["cube_path"].parent.name / "png"
     )
     base = synthetic_cube["cube_path"].name[: -len(".fits")]
     for kind in PRODUCT_KINDS:
-        png = out_dir / f"{base}.{kind}.png"
+        png = png_dir / f"{base}.{kind}.png"
         assert png.exists(), f"missing plot: {png}"
         # PNG signature is the first eight bytes of the file.
         assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
@@ -293,7 +297,8 @@ def test_peak_and_moment_have_correct_shapes_and_values(synthetic_cube):
     )
     base = synthetic_cube["cube_path"].name[:-len(".fits")]
     out_dir = (
-        synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
+        synthetic_cube["analysis_dir"]
+        / synthetic_cube["cube_path"].parent.name / "fits"
     )
 
     peak = fits.getdata(out_dir / f"{base}.peak_intensity.fits")
@@ -317,7 +322,7 @@ def test_mean_spectrum_has_correct_length_and_columns(synthetic_cube):
     base = synthetic_cube["cube_path"].name[:-len(".fits")]
     spec_path = (
         synthetic_cube["analysis_dir"]
-        / synthetic_cube["cube_path"].parent.name
+        / synthetic_cube["cube_path"].parent.name / "fits"
         / f"{base}.mean_spectrum.fits"
     )
     with fits.open(spec_path) as hdul:
@@ -338,7 +343,8 @@ def test_provenance_keywords_in_outputs(synthetic_cube):
     )
     base = synthetic_cube["cube_path"].name[:-len(".fits")]
     out_dir = (
-        synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
+        synthetic_cube["analysis_dir"]
+        / synthetic_cube["cube_path"].parent.name / "fits"
     )
     for kind in ("integrated_intensity", "peak_intensity"):
         with fits.open(out_dir / f"{base}.{kind}.fits") as hdul:
