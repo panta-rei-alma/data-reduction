@@ -474,7 +474,9 @@ def _human_source_label(cube_fits: Path) -> str | None:
         lambda m: {"p": "+", "m": "-"}[m.group(1)],
         sanitized,
     )
-    return f"{source} | {float(n_match.group('lo')):.3f}-{float(n_match.group('hi')):.3f} GHz"
+    # Keep the freq range exactly as it appears in the cube filename
+    # (e.g. ``102.5-102.6``) so the title matches the filename literally.
+    return f"{source} | {n_match.group('lo')}-{n_match.group('hi')} GHz"
 
 
 def discover_cubes(
