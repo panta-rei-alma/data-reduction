@@ -19,6 +19,7 @@ from pathlib import Path
 
 from panta_rei.analysis.moments import (
     CUBE_GLOB,
+    DEFAULT_ARRAY_COMBOS,
     PRODUCT_KINDS,
     discover_cubes,
     process_cube,
@@ -56,8 +57,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
+        "--array-combo", action="append", default=None, metavar="COMBO",
+        help=(
+            "Array-combination token to include, matched as '.<combo>.' "
+            "in the cube filename (repeatable). Default: "
+            f"{','.join(DEFAULT_ARRAY_COMBOS)}. "
+            "Pass 'all' to disable the array-combo filter."
+        ),
+    )
+    ap.add_argument(
         "--match", default=None, metavar="REGEX",
-        help="Regex filter on cube filename (e.g. '12m7mTP' or '102\\.5')",
+        help="Regex filter on cube filename (e.g. '102\\.5' or 'AG221')",
     )
     ap.add_argument(
         "--products", nargs="+", default=list(PRODUCT_KINDS),
@@ -206,19 +216,28 @@ def main() -> int:
         logger.error("imaging dir does not exist: %s", imaging_dir)
         return 2
 
-    cubes = discover_cubes(imaging_dir, args.group)
+    combos_arg = args.array_combo if args.array_combo is not None else list(DEFAULT_ARRAY_COMBOS)
+    array_combos: tuple[str, ...] | None
+    if any(c.lower() == "all" for c in combos_arg):
+        array_combos = None
+    else:
+        array_combos = tuple(combos_arg)
+
+    cubes = discover_cubes(imaging_dir, args.group, array_combos=array_combos)
     cubes = _filter_cubes(cubes, args.match, args.limit)
     if not cubes:
         logger.warning(
-            "No cubes matched (imaging_dir=%s, group=%s, match=%r)",
-            imaging_dir, args.group, args.match,
+            "No cubes matched (imaging_dir=%s, group=%s, array_combos=%s, match=%r)",
+            imaging_dir, args.group, array_combos, args.match,
         )
         return 0
 
     logger.info(
-        "Processing %d cube(s) -> %s [products=%s, spectral_unit=%s, "
-        "force=%s, dry_run=%s, jobs=%d]",
-        len(cubes), analysis_dir, ",".join(args.products),
+        "Processing %d cube(s) -> %s [array_combos=%s, products=%s, "
+        "spectral_unit=%s, force=%s, dry_run=%s, jobs=%d]",
+        len(cubes), analysis_dir,
+        ",".join(array_combos) if array_combos else "all",
+        ",".join(args.products),
         args.spectral_unit, args.force, args.dry_run, args.jobs,
     )
 

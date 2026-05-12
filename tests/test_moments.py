@@ -101,11 +101,11 @@ def test_discover_cubes_filters(tmp_path: Path):
     g2 = imaging / "group.uid___A001_X3833_X64c0.lp_nperetto"
     g1.mkdir(parents=True)
     g2.mkdir(parents=True)
-    (g1 / "a.cube.pbcor.fits").write_bytes(b"")
-    (g1 / "b.cube.pbcor.fits").write_bytes(b"")
-    (g2 / "c.cube.pbcor.fits").write_bytes(b"")
+    (g1 / "a.12m7mTP.cube.pbcor.fits").write_bytes(b"")
+    (g1 / "b.12m7mTP.cube.pbcor.fits").write_bytes(b"")
+    (g2 / "c.12m7mTP.cube.pbcor.fits").write_bytes(b"")
     # ignored: not a *.cube.pbcor.fits
-    (g1 / "a.cube.residual.fits").write_bytes(b"")
+    (g1 / "a.12m7mTP.cube.residual.fits").write_bytes(b"")
 
     all_cubes = discover_cubes(imaging)
     assert len(all_cubes) == 3
@@ -113,6 +113,40 @@ def test_discover_cubes_filters(tmp_path: Path):
     just_g1 = discover_cubes(imaging, group_filters=["X64b9"])
     assert {c.parent.name for c in just_g1} == {g1.name}
     assert len(just_g1) == 2
+
+
+def test_discover_cubes_array_combo_default_excludes_bare_12m7m(tmp_path: Path):
+    """Default filter keeps 12m7mTP but rejects the bare 12m7m product."""
+    imaging = tmp_path / "imaging" / "output"
+    g = imaging / "group.uid___A001_X3833_X64b9.lp_nperetto"
+    g.mkdir(parents=True)
+    tp = g / "src.AG.12m7mTP.86-86.GHz.cube.pbcor.fits"
+    bare = g / "src.AG.12m7m.86-86.GHz.cube.pbcor.fits"
+    tp.write_bytes(b"")
+    bare.write_bytes(b"")
+
+    found = discover_cubes(imaging)
+    assert [c.name for c in found] == [tp.name]
+
+
+def test_discover_cubes_array_combo_override(tmp_path: Path):
+    """Explicit override lets callers select the bare 12m7m product."""
+    imaging = tmp_path / "imaging" / "output"
+    g = imaging / "group.uid___A001_X3833_X64b9.lp_nperetto"
+    g.mkdir(parents=True)
+    tp = g / "src.AG.12m7mTP.86-86.GHz.cube.pbcor.fits"
+    bare = g / "src.AG.12m7m.86-86.GHz.cube.pbcor.fits"
+    tp.write_bytes(b"")
+    bare.write_bytes(b"")
+
+    only_bare = discover_cubes(imaging, array_combos=["12m7m"])
+    assert [c.name for c in only_bare] == [bare.name]
+
+    both = discover_cubes(imaging, array_combos=["12m7m", "12m7mTP"])
+    assert {c.name for c in both} == {tp.name, bare.name}
+
+    no_filter = discover_cubes(imaging, array_combos=None)
+    assert {c.name for c in no_filter} == {tp.name, bare.name}
 
 
 # ---------- end-to-end with a synthetic cube ----------

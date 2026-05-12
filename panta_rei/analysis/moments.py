@@ -37,6 +37,11 @@ PRODUCT_KINDS: tuple[str, ...] = (
 
 CUBE_GLOB = "*.cube.pbcor.fits"
 
+# Array-combination tokens we consider QA-worthy. Only the feathered
+# (12m+7m+TP) product is included by default — the bare 12m+7m cube is
+# an intermediate and its mosaic is what the joint imaging step ships.
+DEFAULT_ARRAY_COMBOS: tuple[str, ...] = ("12m7mTP",)
+
 
 @dataclass
 class CubeResult:
@@ -329,11 +334,18 @@ def process_cube(
 def discover_cubes(
     imaging_dir: Path,
     group_filters: Iterable[str] | None = None,
+    array_combos: Iterable[str] | None = DEFAULT_ARRAY_COMBOS,
 ) -> list[Path]:
     """List ``*.cube.pbcor.fits`` files under ``imaging_dir``'s group dirs.
 
     ``group_filters`` is an optional iterable of substrings; a group dir
     is included if its name contains any of them (case-sensitive).
+
+    ``array_combos`` selects which array-combination products to keep,
+    matched as the dot-bounded token ``.<combo>.`` in the filename. The
+    dot bounding matters: a bare ``12m7m`` substring also appears inside
+    ``12m7mTP`` filenames, so substring matching would collapse the two.
+    Pass ``None`` (or an empty iterable) to skip this filter.
     """
     cubes = sorted(imaging_dir.glob(f"group.*.lp_nperetto/{CUBE_GLOB}"))
     filters = list(group_filters or [])
@@ -342,4 +354,8 @@ def discover_cubes(
             c for c in cubes
             if any(f in c.parent.name for f in filters)
         ]
+    combos = list(array_combos or [])
+    if combos:
+        tokens = tuple(f".{c}." for c in combos)
+        cubes = [c for c in cubes if any(t in c.name for t in tokens)]
     return cubes
