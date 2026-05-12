@@ -65,17 +65,18 @@ def derive_output_paths(
     analysis_dir: Path,
     products: Iterable[str] = PRODUCT_KINDS,
 ) -> dict[str, Path]:
-    """Map a cube path to its output products, mirroring the group-dir layout.
+    """Map a cube path to its output FITS products.
 
-    ``cube_fits`` is expected at
-    ``<imaging_dir>/<group_dir>/<basename>.fits``.
-    Returned paths land under ``<analysis_dir>/<group_dir>/``.
+    Layout: ``<analysis_dir>/<group_dir>/fits/<basename>.<kind>.fits``.
+    The ``fits/`` partition separates FITS from PNGs at the group level
+    so collaborators (and Globus sync rules) can target either format
+    cleanly. Product kind is encoded in the filename suffix.
     """
     group_dir = cube_fits.parent.name
     if not cube_fits.name.endswith(".fits"):
         raise ValueError(f"expected .fits suffix, got {cube_fits.name}")
     stem = cube_fits.name[: -len(".fits")]
-    target_dir = analysis_dir / group_dir
+    target_dir = analysis_dir / group_dir / "fits"
     return {kind: target_dir / f"{stem}.{kind}.fits" for kind in products}
 
 
@@ -84,12 +85,15 @@ def derive_plot_paths(
     analysis_dir: Path,
     products: Iterable[str] = PRODUCT_KINDS,
 ) -> dict[str, Path]:
-    """PNG plot paths, parallel to :func:`derive_output_paths`."""
+    """PNG plot paths, parallel to :func:`derive_output_paths`.
+
+    Layout: ``<analysis_dir>/<group_dir>/png/<basename>.<kind>.png``.
+    """
     group_dir = cube_fits.parent.name
     if not cube_fits.name.endswith(".fits"):
         raise ValueError(f"expected .fits suffix, got {cube_fits.name}")
     stem = cube_fits.name[: -len(".fits")]
-    target_dir = analysis_dir / group_dir
+    target_dir = analysis_dir / group_dir / "png"
     return {kind: target_dir / f"{stem}.{kind}.png" for kind in products}
 
 
