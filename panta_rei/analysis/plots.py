@@ -4,6 +4,9 @@ Outputs are PNGs alongside the FITS products. The Jy/beam → K conversion
 uses ``radio_beam.Beam.jtok``: a single-frequency scalar (evaluated at
 ``RESTFRQ``) for the 2D moment maps, and per-channel jtok for spectra.
 
+All plots are for the feathered 12m+7m+TP product; the title carries a
+``12m7mTP`` tag so the array combination is visible at a glance.
+
 Matplotlib's Agg backend is selected on import so workers can render in
 ProcessPoolExecutor children without a display.
 """
@@ -27,9 +30,9 @@ from astropy.wcs import WCS  # noqa: E402
 logger = logging.getLogger(__name__)
 
 # Colour conventions per QA spec.
-COLOR_FEATHERED = "firebrick"
-COLOR_TP = "cornflowerblue"
+COLOR_SPECTRUM = "cornflowerblue"
 CMAP_MOMENT = "inferno"
+ARRAY_TAG = "12m7mTP"
 
 
 def _resolve_beam_for_scalar(cube):
@@ -181,7 +184,7 @@ def plot_moment_map(
         )
         fig.colorbar(im, ax=ax, label=cbar_label, fraction=0.046, pad=0.04)
 
-        title = title_kind
+        title = f"{ARRAY_TAG} — {title_kind}"
         if source_label:
             title = f"{title} — {source_label}"
         ax.set_title(title, fontsize=10)
@@ -197,15 +200,12 @@ def plot_mean_spectrum(
     cube,
     out_path: Path,
     *,
-    tp_values_jy: np.ndarray | None = None,
-    tp_cube=None,
     source_label: str | None = None,
 ) -> None:
-    """Plot the 12m7mTP mean spectrum in K vs GHz, with optional TP overlay.
+    """Plot the 12m7mTP mean spectrum in K vs GHz.
 
     ``values_jy`` is the unweighted spatial mean per channel in Jy/beam
-    (the same array written to the BinTable FITS). The TP overlay is
-    drawn only when both ``tp_values_jy`` and ``tp_cube`` are provided.
+    (the same array written to the BinTable FITS).
     """
     freq_hz = cube_frequency_axis_hz(cube)
     factor = jtok_per_channel(cube, freq_hz)
@@ -214,28 +214,15 @@ def plot_mean_spectrum(
 
     fig, ax = plt.subplots(figsize=(8.0, 4.5))
     try:
-        ax.plot(
-            freq_ghz, spec_k,
-            color=COLOR_FEATHERED, linewidth=1.5,
-            label="12m+7m+TP",
-        )
-
-        if tp_values_jy is not None and tp_cube is not None:
-            tp_freq_hz = cube_frequency_axis_hz(tp_cube)
-            tp_factor = jtok_per_channel(tp_cube, tp_freq_hz)
-            tp_spec_k = np.asarray(tp_values_jy, dtype=np.float64) * tp_factor
-            ax.plot(
-                tp_freq_hz / 1e9, tp_spec_k,
-                color=COLOR_TP, linewidth=1.5, linestyle="--", label="TP only",
-            )
-
+        ax.plot(freq_ghz, spec_k, color=COLOR_SPECTRUM, linewidth=1.5)
         ax.set_xlabel("Frequency (GHz)")
         ax.set_ylabel(r"Brightness Temperature (K)")
         ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.5)
-        ax.legend(loc="upper right")
 
+        title = f"{ARRAY_TAG} — Mean spectrum"
         if source_label:
-            ax.set_title(source_label, fontsize=10)
+            title = f"{title} — {source_label}"
+        ax.set_title(title, fontsize=10)
 
         fig.tight_layout()
         _atomic_savefig(fig, out_path)

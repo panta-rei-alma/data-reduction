@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -290,18 +291,12 @@ def process_cube(
     force: bool = False,
     dry_run: bool = False,
     plot: bool = True,
-    project_dir: Path | None = None,
-    targets_csv: Path | None = None,
 ) -> CubeResult:
     """Generate the requested products for a single cube.
 
     Catches per-cube exceptions, logs, and returns ``failed:<reason>``
-    entries; never raises.
-
-    When ``plot=True`` a PNG accompanies each FITS product. For the
-    mean-spectrum plot the corresponding TP cube is looked up via
-    ``project_dir`` + ``targets_csv``; if either is omitted, the spectrum
-    plot is drawn without the TP overlay.
+    entries; never raises. When ``plot=True`` a PNG accompanies each
+    FITS product.
     """
     products = tuple(products)
     out_paths = derive_output_paths(cube_fits, analysis_dir, products)
@@ -436,16 +431,12 @@ def process_cube(
                 )
                 spec_vals = None
         if spec_vals is not None:
-            tp_values, tp_cube_obj = _load_tp_overlay(
-                cube_fits, project_dir, targets_csv, spectral_unit,
-            )
             from panta_rei.analysis.plots import plot_mean_spectrum
             _maybe_plot(
                 "mean_spectrum", plots_needed["mean_spectrum"],
                 cube_fits, force,
                 lambda: plot_mean_spectrum(
                     spec_vals, cube, plots_needed["mean_spectrum"],
-                    tp_values_jy=tp_values, tp_cube=tp_cube_obj,
                     source_label=source_label,
                 ),
                 statuses,
@@ -462,54 +453,28 @@ def _safe_call(fn, cube):
         return None
 
 
+_FEATHERED_NAME_RE = re.compile(
+    r"\.lp_nperetto\.(?P<src>.+?)\.12m7mTP\."
+    r"(?P<lo>[\d.]+)-(?P<hi>[\d.]+)GHz\.cube\.pbcor\.fits$"
+)
+
+
 def _human_source_label(cube_fits: Path) -> str | None:
-    """Short label for the plot title — best-effort, ``None`` on parse failure."""
-    try:
-        from panta_rei.analysis.tp_lookup import (
-            desanitize_source_name,
-            parse_feathered_filename,
-        )
+    """Short label for the plot title — best-effort, ``None`` on parse failure.
 
-        parsed = parse_feathered_filename(cube_fits)
-        return (
-            f"{desanitize_source_name(parsed['source_sanitized'])}  "
-            f"{parsed['freq_lo_ghz']:.3f}–{parsed['freq_hi_ghz']:.3f} GHz"
-        )
-    except Exception:
-        return None
-
-
-def _load_tp_overlay(
-    cube_fits: Path,
-    project_dir: Path | None,
-    targets_csv: Path | None,
-    spectral_unit: str,
-):
-    """Resolve and load the TP cube + mean spectrum.
-
-    Returns ``(values, cube)`` or ``(None, None)`` if the TP cube can't
-    be located or fails to load. Failures here never propagate — the
-    spectrum plot just renders without the TP overlay.
+    Format: ``<source>  <lo>-<hi> GHz`` (e.g. ``AG221.9599-1.9932  102.500-102.600 GHz``).
+    The source name is de-sanitised (numeric-context ``p``/``m`` → ``+``/``-``).
     """
-    if project_dir is None or targets_csv is None:
-        logger.debug("TP overlay: project_dir or targets_csv not provided")
-        return None, None
-    try:
-        from panta_rei.analysis.tp_lookup import find_tp_cube_for_feathered
-
-        tp_path = find_tp_cube_for_feathered(cube_fits, project_dir, targets_csv)
-    except Exception as exc:  # pragma: no cover
-        logger.warning("TP overlay lookup failed: %s", exc)
-        return None, None
-    if tp_path is None:
-        return None, None
-    try:
-        tp_cube = load_cube(tp_path, spectral_unit=spectral_unit)
-        tp_values, _, _ = compute_mean_spectrum(tp_cube)
-    except Exception as exc:  # pragma: no cover
-        logger.warning("TP overlay: failed to load %s: %s", tp_path, exc)
-        return None, None
-    return tp_values, tp_cube
+    n_match = _FEATHERED_NAME_RE.search(cube_fits.name)
+    if n_match is None:
+        return None
+    sanitized = n_match.group("src")
+    source = re.sub(
+        r"(?<=\d)([pm])(?=\d)",
+        lambda m: {"p": "+", "m": "-"}[m.group(1)],
+        sanitized,
+    )
+    return f"{source}  {float(n_match.group('lo')):.3f}-{float(n_match.group('hi')):.3f} GHz"
 
 
 def discover_cubes(

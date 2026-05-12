@@ -17,11 +17,6 @@ from panta_rei.analysis.moments import (
     needs_regeneration,
     process_cube,
 )
-from panta_rei.analysis.tp_lookup import (
-    desanitize_source_name,
-    lookup_tp_mous_id,
-    parse_feathered_filename,
-)
 
 
 # ---------- pure-Python helpers ----------
@@ -132,43 +127,6 @@ def test_discover_cubes_array_combo_default_excludes_bare_12m7m(tmp_path: Path):
 
     found = discover_cubes(imaging)
     assert [c.name for c in found] == [tp.name]
-
-
-def test_parse_feathered_filename_extracts_tokens(tmp_path: Path):
-    group_dir = tmp_path / "group.uid___A001_X3833_X64b9.lp_nperetto"
-    group_dir.mkdir(parents=True)
-    cube = group_dir / (
-        "group.uid___A001_X3833_X64b9.lp_nperetto.AG221.9599m1.9932."
-        "12m7mTP.102.5-102.6GHz.cube.pbcor.fits"
-    )
-    cube.write_bytes(b"")
-    parsed = parse_feathered_filename(cube)
-    assert parsed["gous_id"] == "X3833_X64b9"
-    assert parsed["source_sanitized"] == "AG221.9599m1.9932"
-    assert parsed["freq_lo_ghz"] == pytest.approx(102.5)
-    assert parsed["freq_hi_ghz"] == pytest.approx(102.6)
-
-
-def test_desanitize_source_name_round_trip():
-    # Only numeric-context p/m are swapped; alphabetic tokens are untouched.
-    assert desanitize_source_name("AG221.9599m1.9932") == "AG221.9599-1.9932"
-    assert desanitize_source_name("G034.997p0.330") == "G034.997+0.330"
-    # 'AG' is preserved (the 'G' is not numeric-bounded).
-    assert desanitize_source_name("AG221.0p0.0").startswith("AG")
-
-
-def test_lookup_tp_mous_id_reads_targets_csv(tmp_path: Path):
-    csv_path = tmp_path / "targets_by_array.csv"
-    csv_path.write_text(
-        "source_name,array,sb_name,sgous_id,gous_id,mous_ids,Line group\n"
-        "AG221.9599-1.9932,SM,sb,sg,X3833_X64b9,X3833_X64bc,LG\n"
-        "AG221.9599-1.9932,TM,sb,sg,X3833_X64b9,X3833_X64ba,LG\n"
-        "AG221.9599-1.9932,TP,sb,sg,X3833_X64b9,X3833_X64be,LG\n"
-    )
-    tp = lookup_tp_mous_id(csv_path, "X3833_X64b9", "AG221.9599-1.9932")
-    assert tp == "X3833_X64be"
-    assert lookup_tp_mous_id(csv_path, "X3833_X64b9", "NOPE") is None
-    assert lookup_tp_mous_id(csv_path, "WRONG_GOUS", "AG221.9599-1.9932") is None
 
 
 def test_discover_cubes_array_combo_override(tmp_path: Path):

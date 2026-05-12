@@ -92,18 +92,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--plots", action=argparse.BooleanOptionalAction, default=True,
         help=(
-            "Render PNGs alongside each FITS product (default on). The "
-            "spectrum plot overlays the matching TP cube's mean spectrum "
-            "when it can be located via the targets CSV. Use --no-plots "
-            "to disable plotting."
-        ),
-    )
-    ap.add_argument(
-        "--targets-csv", default=None,
-        help=(
-            "Override path to targets_by_array.csv (default: "
-            "<base-dir>/targets_by_array.csv). Used to resolve TP MOUS "
-            "ids for the spectrum overlay."
+            "Render PNGs alongside each FITS product (default on). "
+            "Use --no-plots to disable plotting."
         ),
     )
     ap.add_argument(
@@ -180,10 +170,7 @@ def _summarize(results: list, total: int) -> tuple[int, int, int]:
     return n_written, n_skipped, n_failed
 
 
-def _run_serial(
-    cubes, analysis_dir, products, spectral_unit, force, dry_run,
-    plot, project_dir, targets_csv,
-):
+def _run_serial(cubes, analysis_dir, products, spectral_unit, force, dry_run, plot):
     results = []
     for cube_fits in cubes:
         result = process_cube(
@@ -194,16 +181,13 @@ def _run_serial(
             force=force,
             dry_run=dry_run,
             plot=plot,
-            project_dir=project_dir,
-            targets_csv=targets_csv,
         )
         results.append(result)
     return results
 
 
 def _run_parallel(
-    cubes, analysis_dir, products, spectral_unit, force, dry_run, jobs,
-    plot, project_dir, targets_csv,
+    cubes, analysis_dir, products, spectral_unit, force, dry_run, jobs, plot,
 ):
     results = []
     with ProcessPoolExecutor(max_workers=jobs) as pool:
@@ -217,8 +201,6 @@ def _run_parallel(
                 force=force,
                 dry_run=dry_run,
                 plot=plot,
-                project_dir=project_dir,
-                targets_csv=targets_csv,
             ): cube_fits
             for cube_fits in cubes
         }
@@ -271,28 +253,15 @@ def main() -> int:
     )
 
     products = tuple(args.products)
-    project_dir = base_dir
-    targets_csv = (
-        Path(args.targets_csv).resolve() if args.targets_csv
-        else project_dir / "targets_by_array.csv"
-    )
-    if args.plots and not targets_csv.is_file():
-        logger.warning(
-            "targets CSV not found at %s; spectrum plots will omit the TP overlay",
-            targets_csv,
-        )
-
     if args.jobs <= 1:
         results = _run_serial(
             cubes, analysis_dir, products, args.spectral_unit,
-            args.force, args.dry_run,
-            args.plots, project_dir, targets_csv,
+            args.force, args.dry_run, args.plots,
         )
     else:
         results = _run_parallel(
             cubes, analysis_dir, products, args.spectral_unit,
-            args.force, args.dry_run, args.jobs,
-            args.plots, project_dir, targets_csv,
+            args.force, args.dry_run, args.jobs, args.plots,
         )
 
     _, _, n_failed = _summarize(results, len(cubes))
