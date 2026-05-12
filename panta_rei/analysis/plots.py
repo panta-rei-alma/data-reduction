@@ -184,9 +184,9 @@ def plot_moment_map(
         )
         fig.colorbar(im, ax=ax, label=cbar_label, fraction=0.046, pad=0.04)
 
-        title = f"{ARRAY_TAG} — {title_kind}"
+        title = f"{ARRAY_TAG} | {title_kind}"
         if source_label:
-            title = f"{title} — {source_label}"
+            title = f"{title} | {source_label}"
         ax.set_title(title, fontsize=10)
 
         fig.tight_layout()
@@ -219,9 +219,9 @@ def plot_mean_spectrum(
         ax.set_ylabel(r"Brightness Temperature (K)")
         ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.5)
 
-        title = f"{ARRAY_TAG} — Mean spectrum"
+        title = f"{ARRAY_TAG} | Mean spectrum"
         if source_label:
-            title = f"{title} — {source_label}"
+            title = f"{title} | {source_label}"
         ax.set_title(title, fontsize=10)
 
         fig.tight_layout()

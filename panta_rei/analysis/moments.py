@@ -474,7 +474,7 @@ def _human_source_label(cube_fits: Path) -> str | None:
         lambda m: {"p": "+", "m": "-"}[m.group(1)],
         sanitized,
     )
-    return f"{source}  {float(n_match.group('lo')):.3f}-{float(n_match.group('hi')):.3f} GHz"
+    return f"{source} | {float(n_match.group('lo')):.3f}-{float(n_match.group('hi')):.3f} GHz"
 
 
 def discover_cubes(
