@@ -17,6 +17,11 @@ from panta_rei.analysis.moments import (
     needs_regeneration,
     process_cube,
 )
+from panta_rei.analysis.tp_lookup import (
+    desanitize_source_name,
+    lookup_tp_mous_id,
+    parse_feathered_filename,
+)
 
 
 # ---------- pure-Python helpers ----------
@@ -129,6 +134,43 @@ def test_discover_cubes_array_combo_default_excludes_bare_12m7m(tmp_path: Path):
     assert [c.name for c in found] == [tp.name]
 
 
+def test_parse_feathered_filename_extracts_tokens(tmp_path: Path):
+    group_dir = tmp_path / "group.uid___A001_X3833_X64b9.lp_nperetto"
+    group_dir.mkdir(parents=True)
+    cube = group_dir / (
+        "group.uid___A001_X3833_X64b9.lp_nperetto.AG221.9599m1.9932."
+        "12m7mTP.102.5-102.6GHz.cube.pbcor.fits"
+    )
+    cube.write_bytes(b"")
+    parsed = parse_feathered_filename(cube)
+    assert parsed["gous_id"] == "X3833_X64b9"
+    assert parsed["source_sanitized"] == "AG221.9599m1.9932"
+    assert parsed["freq_lo_ghz"] == pytest.approx(102.5)
+    assert parsed["freq_hi_ghz"] == pytest.approx(102.6)
+
+
+def test_desanitize_source_name_round_trip():
+    # Only numeric-context p/m are swapped; alphabetic tokens are untouched.
+    assert desanitize_source_name("AG221.9599m1.9932") == "AG221.9599-1.9932"
+    assert desanitize_source_name("G034.997p0.330") == "G034.997+0.330"
+    # 'AG' is preserved (the 'G' is not numeric-bounded).
+    assert desanitize_source_name("AG221.0p0.0").startswith("AG")
+
+
+def test_lookup_tp_mous_id_reads_targets_csv(tmp_path: Path):
+    csv_path = tmp_path / "targets_by_array.csv"
+    csv_path.write_text(
+        "source_name,array,sb_name,sgous_id,gous_id,mous_ids,Line group\n"
+        "AG221.9599-1.9932,SM,sb,sg,X3833_X64b9,X3833_X64bc,LG\n"
+        "AG221.9599-1.9932,TM,sb,sg,X3833_X64b9,X3833_X64ba,LG\n"
+        "AG221.9599-1.9932,TP,sb,sg,X3833_X64b9,X3833_X64be,LG\n"
+    )
+    tp = lookup_tp_mous_id(csv_path, "X3833_X64b9", "AG221.9599-1.9932")
+    assert tp == "X3833_X64be"
+    assert lookup_tp_mous_id(csv_path, "X3833_X64b9", "NOPE") is None
+    assert lookup_tp_mous_id(csv_path, "WRONG_GOUS", "AG221.9599-1.9932") is None
+
+
 def test_discover_cubes_array_combo_override(tmp_path: Path):
     """Explicit override lets callers select the bare 12m7m product."""
     imaging = tmp_path / "imaging" / "output"
@@ -218,12 +260,12 @@ def test_process_cube_writes_three_products(synthetic_cube):
     res = process_cube(
         synthetic_cube["cube_path"],
         synthetic_cube["analysis_dir"],
+        plot=False,
     )
     assert set(res.products) == set(PRODUCT_KINDS)
     assert all(s == "written" for s in res.products.values()), res.products
 
     for kind in PRODUCT_KINDS:
-        path = res.cube.parent  # reused below for sanity
         out = (
             synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
             / f"{synthetic_cube['cube_path'].name[:-len('.fits')]}.{kind}.fits"
@@ -231,17 +273,46 @@ def test_process_cube_writes_three_products(synthetic_cube):
         assert out.exists(), f"missing: {out}"
 
 
+def test_process_cube_writes_plot_pngs(synthetic_cube):
+    res = process_cube(
+        synthetic_cube["cube_path"],
+        synthetic_cube["analysis_dir"],
+        plot=True,
+    )
+    # All FITS + all plot entries written.
+    expected = set(PRODUCT_KINDS) | {f"plot:{k}" for k in PRODUCT_KINDS}
+    assert set(res.products) == expected, res.products
+    assert all(s == "written" for s in res.products.values()), res.products
+
+    out_dir = (
+        synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
+    )
+    base = synthetic_cube["cube_path"].name[: -len(".fits")]
+    for kind in PRODUCT_KINDS:
+        png = out_dir / f"{base}.{kind}.png"
+        assert png.exists(), f"missing plot: {png}"
+        # PNG signature is the first eight bytes of the file.
+        assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
 def test_process_cube_idempotent_skip_on_rerun(synthetic_cube):
-    process_cube(synthetic_cube["cube_path"], synthetic_cube["analysis_dir"])
-    res2 = process_cube(synthetic_cube["cube_path"], synthetic_cube["analysis_dir"])
+    process_cube(
+        synthetic_cube["cube_path"], synthetic_cube["analysis_dir"], plot=False,
+    )
+    res2 = process_cube(
+        synthetic_cube["cube_path"], synthetic_cube["analysis_dir"], plot=False,
+    )
     assert all(s == "skipped" for s in res2.products.values()), res2.products
 
 
 def test_process_cube_force_rewrites(synthetic_cube):
-    process_cube(synthetic_cube["cube_path"], synthetic_cube["analysis_dir"])
+    process_cube(
+        synthetic_cube["cube_path"], synthetic_cube["analysis_dir"], plot=False,
+    )
     res2 = process_cube(
         synthetic_cube["cube_path"],
         synthetic_cube["analysis_dir"],
+        plot=False,
         force=True,
     )
     assert all(s == "written" for s in res2.products.values()), res2.products
@@ -251,6 +322,7 @@ def test_process_cube_dry_run_writes_nothing(synthetic_cube):
     res = process_cube(
         synthetic_cube["cube_path"],
         synthetic_cube["analysis_dir"],
+        plot=False,
         dry_run=True,
     )
     assert all(s == "dry-run" for s in res.products.values())
@@ -258,7 +330,9 @@ def test_process_cube_dry_run_writes_nothing(synthetic_cube):
 
 
 def test_peak_and_moment_have_correct_shapes_and_values(synthetic_cube):
-    process_cube(synthetic_cube["cube_path"], synthetic_cube["analysis_dir"])
+    process_cube(
+        synthetic_cube["cube_path"], synthetic_cube["analysis_dir"], plot=False,
+    )
     base = synthetic_cube["cube_path"].name[:-len(".fits")]
     out_dir = (
         synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name
@@ -279,7 +353,9 @@ def test_peak_and_moment_have_correct_shapes_and_values(synthetic_cube):
 
 
 def test_mean_spectrum_has_correct_length_and_columns(synthetic_cube):
-    process_cube(synthetic_cube["cube_path"], synthetic_cube["analysis_dir"])
+    process_cube(
+        synthetic_cube["cube_path"], synthetic_cube["analysis_dir"], plot=False,
+    )
     base = synthetic_cube["cube_path"].name[:-len(".fits")]
     spec_path = (
         synthetic_cube["analysis_dir"]
@@ -299,7 +375,9 @@ def test_mean_spectrum_has_correct_length_and_columns(synthetic_cube):
 
 
 def test_provenance_keywords_in_outputs(synthetic_cube):
-    process_cube(synthetic_cube["cube_path"], synthetic_cube["analysis_dir"])
+    process_cube(
+        synthetic_cube["cube_path"], synthetic_cube["analysis_dir"], plot=False,
+    )
     base = synthetic_cube["cube_path"].name[:-len(".fits")]
     out_dir = (
         synthetic_cube["analysis_dir"] / synthetic_cube["cube_path"].parent.name

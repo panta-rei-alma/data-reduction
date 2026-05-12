@@ -78,6 +78,20 @@ def derive_output_paths(
     return {kind: target_dir / f"{stem}.{kind}.fits" for kind in products}
 
 
+def derive_plot_paths(
+    cube_fits: Path,
+    analysis_dir: Path,
+    products: Iterable[str] = PRODUCT_KINDS,
+) -> dict[str, Path]:
+    """PNG plot paths, parallel to :func:`derive_output_paths`."""
+    group_dir = cube_fits.parent.name
+    if not cube_fits.name.endswith(".fits"):
+        raise ValueError(f"expected .fits suffix, got {cube_fits.name}")
+    stem = cube_fits.name[: -len(".fits")]
+    target_dir = analysis_dir / group_dir
+    return {kind: target_dir / f"{stem}.{kind}.png" for kind in products}
+
+
 def needs_regeneration(input_path: Path, output_path: Path, force: bool) -> bool:
     """Return True if ``output_path`` is missing, stale, or ``force`` is set."""
     if force or not output_path.exists():
@@ -243,6 +257,30 @@ def write_spectrum_fits(
     _atomic_write_fits(hdul, out_path)
 
 
+def _maybe_plot(
+    kind: str,
+    plot_path: Path,
+    cube_fits: Path,
+    force: bool,
+    factory,
+    statuses: dict[str, str],
+) -> None:
+    """Run ``factory()`` to write a plot, with skip-if-fresh + error capture."""
+    key = f"plot:{kind}"
+    if not needs_regeneration(cube_fits, plot_path, force):
+        statuses[key] = "skipped"
+        logger.debug("skip %s (plot up-to-date)", plot_path)
+        return
+    try:
+        factory()
+        statuses[key] = "written"
+        logger.info("wrote %s", plot_path)
+    except Exception as exc:  # pragma: no cover - plotting depends on cube payload
+        reason = f"failed:plot_{kind}:{type(exc).__name__}:{exc}"
+        logger.error("%s: %s", cube_fits.name, reason)
+        statuses[key] = reason
+
+
 def process_cube(
     cube_fits: Path,
     analysis_dir: Path,
@@ -251,14 +289,23 @@ def process_cube(
     spectral_unit: str = "auto",
     force: bool = False,
     dry_run: bool = False,
+    plot: bool = True,
+    project_dir: Path | None = None,
+    targets_csv: Path | None = None,
 ) -> CubeResult:
     """Generate the requested products for a single cube.
 
     Catches per-cube exceptions, logs, and returns ``failed:<reason>``
     entries; never raises.
+
+    When ``plot=True`` a PNG accompanies each FITS product. For the
+    mean-spectrum plot the corresponding TP cube is looked up via
+    ``project_dir`` + ``targets_csv``; if either is omitted, the spectrum
+    plot is drawn without the TP overlay.
     """
     products = tuple(products)
     out_paths = derive_output_paths(cube_fits, analysis_dir, products)
+    plot_paths = derive_plot_paths(cube_fits, analysis_dir, products) if plot else {}
     statuses: dict[str, str] = {}
 
     needed = {
@@ -271,13 +318,27 @@ def process_cube(
             statuses[kind] = "skipped"
             logger.debug("skip %s (output up-to-date)", path)
 
+    plots_needed: dict[str, Path] = {}
+    if plot:
+        for kind, ppath in plot_paths.items():
+            if needs_regeneration(cube_fits, ppath, force):
+                plots_needed[kind] = ppath
+
     if dry_run:
         for kind in needed:
             statuses[kind] = "dry-run"
             logger.info("[dry-run] would write %s", out_paths[kind])
+        for kind, ppath in plots_needed.items():
+            statuses[f"plot:{kind}"] = "dry-run"
+            logger.info("[dry-run] would write %s", ppath)
         return CubeResult(cube=cube_fits, products=statuses)
 
-    if not needed:
+    # If neither FITS nor plots need (re)generation, short-circuit before
+    # touching the cube — that's an expensive load.
+    if not needed and not plots_needed:
+        if plot:
+            for kind, ppath in plot_paths.items():
+                statuses.setdefault(f"plot:{kind}", "skipped")
         return CubeResult(cube=cube_fits, products=statuses)
 
     try:
@@ -287,13 +348,18 @@ def process_cube(
         logger.error("%s: %s", cube_fits.name, reason)
         for kind in needed:
             statuses[kind] = reason
+        for kind in plots_needed:
+            statuses[f"plot:{kind}"] = reason
         return CubeResult(cube=cube_fits, products=statuses)
 
+    source_label = _human_source_label(cube_fits)
+
+    m0_proj = None
     if "integrated_intensity" in needed:
         try:
-            m0 = compute_moment0(cube)
+            m0_proj = compute_moment0(cube)
             write_moment_fits(
-                m0, needed["integrated_intensity"], cube_fits, "integrated_intensity"
+                m0_proj, needed["integrated_intensity"], cube_fits, "integrated_intensity"
             )
             statuses["integrated_intensity"] = "written"
             logger.info("wrote %s", needed["integrated_intensity"])
@@ -302,11 +368,27 @@ def process_cube(
             logger.error("%s: %s", cube_fits.name, reason)
             statuses["integrated_intensity"] = reason
 
+    if plot and "integrated_intensity" in plots_needed:
+        # If the FITS step skipped we still want the plot; recompute if needed.
+        proj = m0_proj if m0_proj is not None else _safe_call(compute_moment0, cube)
+        if proj is not None:
+            from panta_rei.analysis.plots import plot_moment_map
+            _maybe_plot(
+                "integrated_intensity", plots_needed["integrated_intensity"],
+                cube_fits, force,
+                lambda: plot_moment_map(
+                    proj, cube, plots_needed["integrated_intensity"],
+                    "integrated_intensity", source_label=source_label,
+                ),
+                statuses,
+            )
+
+    peak_proj = None
     if "peak_intensity" in needed:
         try:
-            peak = compute_peak(cube)
+            peak_proj = compute_peak(cube)
             write_moment_fits(
-                peak, needed["peak_intensity"], cube_fits, "peak_intensity"
+                peak_proj, needed["peak_intensity"], cube_fits, "peak_intensity"
             )
             statuses["peak_intensity"] = "written"
             logger.info("wrote %s", needed["peak_intensity"])
@@ -315,11 +397,26 @@ def process_cube(
             logger.error("%s: %s", cube_fits.name, reason)
             statuses["peak_intensity"] = reason
 
+    if plot and "peak_intensity" in plots_needed:
+        proj = peak_proj if peak_proj is not None else _safe_call(compute_peak, cube)
+        if proj is not None:
+            from panta_rei.analysis.plots import plot_moment_map
+            _maybe_plot(
+                "peak_intensity", plots_needed["peak_intensity"],
+                cube_fits, force,
+                lambda: plot_moment_map(
+                    proj, cube, plots_needed["peak_intensity"],
+                    "peak_intensity", source_label=source_label,
+                ),
+                statuses,
+            )
+
+    spec_vals = None
     if "mean_spectrum" in needed:
         try:
-            spec, axis, flux_unit = compute_mean_spectrum(cube)
+            spec_vals, axis, flux_unit = compute_mean_spectrum(cube)
             write_spectrum_fits(
-                spec, axis, flux_unit, needed["mean_spectrum"], cube_fits
+                spec_vals, axis, flux_unit, needed["mean_spectrum"], cube_fits
             )
             statuses["mean_spectrum"] = "written"
             logger.info("wrote %s", needed["mean_spectrum"])
@@ -328,7 +425,91 @@ def process_cube(
             logger.error("%s: %s", cube_fits.name, reason)
             statuses["mean_spectrum"] = reason
 
+    if plot and "mean_spectrum" in plots_needed:
+        if spec_vals is None:
+            try:
+                spec_vals, _, _ = compute_mean_spectrum(cube)
+            except Exception as exc:  # pragma: no cover
+                logger.error("plot mean_spectrum: recompute failed: %s", exc)
+                statuses["plot:mean_spectrum"] = (
+                    f"failed:plot_mean_spectrum:{type(exc).__name__}:{exc}"
+                )
+                spec_vals = None
+        if spec_vals is not None:
+            tp_values, tp_cube_obj = _load_tp_overlay(
+                cube_fits, project_dir, targets_csv, spectral_unit,
+            )
+            from panta_rei.analysis.plots import plot_mean_spectrum
+            _maybe_plot(
+                "mean_spectrum", plots_needed["mean_spectrum"],
+                cube_fits, force,
+                lambda: plot_mean_spectrum(
+                    spec_vals, cube, plots_needed["mean_spectrum"],
+                    tp_values_jy=tp_values, tp_cube=tp_cube_obj,
+                    source_label=source_label,
+                ),
+                statuses,
+            )
+
     return CubeResult(cube=cube_fits, products=statuses)
+
+
+def _safe_call(fn, cube):
+    try:
+        return fn(cube)
+    except Exception as exc:  # pragma: no cover
+        logger.error("recompute %s failed: %s", fn.__name__, exc)
+        return None
+
+
+def _human_source_label(cube_fits: Path) -> str | None:
+    """Short label for the plot title — best-effort, ``None`` on parse failure."""
+    try:
+        from panta_rei.analysis.tp_lookup import (
+            desanitize_source_name,
+            parse_feathered_filename,
+        )
+
+        parsed = parse_feathered_filename(cube_fits)
+        return (
+            f"{desanitize_source_name(parsed['source_sanitized'])}  "
+            f"{parsed['freq_lo_ghz']:.3f}–{parsed['freq_hi_ghz']:.3f} GHz"
+        )
+    except Exception:
+        return None
+
+
+def _load_tp_overlay(
+    cube_fits: Path,
+    project_dir: Path | None,
+    targets_csv: Path | None,
+    spectral_unit: str,
+):
+    """Resolve and load the TP cube + mean spectrum.
+
+    Returns ``(values, cube)`` or ``(None, None)`` if the TP cube can't
+    be located or fails to load. Failures here never propagate — the
+    spectrum plot just renders without the TP overlay.
+    """
+    if project_dir is None or targets_csv is None:
+        logger.debug("TP overlay: project_dir or targets_csv not provided")
+        return None, None
+    try:
+        from panta_rei.analysis.tp_lookup import find_tp_cube_for_feathered
+
+        tp_path = find_tp_cube_for_feathered(cube_fits, project_dir, targets_csv)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("TP overlay lookup failed: %s", exc)
+        return None, None
+    if tp_path is None:
+        return None, None
+    try:
+        tp_cube = load_cube(tp_path, spectral_unit=spectral_unit)
+        tp_values, _, _ = compute_mean_spectrum(tp_cube)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("TP overlay: failed to load %s: %s", tp_path, exc)
+        return None, None
+    return tp_values, tp_cube
 
 
 def discover_cubes(
