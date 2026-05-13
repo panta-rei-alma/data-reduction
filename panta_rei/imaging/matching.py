@@ -440,6 +440,13 @@ def build_output_path(
     return output_dir / subdir / filename
 
 
+# Tclean diagnostics (the 12m7m pbcor cube and the aux QA products) live
+# under this sub-directory so the canonical ``group.*.lp_nperetto/`` dirs
+# only contain the feathered 12m7mTP science cubes. Keeps the consumer-
+# facing layout free of intermediate-array diagnostic files.
+AUX_SUBDIR = "aux"
+
+
 def build_tclean_only_output_path(
     output_dir: Path,
     gous_id: str,
@@ -449,7 +456,7 @@ def build_tclean_only_output_path(
 ) -> Path:
     """Build the output FITS path for the tclean-only 12m+7m product.
 
-    Pattern: ``{output_dir}/group.uid___A001_{gous_id}.lp_nperetto/
+    Pattern: ``{output_dir}/aux/group.uid___A001_{gous_id}.lp_nperetto/
     group.uid___A001_{gous_id}.lp_nperetto.{source}.12m7m.{freq}GHz.cube.pbcor.fits``
     """
     sanitized = sanitize_source_name(source_name)
@@ -459,11 +466,11 @@ def build_tclean_only_output_path(
         f"group.uid___A001_{gous_id}.lp_nperetto."
         f"{sanitized}.12m7m.{freq_range}GHz.cube.pbcor.fits"
     )
-    return output_dir / subdir / filename
+    return output_dir / AUX_SUBDIR / subdir / filename
 
 
 # Aux products (QA artefacts produced by tclean) — each is published as
-# FITS alongside the canonical .pbcor pair.  Order is just for stable
+# FITS under the ``aux/`` sub-directory.  Order is just for stable
 # logging.
 AUX_PRODUCT_KINDS: tuple[str, ...] = ("mask", "residual", "pb")
 
@@ -480,7 +487,7 @@ def build_aux_output_path(
 
     Aux products (mask, residual, pb) come from the tclean step and so
     inherit the 12m7m naming.  Pattern:
-    ``{output_dir}/group.uid___A001_{gous_id}.lp_nperetto/
+    ``{output_dir}/aux/group.uid___A001_{gous_id}.lp_nperetto/
     group.uid___A001_{gous_id}.lp_nperetto.{source}.12m7m.{freq}GHz.cube.{kind}.fits``
     """
     if kind not in AUX_PRODUCT_KINDS:
@@ -495,7 +502,7 @@ def build_aux_output_path(
         f"group.uid___A001_{gous_id}.lp_nperetto."
         f"{sanitized}.12m7m.{freq_range}GHz.cube.{kind}.fits"
     )
-    return output_dir / subdir / filename
+    return output_dir / AUX_SUBDIR / subdir / filename
 
 
 # ---------------------------------------------------------------------------

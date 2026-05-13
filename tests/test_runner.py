@@ -782,7 +782,7 @@ class TestRunTcleanFeatherParallel:
 
     def test_subprocess_success_publishes_aux_products(self, basic_unit, tmp_path):
         """When the CASA script reports aux_fits, the runner publishes
-        each alongside the canonical pair using the canonical aux paths
+        each under the aux/ sub-directory using the canonical aux paths
         passed in the job spec."""
         casa_path = tmp_path / "casa"
         (casa_path / "bin").mkdir(parents=True)
@@ -837,10 +837,14 @@ class TestRunTcleanFeatherParallel:
         # job spec should advertise the 3 default aux products + canonical
         # paths for each
         assert observed_spec["aux_products"] == ["mask", "residual", "pb"]
+        # Aux products live under output_dir/aux/group.../, separate from
+        # the feathered cube which stays in output_dir/group.../.
+        feathered_parent = Path(output).parent
         for kind in ("mask", "residual", "pb"):
             canonical = Path(observed_spec["canonical_paths"]["aux"][kind])
-            # Lives in same group subdir as the .pbcor.fits, named .cube.<kind>.fits
-            assert canonical.parent == Path(output).parent
+            assert canonical.parent != feathered_parent
+            assert canonical.parent.parent.name == "aux"
+            assert canonical.parent.name == feathered_parent.name
             assert canonical.name.endswith(f".cube.{kind}.fits")
             assert "12m7m." in canonical.name and "12m7mTP" not in canonical.name
             assert canonical.exists()
