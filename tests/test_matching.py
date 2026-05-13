@@ -178,11 +178,38 @@ class TestBuildOutputPath:
         )
         assert "group.uid___A001_X3833_X64b9.lp_nperetto" in str(p.parent)
 
+    def test_feathered_cube_not_under_aux(self):
+        # The feathered 12m7mTP cube is the science product and lives in
+        # the canonical group subdir, NOT in the aux/ tree.
+        p = build_output_path(
+            Path("/out"), "X3833_X64b9", "AG231.7986-1.9684", 86e9, 87e9,
+        )
+        assert "/aux/" not in str(p)
+
+
+class TestBuildTcleanOnlyOutputPath:
+    """The tclean-only 12m7m pbcor cube is a diagnostic intermediate
+    (the feathered 12m7mTP is the science product), so it lives under
+    the aux/ sub-directory alongside the other tclean aux products."""
+
+    def test_lives_under_aux(self):
+        from panta_rei.imaging.matching import build_tclean_only_output_path
+        p = build_tclean_only_output_path(
+            Path("/out"), "X3833_X64b9", "AG231.7986-1.9684", 86e9, 87e9,
+        )
+        assert p.name == (
+            "group.uid___A001_X3833_X64b9.lp_nperetto."
+            "AG231.7986m1.9684.12m7m.86.0-87.0GHz.cube.pbcor.fits"
+        )
+        assert p.parent == Path(
+            "/out/aux/group.uid___A001_X3833_X64b9.lp_nperetto"
+        )
+
 
 class TestBuildAuxOutputPath:
     """Aux QA products inherit the 12m7m naming (they come from tclean,
-    not from feather), so their canonical paths sit alongside the
-    .pbcor.fits pair in the same group subdir."""
+    not from feather), and live under the aux/ sub-directory next to
+    the tclean-only pbcor cube."""
 
     def test_each_kind(self):
         from panta_rei.imaging.matching import build_aux_output_path
@@ -197,7 +224,9 @@ class TestBuildAuxOutputPath:
                 "group.uid___A001_X3833_X64b9.lp_nperetto."
                 f"AG231.7986m1.9684.12m7m.86.0-87.0GHz.cube.{kind}.fits"
             )
-            assert "group.uid___A001_X3833_X64b9.lp_nperetto" in str(p.parent)
+            assert p.parent == Path(
+                "/out/aux/group.uid___A001_X3833_X64b9.lp_nperetto"
+            )
 
     def test_unknown_kind_rejected(self):
         from panta_rei.imaging.matching import build_aux_output_path
@@ -207,7 +236,7 @@ class TestBuildAuxOutputPath:
                 86e9, 87e9, "psf",
             )
 
-    def test_lives_in_same_group_subdir_as_pbcor(self):
+    def test_lives_in_same_subdir_as_tclean_pbcor(self):
         from panta_rei.imaging.matching import (
             build_aux_output_path, build_tclean_only_output_path,
         )
@@ -221,6 +250,22 @@ class TestBuildAuxOutputPath:
         pbcor = build_tclean_only_output_path(**kw)
         residual = build_aux_output_path(kind="residual", **kw)
         assert residual.parent == pbcor.parent
+
+    def test_disjoint_from_feathered_cube_subdir(self):
+        # The feathered cube parent dir and the aux parent dir must be
+        # different — the whole point of the aux/ split is keeping the
+        # consumer-facing group dir free of diagnostic intermediates.
+        from panta_rei.imaging.matching import build_aux_output_path
+        kw = dict(
+            output_dir=Path("/out"),
+            gous_id="X3833_X64b9",
+            source_name="AG231.7986-1.9684",
+            freq_min_hz=86e9,
+            freq_max_hz=87e9,
+        )
+        feathered = build_output_path(**kw)
+        residual = build_aux_output_path(kind="residual", **kw)
+        assert feathered.parent != residual.parent
 
 
 # ---------------------------------------------------------------------------
