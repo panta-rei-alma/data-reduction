@@ -348,13 +348,60 @@ def test_force_regenerates(quad_4d):
     assert all(s == "written" for s in res2.products.values()), res2.products
 
 
-def test_missing_sibling_surfaces_per_product(quad_4d):
+def test_missing_required_sibling_surfaces_per_product(quad_4d):
+    """pb absent → every product fails with missing_sibling (pb is required)."""
     from panta_rei.analysis.clean_diagnostics import process_cube, resolve_siblings
 
     sibs = resolve_siblings(quad_4d["pbcor_path"])
     sibs["pb"].unlink()
     res = process_cube(quad_4d["pbcor_path"], quad_4d["analysis_dir"], plot=False)
     assert any(s.startswith("failed:missing_sibling") for s in res.products.values())
+
+
+def test_missing_mask_synthesises_empty_mask(quad_4d):
+    """mask absent → process continues; mask FITS is all-zero, spectra all-NaN.
+
+    Mirrors the real-world case where tclean's auto-masking found
+    nothing to mask (no detectable emission). The 4 intensity maps
+    remain valuable QA so we still emit them.
+    """
+    from panta_rei.analysis.clean_diagnostics import (
+        PRODUCT_KINDS, process_cube, resolve_siblings,
+    )
+
+    # Delete the mask sibling before processing.
+    sibs = resolve_siblings(quad_4d["pbcor_path"])
+    sibs["mask"].unlink()
+
+    res = process_cube(quad_4d["pbcor_path"], quad_4d["analysis_dir"], plot=False)
+
+    # No failures; all 7 FITS produced.
+    failures = [k for k, v in res.products.items() if v.startswith("failed:")]
+    assert not failures, f"unexpected failures: {failures}"
+
+    base = quad_4d["pbcor_path"].name[: -len(".cube.pbcor.fits")]
+    group = quad_4d["pbcor_path"].parent.name
+    fits_dir = quad_4d["analysis_dir"] / group / "fits"
+    for kind in PRODUCT_KINDS:
+        assert (fits_dir / f"{base}.{kind}.fits").exists(), kind
+
+    # 2D mask is all-zero.
+    with fits.open(fits_dir / f"{base}.clean_mask.fits") as hdul:
+        data = hdul[0].data
+        hdr = hdul[0].header
+    assert data.dtype == np.uint8
+    assert data.sum() == 0
+    assert hdr["SIB_MASK"].startswith("(absent")
+
+    # Image moment / peak maps still finite where signal lived.
+    with fits.open(fits_dir / f"{base}.peak_intensity_image.fits") as hdul:
+        peak = hdul[0].data
+    assert np.isfinite(peak).any()
+
+    # Spectra are all-NaN (mask is empty).
+    with fits.open(fits_dir / f"{base}.mean_spectrum_image_in_mask.fits") as hdul:
+        flux = hdul["SPECTRUM"].data["FLUX"]
+    assert np.all(np.isnan(flux))
 
 
 def test_peak_image_value_is_positive_in_signal_pixel(quad_4d):

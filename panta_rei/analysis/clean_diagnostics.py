@@ -78,6 +78,11 @@ DEFAULT_ARRAY_COMBOS: tuple[str, ...] = ("12m7m",)
 AUX_SUBDIR = "aux"
 
 SIBLING_KINDS: tuple[str, ...] = ("pbcor", "mask", "residual", "pb")
+# Optional siblings: tclean's auto-masking emits no ``.cube.mask.fits`` when
+# nothing rose above the masking threshold (i.e. no detectable emission).
+# Treating the mask as required would drop the still-useful intensity maps
+# for those cubes; instead we synthesise an all-zero mask in that case.
+OPTIONAL_SIBLING_KINDS: tuple[str, ...] = ("mask",)
 
 
 # ---------------------------- typed exceptions -----------------------------
@@ -151,19 +156,31 @@ def _split_base(pbcor_path: Path) -> str:
     return m.group("base")
 
 
-def resolve_siblings(pbcor_path: Path) -> dict[str, Path]:
-    """Return a ``{kind: Path}`` map for pbcor / mask / residual / pb.
+def resolve_siblings(pbcor_path: Path) -> dict[str, Path | None]:
+    """Return a ``{kind: Path | None}`` map for pbcor / mask / residual / pb.
 
-    Raises :class:`MissingSibling` if any of the three siblings is absent.
+    Required siblings (``pbcor``, ``residual``, ``pb``) must exist on disk
+    or :class:`MissingSibling` is raised. Optional siblings (``mask``)
+    are returned as ``None`` when absent so the caller can synthesise a
+    sensible default (an all-zero mask, in the mask case).
     """
     base = _split_base(pbcor_path)
     parent = pbcor_path.parent
-    paths = {kind: parent / f"{base}.cube.{kind}.fits" for kind in SIBLING_KINDS}
-    missing = [kind for kind, p in paths.items() if not p.is_file()]
-    if missing:
+    candidate: dict[str, Path] = {
+        kind: parent / f"{base}.cube.{kind}.fits" for kind in SIBLING_KINDS
+    }
+    missing_required = [
+        kind for kind in SIBLING_KINDS
+        if kind not in OPTIONAL_SIBLING_KINDS and not candidate[kind].is_file()
+    ]
+    if missing_required:
         raise MissingSibling(
-            f"missing sibling(s) {missing} for {pbcor_path.name}"
+            f"missing required sibling(s) {missing_required} for {pbcor_path.name}"
         )
+    paths: dict[str, Path | None] = dict(candidate)
+    for kind in OPTIONAL_SIBLING_KINDS:
+        if not candidate[kind].is_file():
+            paths[kind] = None
     return paths
 
 
@@ -197,14 +214,15 @@ def derive_plot_paths(
 # ---------------------------- mtime logic ----------------------------------
 
 
-def input_mtime(sibling_paths: dict[str, Path]) -> float:
-    """Return ``max(mtime)`` across the 4 sibling cubes.
+def input_mtime(sibling_paths: dict[str, Path | None]) -> float:
+    """Return ``max(mtime)`` across the present sibling cubes.
 
     Outputs are considered fresh when their mtime is ``>=`` this value
     (uses ``>=`` rather than ``>`` to tolerate same-second writes on
-    NFS).
+    NFS). Optional siblings that are absent (``None`` in the map) are
+    skipped — they have no clock to honour.
     """
-    return max(p.stat().st_mtime for p in sibling_paths.values())
+    return max(p.stat().st_mtime for p in sibling_paths.values() if p is not None)
 
 
 def needs_regeneration(input_clock: float, output_path: Path, force: bool) -> bool:
@@ -283,18 +301,24 @@ class CubeBundle:
 
 
 def _open_cube_arrays(
-    sibling_paths: dict[str, Path],
+    sibling_paths: dict[str, Path | None],
     exit_stack: contextlib.ExitStack,
 ) -> CubeBundle:
-    """Open the 4 cubes, squeeze Stokes, validate cross-cube consistency.
+    """Open the cubes, squeeze Stokes, validate cross-cube consistency.
 
-    All four HDULs are kept open via ``exit_stack`` for the lifetime of
-    the bundle; arrays are numpy views over memmap'd data.
+    HDULs are kept open via ``exit_stack`` for the lifetime of the
+    bundle; arrays are numpy views over memmap'd data. Optional siblings
+    that are absent (``None``) are synthesised — for mask this is an
+    all-zero ``(n_chan, ny, nx)`` array taken from pbcor's shape.
     """
     arrays: dict[str, np.ndarray] = {}
     pbcor_header: fits.Header | None = None
     for kind in SIBLING_KINDS:
         path = sibling_paths[kind]
+        if path is None:
+            # Optional sibling absent — handled after pbcor is loaded.
+            assert kind in OPTIONAL_SIBLING_KINDS, kind
+            continue
         hdul = exit_stack.enter_context(fits.open(str(path), memmap=True))
         primary = hdul[0]
         data = primary.data
@@ -307,9 +331,17 @@ def _open_cube_arrays(
 
     assert pbcor_header is not None  # SIBLING_KINDS starts with pbcor
 
-    # Cross-cube shape consistency. We bind the canonical (n_chan, ny, nx)
-    # from pbcor and compare the other three against it.
+    # Synthesise any absent optional siblings now that we know the
+    # canonical shape from pbcor.
     n_chan, ny, nx = arrays["pbcor"].shape
+    if sibling_paths.get("mask") is None:
+        logger.info(
+            "%s: no .cube.mask.fits — synthesising empty mask (no clean components)",
+            sibling_paths["pbcor"].name,
+        )
+        arrays["mask"] = np.zeros((n_chan, ny, nx), dtype=np.uint8)
+
+    # Cross-cube shape consistency.
     for kind in ("residual", "mask", "pb"):
         if arrays[kind].shape != (n_chan, ny, nx):
             raise ShapeMismatch(
@@ -529,7 +561,15 @@ def _build_2d_header(
     hdr["PRODUCT"] = (product_kind, "clean-diagnostics product kind")
     hdr["SIB_PB"] = (bundle.sibling_paths["pb"].name, "pb sibling")
     hdr["SIB_RESI"] = (bundle.sibling_paths["residual"].name, "residual sibling")
-    hdr["SIB_MASK"] = (bundle.sibling_paths["mask"].name, "mask sibling")
+    mask_path = bundle.sibling_paths.get("mask")
+    if mask_path is None:
+        hdr["SIB_MASK"] = ("(absent - empty mask synthesised)", "mask sibling")
+        hdr.add_history(
+            "panta-rei-clean-diagnostics: no .cube.mask.fits - "
+            "mask synthesised as all-zero (no detectable emission)."
+        )
+    else:
+        hdr["SIB_MASK"] = (mask_path.name, "mask sibling")
     if jytok is not None:
         hdr["JYTOK"] = (float(jytok), "K per (Jy/beam) at RESTFRQ (pbcor beam)")
     if mask_projection is not None:
@@ -537,7 +577,7 @@ def _build_2d_header(
     hdr.add_history(
         "panta-rei-clean-diagnostics: "
         "RECON_IMG = pbcor * pb (valid where both finite); "
-        "may differ from CASA .image in PB-tapered / blanked regions."
+        "may differ from CASA .image in PB-tapered or blanked regions."
     )
     return hdr
 
@@ -607,7 +647,11 @@ def _write_spectrum_fits(
     bintable.header["MASKKIND"] = (mask_kind, "2D mask used for spatial averaging")
     bintable.header["SIB_PB"] = (bundle.sibling_paths["pb"].name, "pb sibling")
     bintable.header["SIB_RESI"] = (bundle.sibling_paths["residual"].name, "residual sibling")
-    bintable.header["SIB_MASK"] = (bundle.sibling_paths["mask"].name, "mask sibling")
+    mask_path = bundle.sibling_paths.get("mask")
+    bintable.header["SIB_MASK"] = (
+        mask_path.name if mask_path is not None else "(absent - empty mask synthesised)",
+        "mask sibling",
+    )
     bintable.header["SPECCONV"] = (spectral_unit, "SPECTRAL column units")
 
     primary = fits.PrimaryHDU()
