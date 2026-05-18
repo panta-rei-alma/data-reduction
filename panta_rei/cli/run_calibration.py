@@ -29,6 +29,31 @@ from panta_rei.db.models import PIRunsQueries, PIRunStatus
 log = logging.getLogger(__name__)
 
 
+_FALLBACK_CASA_CMD = 'casa --nologger --nogui --pipeline -c "{script}"'
+
+
+def _default_casa_cmd() -> str:
+    """Resolve the default --casa-cmd template from .env / environment.
+
+    Delegates to :class:`panta_rei.config.PipelineConfig`, which already
+    knows how to read ``CASA_PATH`` from ``.env`` (or the live
+    environment) and assemble the canonical CASA invocation. Appends
+    the ``-c "{script}"`` suffix this CLI uses.
+
+    Falls back to bare ``casa`` on PATH if config loading fails for
+    any reason (e.g. ``PANTA_REI_BASE`` not set, no ``.env``) so the
+    CLI never crashes at argparse-default time over config plumbing.
+    """
+    try:
+        from panta_rei.config import PipelineConfig
+        cfg = PipelineConfig.from_env()
+        if cfg.casa_cmd:
+            return f'{cfg.casa_cmd} -c "{{script}}"'
+    except Exception:
+        pass
+    return _FALLBACK_CASA_CMD
+
+
 # ---------------------------------------------------------------------------
 # Helpers (ported from legacy run_script_for_pi.py)
 # ---------------------------------------------------------------------------
@@ -368,8 +393,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--casa-cmd",
-        default='casa --nologger --nogui --pipeline -c "{script}"',
-        help='Command template to run CASA. Must include {script}.',
+        default=_default_casa_cmd(),
+        help=(
+            "Command template to run CASA. Must include {script}. "
+            "Defaults to $CASA_PATH/bin/casa ... when CASA_PATH is set "
+            "(via .env), else bare 'casa' on PATH."
+        ),
     )
     ap.add_argument(
         "--dry-run", action="store_true",
