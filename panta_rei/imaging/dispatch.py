@@ -194,11 +194,11 @@ class DBWriter(threading.Thread):
         self.q: Queue = Queue()
         self.db_manager = db_manager
         self.dispatch_id = dispatch_id
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def stop(self) -> None:
         self.q.put(DB_SHUTDOWN)
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:
         con = self.db_manager.connect()
@@ -1266,10 +1266,10 @@ class TokenReaper(threading.Thread):
         self.tokens_dir = Path(tokens_dir)
         self.g = g
         self.expected_tokens = list(expected_tokens)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     # Kept as a class attribute for backwards-compat with code that may
     # have referenced ``TokenReaper.MALFORMED_GRACE_SEC``; the actual
@@ -1277,7 +1277,7 @@ class TokenReaper(threading.Thread):
     MALFORMED_GRACE_SEC = _TOKEN_MALFORMED_GRACE_SEC
 
     def run(self) -> None:
-        while not self._stop.wait(self.g.token_reaper_interval_sec):
+        while not self._stop_event.wait(self.g.token_reaper_interval_sec):
             try:
                 self._sweep()
             except Exception:
@@ -1310,15 +1310,15 @@ class GousCleaner(threading.Thread):
         self.cfg = cfg
         self.dispatch_id = dispatch_id
         self.g = g
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._cleaned: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:
-        while not self._stop.wait(self.g.cleanup_interval_sec):
+        while not self._stop_event.wait(self.g.cleanup_interval_sec):
             try:
                 self._sweep()
             except Exception:
@@ -1402,13 +1402,13 @@ class MachineSlot(threading.Thread):
         self.slot_id = slot_id
         self.machine = machine
         self.ctx = ctx
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             unit = self.ctx.scheduler.pick(self.machine.name, self._next_run_id)
             if unit is None:
                 # Drained — exit slot
@@ -1532,104 +1532,187 @@ class MachineSlot(threading.Thread):
             machine, unit.gous_uid, run_id, dispatch_id=c.dispatch_id,
         )
 
-        # 5. Launch detached
-        ok, msg, wrapper_pid = launch_detached(
-            machine, launcher, nas_unit_dir,
-            timeout=c.cfg.global_cfg.ssh_timeout_sec,
-        )
-        if not ok:
+        # Once mark_inflight is set we MUST release it with mark_terminal
+        # — otherwise pick() will skip this (machine, GOUS) for the rest
+        # of the dispatch.  The sentinel below + try/finally guarantees
+        # that, even if poll_state_until_terminal raises or any other
+        # unexpected exception occurs between here and the bottom.
+        terminal_recorded = False
+        try:
+            # 5. Launch detached
+            ok, msg, wrapper_pid = launch_detached(
+                machine, launcher, nas_unit_dir,
+                timeout=c.cfg.global_cfg.ssh_timeout_sec,
+            )
+            if not ok:
+                c.db_writer.q.put({
+                    "op": "MARK_DONE",
+                    "run_id": run_id,
+                    "status": ImagingRunStatus.FAILED,
+                    "retcode": 255,
+                    "finished_at": now_iso(),
+                    "duration_sec": 0.0,
+                    "error_message": f"ssh launch failed: {msg}",
+                })
+                c.scheduler.mark_terminal(
+                    machine, unit.gous_uid, run_id, success=False,
+                )
+                terminal_recorded = True
+                return
+
+            # 6. Poll until terminal
+            t0 = time.monotonic()
+            expected_tokens = [
+                f"--dispatch-id {c.dispatch_id}",
+                f"--run-id {run_id}",
+            ]
+
+            def _on_phase(phase, state):
+                if phase == "running":
+                    # Staging finished — let other slots pick this GOUS freely.
+                    c.scheduler.mark_staged(machine, unit.gous_uid)
+                # Push MARK_RUNNING the first time we see worker_pid in state
+                if state.get("worker_pid"):
+                    c.db_writer.q.put({
+                        "op": "MARK_RUNNING",
+                        "run_id": run_id,
+                        "remote_workdir": raid_dir,
+                        "worker_pid": int(state["worker_pid"]),
+                        "worker_pgid": int(state.get("worker_pgid") or 0),
+                        "hostname": machine,
+                    })
+
+            last_db_hb_state = {"t": 0.0}
+            hb_throttle = max(
+                5.0, c.cfg.global_cfg.heartbeat_interval_sec / 2,
+            )
+
+            def _on_poll(state):
+                # Throttled DB heartbeat so imaging_runs.last_heartbeat is
+                # observable from `panta-rei` queries.  NAS heartbeat is the
+                # real liveness source; this is a visibility convenience.
+                now = time.monotonic()
+                if now - last_db_hb_state["t"] < hb_throttle:
+                    return
+                last_db_hb_state["t"] = now
+                c.db_writer.q.put({
+                    "op": "HEARTBEAT", "run_id": run_id,
+                    "ts": now_iso(),
+                })
+
+            final = poll_state_until_terminal(
+                machine, nas_unit_dir, g=c.cfg.global_cfg,
+                expected_tokens=expected_tokens,
+                on_phase_change=_on_phase,
+                on_poll=_on_poll,
+            )
+            elapsed = time.monotonic() - t0
+
+            # 7. Apply terminal state to DB
+            prov = final.get("provenance") or {}
             c.db_writer.q.put({
                 "op": "MARK_DONE",
                 "run_id": run_id,
-                "status": ImagingRunStatus.FAILED,
-                "retcode": 255,
-                "finished_at": now_iso(),
-                "duration_sec": 0.0,
-                "error_message": f"ssh launch failed: {msg}",
+                "status": (ImagingRunStatus.SUCCESS if final.get("success")
+                           else ImagingRunStatus.FAILED),
+                "retcode": 0 if final.get("success") else 1,
+                "finished_at": final.get("finished_at") or now_iso(),
+                "duration_sec": float(elapsed),
+                "output_fits": final.get("output_fits"),
+                "spw_selection": (json.dumps(final["spw_selection"])
+                                  if final.get("spw_selection") else None),
+                "field_selection": (json.dumps(final["field_selection"])
+                                    if final.get("field_selection") else None),
+                "error_message": final.get("error_message"),
+                "job_json_path": prov.get("job_json"),
             })
-            c.scheduler.mark_terminal(
-                machine, unit.gous_uid, run_id, success=False,
+            empty = c.scheduler.mark_terminal(
+                machine, unit.gous_uid, run_id,
+                success=bool(final.get("success")),
             )
-            return
-
-        # 6. Poll until terminal
-        t0 = time.monotonic()
-        expected_tokens = [
-            f"--dispatch-id {c.dispatch_id}",
-            f"--run-id {run_id}",
-        ]
-
-        def _on_phase(phase, state):
-            if phase == "running":
-                # Staging finished — let other slots pick this GOUS freely.
-                c.scheduler.mark_staged(machine, unit.gous_uid)
-            # Push MARK_RUNNING the first time we see worker_pid in state
-            if state.get("worker_pid"):
-                c.db_writer.q.put({
-                    "op": "MARK_RUNNING",
-                    "run_id": run_id,
-                    "remote_workdir": raid_dir,
-                    "worker_pid": int(state["worker_pid"]),
-                    "worker_pgid": int(state.get("worker_pgid") or 0),
-                    "hostname": machine,
-                })
-
-        last_db_hb_state = {"t": 0.0}
-        hb_throttle = max(
-            5.0, c.cfg.global_cfg.heartbeat_interval_sec / 2,
-        )
-
-        def _on_poll(state):
-            # Throttled DB heartbeat so imaging_runs.last_heartbeat is
-            # observable from `panta-rei` queries.  NAS heartbeat is the
-            # real liveness source; this is a visibility convenience.
-            now = time.monotonic()
-            if now - last_db_hb_state["t"] < hb_throttle:
-                return
-            last_db_hb_state["t"] = now
-            c.db_writer.q.put({
-                "op": "HEARTBEAT", "run_id": run_id,
-                "ts": now_iso(),
-            })
-
-        final = poll_state_until_terminal(
-            machine, nas_unit_dir, g=c.cfg.global_cfg,
-            expected_tokens=expected_tokens,
-            on_phase_change=_on_phase,
-            on_poll=_on_poll,
-        )
-        elapsed = time.monotonic() - t0
-
-        # 7. Apply terminal state to DB
-        prov = final.get("provenance") or {}
-        c.db_writer.q.put({
-            "op": "MARK_DONE",
-            "run_id": run_id,
-            "status": (ImagingRunStatus.SUCCESS if final.get("success")
-                       else ImagingRunStatus.FAILED),
-            "retcode": 0 if final.get("success") else 1,
-            "finished_at": final.get("finished_at") or now_iso(),
-            "duration_sec": float(elapsed),
-            "output_fits": final.get("output_fits"),
-            "spw_selection": (json.dumps(final["spw_selection"])
-                              if final.get("spw_selection") else None),
-            "field_selection": (json.dumps(final["field_selection"])
-                                if final.get("field_selection") else None),
-            "error_message": final.get("error_message"),
-            "job_json_path": prov.get("job_json"),
-        })
-        empty = c.scheduler.mark_terminal(
-            machine, unit.gous_uid, run_id,
-            success=bool(final.get("success")),
-        )
-        if empty:
-            # Possible cleanup opportunity — let the cleaner sweep
-            log.debug("(machine=%s, gous=%s) drained", machine, unit.gous_uid)
+            terminal_recorded = True
+            if empty:
+                # Possible cleanup opportunity — let the cleaner sweep
+                log.debug("(machine=%s, gous=%s) drained", machine, unit.gous_uid)
+        finally:
+            if not terminal_recorded:
+                # Unexpected exception path (e.g. poll_state_until_terminal
+                # raised).  Release the scheduler slot with FAILED so the
+                # outer MachineSlot.run() can pick the next unit, and emit
+                # a terminal DB event so reconciliation later isn't blocked
+                # on this run sitting in non-terminal status.
+                log.exception(
+                    "MachineSlot crashed mid-dispatch: machine=%s gous=%s "
+                    "run_id=%d; marking FAILED",
+                    machine, unit.gous_uid, run_id,
+                )
+                try:
+                    c.db_writer.q.put({
+                        "op": "MARK_DONE",
+                        "run_id": run_id,
+                        "status": ImagingRunStatus.FAILED,
+                        "retcode": 1,
+                        "finished_at": now_iso(),
+                        "duration_sec": 0.0,
+                        "error_message": "MachineSlot crashed mid-dispatch",
+                    })
+                except Exception:
+                    log.exception("failed to emit MARK_DONE for run_id=%d", run_id)
+                try:
+                    c.scheduler.mark_terminal(
+                        machine, unit.gous_uid, run_id, success=False,
+                    )
+                except Exception:
+                    log.exception(
+                        "failed to mark_terminal for machine=%s gous=%s "
+                        "run_id=%d", machine, unit.gous_uid, run_id,
+                    )
 
 
 # ---------------------------------------------------------------------------
 # Top-level dispatch context + entry point
 # ---------------------------------------------------------------------------
+
+class LiveCountWatchdog(threading.Thread):
+    """Periodically log live thread counts so a wedge is visible in logs.
+
+    Without this, a hung dispatcher just goes silent.  We emit a single
+    INFO line on a fixed cadence with adoption / fixed-slot / dynamic-slot
+    live counts so it is obvious whether the orchestrator is making
+    progress.  No mutation, no force-cleanup — purely observational.
+    """
+
+    def __init__(
+        self,
+        ctx: "DispatchContext",
+        adoption_threads: list,
+        slots: list,
+        interval_sec: int = 300,
+    ):
+        super().__init__(name="watchdog", daemon=True)
+        self.ctx = ctx
+        self.adoption_threads = adoption_threads
+        self.slots = slots
+        self.interval_sec = int(interval_sec)
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval_sec):
+            try:
+                live_a = sum(1 for t in self.adoption_threads if t.is_alive())
+                live_s = sum(1 for s in self.slots if s.is_alive())
+                with self.ctx.dynamic_slots_lock:
+                    live_d = sum(1 for s in self.ctx.dynamic_slots if s.is_alive())
+                log.info(
+                    "watchdog: adoption=%d slots=%d dynamic=%d",
+                    live_a, live_s, live_d,
+                )
+            except Exception:
+                log.exception("watchdog tick failed")
+
 
 class AdoptionPoller(threading.Thread):
     """Poll an adopted (already-running) worker until it terminates.
@@ -1645,12 +1728,20 @@ class AdoptionPoller(threading.Thread):
         self,
         adopted: dict,                      # dict from reconcile_prior
         ctx: "DispatchContext",
+        machine_cfg: Optional[MachineCfg] = None,
     ):
         super().__init__(
             name=f"adopt-{adopted['run_id']}", daemon=True,
         )
         self.adopted = adopted
         self.ctx = ctx
+        # ``machine_cfg`` is the new-dispatch MachineCfg for the host
+        # this adopted unit runs on, used to size the successor-slot
+        # spawn after termination.  Optional because reconciliation
+        # may surface a machine that is not in the current cfg
+        # (machines.json change between runs); in that case we still
+        # poll the worker to terminal but skip successor spawning.
+        self.machine_cfg = machine_cfg
 
     def run(self) -> None:
         c = self.ctx
@@ -1668,64 +1759,139 @@ class AdoptionPoller(threading.Thread):
             f"--run-id {run_id}",
         ]
 
+        if not gous_uid:
+            log.warning(
+                "adoption: run_id=%d machine=%s prior_dispatch=%s has no "
+                "resolvable gous_uid; scheduler slot accounting and "
+                "/raid cleanup will be skipped for this run",
+                run_id, machine, prior_did,
+            )
+
         # Account adopted unit in the scheduler so the cleaner reaches it.
         # Tag with the *prior* dispatch_id so cleanup hits the right
-        # /raid/d_<prior_id>/... tree, NOT the new dispatch's.
+        # /raid/d_<prior_id>/... tree, NOT the new dispatch's.  Wrap
+        # everything from here in try/finally so a failure during the
+        # poll-setup (closures, timing, etc.) still releases the slot
+        # we just reserved.
         if gous_uid:
             c.scheduler.mark_inflight(
                 machine, gous_uid, run_id, dispatch_id=prior_did,
             )
 
+        final: Optional[dict] = None
+        crashed_exc: Optional[BaseException] = None
         t0 = time.monotonic()
-        last_db_hb_state = {"t": 0.0}
-        hb_throttle = max(
-            5.0, c.cfg.global_cfg.heartbeat_interval_sec / 2,
-        )
-
-        def _on_poll(state):
-            now = time.monotonic()
-            if now - last_db_hb_state["t"] < hb_throttle:
-                return
-            last_db_hb_state["t"] = now
-            c.db_writer.q.put({
-                "op": "HEARTBEAT", "run_id": run_id,
-                "ts": now_iso(),
-            })
-
         try:
-            final = poll_state_until_terminal(
-                machine, unit_dir,
-                g=c.cfg.global_cfg,
-                expected_tokens=expected_tokens,
-                on_poll=_on_poll,
+            last_db_hb_state = {"t": 0.0}
+            hb_throttle = max(
+                5.0, c.cfg.global_cfg.heartbeat_interval_sec / 2,
             )
-        except Exception:
-            log.exception("adoption poller crashed for run_id=%d", run_id)
-            return
-        elapsed = time.monotonic() - t0
 
-        prov = final.get("provenance") or {}
-        c.db_writer.q.put({
-            "op": "MARK_DONE",
-            "run_id": run_id,
-            "status": (ImagingRunStatus.SUCCESS if final.get("success")
-                       else ImagingRunStatus.FAILED),
-            "retcode": 0 if final.get("success") else 1,
-            "finished_at": final.get("finished_at") or now_iso(),
-            "duration_sec": float(elapsed),
-            "output_fits": final.get("output_fits"),
-            "spw_selection": (json.dumps(final["spw_selection"])
-                              if final.get("spw_selection") else None),
-            "field_selection": (json.dumps(final["field_selection"])
-                                if final.get("field_selection") else None),
-            "error_message": final.get("error_message"),
-            "job_json_path": prov.get("job_json"),
-        })
-        if gous_uid:
-            c.scheduler.mark_terminal(
-                machine, gous_uid, run_id,
-                success=bool(final.get("success")),
+            def _on_poll(state):
+                now = time.monotonic()
+                if now - last_db_hb_state["t"] < hb_throttle:
+                    return
+                last_db_hb_state["t"] = now
+                c.db_writer.q.put({
+                    "op": "HEARTBEAT", "run_id": run_id,
+                    "ts": now_iso(),
+                })
+
+            try:
+                final = poll_state_until_terminal(
+                    machine, unit_dir,
+                    g=c.cfg.global_cfg,
+                    expected_tokens=expected_tokens,
+                    on_poll=_on_poll,
+                )
+            except Exception as e:
+                log.exception("adoption poller crashed for run_id=%d", run_id)
+                crashed_exc = e
+        finally:
+            elapsed = time.monotonic() - t0
+            success = bool(final and final.get("success"))
+            prov = (final or {}).get("provenance") or {}
+            # Always emit a terminal DB event so reconciliation on the
+            # next dispatch has a definite status to read.  On poller
+            # crash, mark FAILED and stash the exception text — the
+            # remote worker may still be alive, but the DB needs a
+            # terminal state to release this run from "non-terminal".
+            err_msg = (
+                (final or {}).get("error_message")
+                if final
+                else f"adoption poller crashed: {crashed_exc!r}"
             )
+            c.db_writer.q.put({
+                "op": "MARK_DONE",
+                "run_id": run_id,
+                "status": (ImagingRunStatus.SUCCESS if success
+                           else ImagingRunStatus.FAILED),
+                "retcode": 0 if success else 1,
+                "finished_at": (final or {}).get("finished_at") or now_iso(),
+                "duration_sec": float(elapsed),
+                "output_fits": (final or {}).get("output_fits"),
+                "spw_selection": (json.dumps((final or {})["spw_selection"])
+                                  if (final or {}).get("spw_selection") else None),
+                "field_selection": (json.dumps((final or {})["field_selection"])
+                                    if (final or {}).get("field_selection") else None),
+                "error_message": err_msg,
+                "job_json_path": prov.get("job_json"),
+            })
+            if gous_uid:
+                c.scheduler.mark_terminal(
+                    machine, gous_uid, run_id, success=success,
+                )
+            # Successor-slot spawn: take the now-freed slot capacity
+            # and dispatch a fresh MachineSlot to consume queued units
+            # on this machine.  Capped by the monotonic
+            # ``successors_spawned`` counter so we never exceed the
+            # machine's slot count, regardless of how many adoptions
+            # terminate on the same host.
+            #
+            # IMPORTANT: only spawn if ``final is not None`` — i.e. we
+            # actually observed the adopted worker reach a terminal
+            # state.  If the poller itself crashed (``crashed_exc`` set,
+            # ``final`` is None), the remote worker may still be alive;
+            # spawning a successor in that case would oversubscribe the
+            # host.  We've already emitted MARK_DONE FAILED and called
+            # mark_terminal for DB/scheduler consistency, but we hold
+            # off on a replacement slot for safety.
+            m_cfg = self.machine_cfg
+            to_start: Optional[MachineSlot] = None
+            if m_cfg is not None and final is not None:
+                with c.dynamic_slots_lock:
+                    if not c.new_launch_machines_ready.is_set():
+                        # Preflight hasn't run yet — queue for drain.
+                        c.pending_successors[m_cfg.name] = (
+                            c.pending_successors.get(m_cfg.name, 0) + 1
+                        )
+                    elif m_cfg.name in c.new_launch_machines_names:
+                        spawned = c.successors_spawned.get(m_cfg.name, 0)
+                        if spawned < m_cfg.slots:
+                            c.successors_spawned[m_cfg.name] = spawned + 1
+                            slot = MachineSlot(
+                                f"{m_cfg.name}#post-adopt-{run_id}",
+                                m_cfg, c,
+                            )
+                            c.dynamic_slots.append(slot)
+                            to_start = slot
+            if to_start is not None:
+                try:
+                    to_start.start()
+                except Exception:
+                    log.exception(
+                        "failed to start successor MachineSlot for %s "
+                        "(run_id=%d); rolling back counter",
+                        m_cfg.name if m_cfg else "?", run_id,
+                    )
+                    with c.dynamic_slots_lock:
+                        c.successors_spawned[m_cfg.name] = max(
+                            0, c.successors_spawned.get(m_cfg.name, 0) - 1,
+                        )
+                        try:
+                            c.dynamic_slots.remove(to_start)
+                        except ValueError:
+                            pass
 
     def _gous_from_db(self, run_id: int) -> Optional[str]:
         try:
@@ -1751,6 +1917,25 @@ class DispatchContext:
     deconvolver: str
     scales: list[int]
     gous_inputs: dict[str, list[dict]]
+    # Successor-slot machinery (see AdoptionPoller / preflight drain).
+    # When an adopted unit completes, the AdoptionPoller spawns one
+    # replacement MachineSlot so the freed slot capacity is used.  All
+    # mutation happens under ``dynamic_slots_lock``.
+    dynamic_slots: list = field(default_factory=list)
+    dynamic_slots_lock: threading.Lock = field(default_factory=threading.Lock)
+    # ``pending_successors[machine_name] = count`` records adoption
+    # finishes that happened *before* preflight completed.  The drain
+    # block after preflight consumes these.
+    pending_successors: dict[str, int] = field(default_factory=dict)
+    # Monotonic per-machine cap counter: total successor MachineSlots
+    # ever spawned for this machine.  Used as the cap (never decremented)
+    # so increment-under-lock is sufficient — no is_alive() race.
+    successors_spawned: dict[str, int] = field(default_factory=dict)
+    # Set once preflight has populated ``new_launch_machines_names``.
+    # Adoption pollers that finish before this point queue themselves
+    # in ``pending_successors`` instead of spawning immediately.
+    new_launch_machines_ready: threading.Event = field(default_factory=threading.Event)
+    new_launch_machines_names: set[str] = field(default_factory=set)
 
 
 _du_cache: dict[str, int] = {}
@@ -1842,6 +2027,10 @@ def run_dispatch(
     # 1. Dispatcher lock
     lock = DispatcherLock(base_dir / "imaging" / "dispatch" / ".dispatcher.lock")
     lock.acquire()
+    # ``dispatch_log_handler`` is created later (after ``dispatch_dir`` is
+    # known) and removed in the outer ``finally`` so we never leak a
+    # handler back into the root logger for the next invocation.
+    dispatch_log_handler: Optional[logging.Handler] = None
     try:
         # 2. Reconciliation — runs BEFORE selection so terminal results
         # discovered here are visible to success_exists() and the
@@ -1896,6 +2085,19 @@ def run_dispatch(
         dispatch_dir.mkdir(parents=True, exist_ok=True)
         tokens_dir = dispatch_dir / "staging_tokens"
         tokens_dir.mkdir(exist_ok=True)
+
+        # 3b. Per-dispatch file log handler.  Captures everything the
+        # orchestrator logs for the rest of this run into
+        # ``<dispatch_dir>/dispatch.log`` so future operators can
+        # diagnose hangs/wedges without relying on the launch-time
+        # stdout redirect surviving.  Removed in the outer ``finally``.
+        dispatch_log_handler = logging.FileHandler(
+            dispatch_dir / "dispatch.log"
+        )
+        dispatch_log_handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        ))
+        logging.getLogger().addHandler(dispatch_log_handler)
 
         # 4. Dispatches row
         commit, is_dirty = _git_meta(Path(cfg.repo_path))
@@ -1997,7 +2199,11 @@ def run_dispatch(
         for a in (adoptable or []):
             m_name = a["machine"]
             adopt_per_machine[m_name] = adopt_per_machine.get(m_name, 0) + 1
-            t = AdoptionPoller(a, ctx)
+            # Pass the current-cfg MachineCfg if the adopted unit's host
+            # is still in machines.json; otherwise None disables the
+            # successor-spawn path for this poller (the unit still runs
+            # to terminal under polling).
+            t = AdoptionPoller(a, ctx, machine_cfg=cfg.machines.get(m_name))
             t.start()
             adoption_threads.append(t)
 
@@ -2035,6 +2241,52 @@ def run_dispatch(
                     "skipping new launches but adoptions will still complete"
                 )
 
+        # 10b. Drain any successor-spawn requests that adoption pollers
+        # queued while preflight was running, then mark preflight done
+        # so subsequent pollers spawn successors directly.  All under
+        # ``dynamic_slots_lock`` so an in-flight poller cannot race the
+        # cap (monotonic ``successors_spawned`` counter is incremented
+        # under the same lock).
+        drained_successor_slots: list[MachineSlot] = []
+        with ctx.dynamic_slots_lock:
+            ctx.new_launch_machines_names = set(new_launch_machines.keys())
+            for m_name, count in list(ctx.pending_successors.items()):
+                if m_name in ctx.new_launch_machines_names:
+                    m_cfg = cfg.machines[m_name]
+                    spawned = ctx.successors_spawned.get(m_name, 0)
+                    remaining_cap = max(0, m_cfg.slots - spawned)
+                    n = min(count, remaining_cap)
+                    for i in range(n):
+                        ctx.successors_spawned[m_name] = (
+                            ctx.successors_spawned.get(m_name, 0) + 1
+                        )
+                        slot = MachineSlot(
+                            f"{m_name}#post-adopt-drain-{i}", m_cfg, ctx,
+                        )
+                        ctx.dynamic_slots.append(slot)
+                        drained_successor_slots.append(slot)
+                ctx.pending_successors.pop(m_name, None)
+            ctx.new_launch_machines_ready.set()
+        # Start drained successors OUTSIDE the lock.  See comment in
+        # AdoptionPoller.run() for the rationale.
+        for slot in drained_successor_slots:
+            try:
+                slot.start()
+            except Exception:
+                log.exception(
+                    "failed to start drained successor MachineSlot %s",
+                    slot.name,
+                )
+                with ctx.dynamic_slots_lock:
+                    name = slot.machine.name
+                    ctx.successors_spawned[name] = max(
+                        0, ctx.successors_spawned.get(name, 0) - 1,
+                    )
+                    try:
+                        ctx.dynamic_slots.remove(slot)
+                    except ValueError:
+                        pass
+
         # 11. Slots — only on machines that passed preflight; account for
         # adopted units already running on each.
         slots: list[MachineSlot] = []
@@ -2051,11 +2303,40 @@ def run_dispatch(
                 slot.start()
                 slots.append(slot)
 
-        # 12. Wait for all slots AND adoption pollers to drain
+        # 11b. Observability watchdog — periodic live-counts so a wedge
+        # is visible in the dispatch log rather than silent.
+        watchdog = LiveCountWatchdog(ctx, adoption_threads, slots)
+        watchdog.start()
+
+        # 12. Wait for original slots, then alternate-check adoption
+        # pollers and dynamic (successor) slots until both quiet.  Order
+        # matters: check adoption FIRST each iteration so a successor
+        # that an adoption thread is about to append cannot be missed.
+        # Adoption threads are the only producers of ``dynamic_slots``;
+        # once they are all dead, no new dynamic slots can appear, so
+        # the post-adoption snapshot is final.
         for s in slots:
             s.join()
-        for t in adoption_threads:
-            t.join()
+        while True:
+            any_adoption_alive = any(
+                t.is_alive() for t in adoption_threads
+            )
+            if any_adoption_alive:
+                # Brief join to make progress without burning CPU; we
+                # re-enter the loop to pick up any successor slots an
+                # adoption thread appended in the interim.
+                for t in adoption_threads:
+                    t.join(timeout=2.0)
+                continue
+            # No adoption alive → no new dynamics can be added.  Snapshot
+            # under lock and join whatever is there.
+            with ctx.dynamic_slots_lock:
+                snap = list(ctx.dynamic_slots)
+            any_dynamic_alive = any(s.is_alive() for s in snap)
+            if not any_dynamic_alive:
+                break
+            for s in snap:
+                s.join(timeout=2.0)
 
         # 13. Drain the DB writer queue BEFORE the final cleanup sweep so
         # MARK_DONE events have committed before the cleaner queries
@@ -2072,6 +2353,7 @@ def run_dispatch(
         for r in reapers:
             r.join(timeout=5)
         cleaner.stop(); cleaner.join(timeout=5)
+        watchdog.stop(); watchdog.join(timeout=5)
 
         # 16. End-of-run /raid/ sweep — backstop for paths the periodic
         # cleaner might have missed.  Iterate the union of:
@@ -2127,4 +2409,10 @@ def run_dispatch(
             "machines_used": list(new_launch_machines.keys()),
         }
     finally:
+        if dispatch_log_handler is not None:
+            try:
+                logging.getLogger().removeHandler(dispatch_log_handler)
+                dispatch_log_handler.close()
+            except Exception:
+                log.exception("failed to detach per-dispatch log handler")
         lock.release()
