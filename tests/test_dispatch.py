@@ -1253,3 +1253,249 @@ def test_reconcile_without_abandon_does_not_invoke_cleanup(tmp_path, monkeypatch
 
     assert cleanup_calls == []
     assert lock_release_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Hardening pass (2026-05-21):
+#   - _stop renamed → _stop_event on all Thread subclasses
+#   - AdoptionPoller try/finally guarantees mark_terminal on poll crash
+#   - successor-slot mechanism (monotonic cap counter) when adoption ends
+# ---------------------------------------------------------------------------
+
+
+def test_thread_subclasses_use_stop_event_attribute():
+    """Regression test: ``_stop`` on Thread subclasses shadows
+    ``threading.Thread._stop()`` and can break ``join()``.  Each subclass
+    must expose ``_stop_event`` (the renamed sentinel) and NOT ``_stop``
+    as an instance attribute.
+    """
+    # MachineSlot — construct via minimal duck-typed bits
+    m = D.MachineCfg(name="alpha", raid="/raid", slots=1)
+    # We can't easily build a full DispatchContext, but MachineSlot only
+    # needs ctx for run(); __init__ doesn't touch it.
+    slot = D.MachineSlot("alpha#0", m, ctx=None)  # type: ignore[arg-type]
+    assert hasattr(slot, "_stop_event")
+    assert "_stop" not in vars(slot)
+
+    # GousCleaner
+    sched = D.SchedulerState()
+    cleaner = D.GousCleaner(
+        sched,
+        D.MachinesConfig(
+            conda_env="/x", repo_path="/y", casa_path=None,
+            global_cfg=D.GlobalCfg(), machines={},
+        ),
+        "d_test",
+        D.GlobalCfg(),
+    )
+    assert hasattr(cleaner, "_stop_event")
+    assert "_stop" not in vars(cleaner)
+
+    # TokenReaper
+    reaper = D.TokenReaper(Path("/tmp/no"), D.GlobalCfg(), [])
+    assert hasattr(reaper, "_stop_event")
+    assert "_stop" not in vars(reaper)
+
+
+def _minimal_ctx(tmp_path, dispatch_id="d_test"):
+    """Build a DispatchContext with the bits AdoptionPoller actually uses.
+
+    Skips the cleaner / reaper since the test exercises only the
+    poller's terminal cleanup path.
+    """
+    db = DatabaseManager(tmp_path / "x.db")
+    sched = D.SchedulerState()
+    cfg = D.MachinesConfig(
+        conda_env="/x", repo_path="/y", casa_path=None,
+        global_cfg=D.GlobalCfg(heartbeat_interval_sec=10),
+        machines={"alpha": D.MachineCfg(name="alpha", raid="/raid")},
+    )
+    db_writer = D.DBWriter(db, dispatch_id)
+    db_writer.start()
+    ctx = D.DispatchContext(
+        cfg=cfg, dispatch_id=dispatch_id,
+        dispatch_dir=tmp_path / "disp",
+        publish_dir=tmp_path / "pub",
+        tokens_dir=tmp_path / "tok",
+        db_writer=db_writer, db_manager=db, scheduler=sched,
+        transfer_method="tar", publish_policy="fail_if_exists",
+        deconvolver="multiscale", scales=[0, 5, 10],
+        gous_inputs={},
+    )
+    return ctx, db_writer
+
+
+def test_adoption_poller_releases_slot_on_poll_crash(tmp_path, monkeypatch):
+    """If ``poll_state_until_terminal`` raises, the AdoptionPoller must
+    still call ``mark_terminal`` so the slot doesn't stay stuck in
+    ``in_flight`` for the rest of the dispatch.  It must NOT spawn a
+    successor MachineSlot — the remote worker may still be alive and
+    a successor would oversubscribe the host.
+    """
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        adopted = {
+            "run_id": 999,
+            "machine": "alpha",
+            "unit_dir": tmp_path / "unit",
+            "state": {"gous_uid": "G1", "dispatch_id": "d_prior"},
+            "prior_dispatch_id": "d_prior",
+        }
+        # Make poll_state_until_terminal blow up
+        def _boom(*a, **kw):
+            raise RuntimeError("simulated NAS read failure")
+        monkeypatch.setattr(D, "poll_state_until_terminal", _boom)
+
+        # Even with preflight ready, the crash path must NOT spawn a
+        # successor (gated on ``final is not None``).
+        ctx.new_launch_machines_names = {"alpha"}
+        ctx.new_launch_machines_ready.set()
+        spawned: list = []
+        monkeypatch.setattr(
+            D.MachineSlot, "start",
+            lambda self: spawned.append(self.name),
+        )
+
+        poller = D.AdoptionPoller(
+            adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"],
+        )
+        # Run synchronously in this thread for deterministic assertion
+        poller.run()
+
+        # mark_terminal must have cleared in_flight for (alpha, G1)
+        assert ("alpha", "G1") not in ctx.scheduler.in_flight
+        # And the (machine, gous) pair must be in failed_run_ids
+        assert 999 in ctx.scheduler.failed_run_ids.get(("alpha", "G1"), set())
+        # Successor NOT spawned despite preflight ready
+        assert spawned == [], f"unexpected successor spawn on poll crash: {spawned}"
+        assert ctx.successors_spawned.get("alpha", 0) == 0
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_successor_spawn_caps_at_machine_slots(tmp_path, monkeypatch):
+    """With slots=1, even if multiple adoption pollers complete on the
+    same machine, only one successor MachineSlot is ever spawned (the
+    monotonic ``successors_spawned`` counter caps).
+    """
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        # Mark preflight done so the spawn-now path runs
+        ctx.new_launch_machines_names = {"alpha"}
+        ctx.new_launch_machines_ready.set()
+
+        # Stub out poll + start so we don't actually try to launch
+        # MachineSlot threads or touch NAS.  We just need the spawn
+        # decisions, not the thread bodies.
+        spawned: list = []
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal", lambda *a, **kw: {"success": True},
+        )
+
+        original_start = D.MachineSlot.start
+        def _fake_start(self):
+            spawned.append(self.name)
+        monkeypatch.setattr(D.MachineSlot, "start", _fake_start)
+
+        # Two adoption pollers finishing on the same slots=1 machine
+        for rid in (100, 101):
+            adopted = {
+                "run_id": rid,
+                "machine": "alpha",
+                "unit_dir": tmp_path / f"u{rid}",
+                "state": {"gous_uid": f"G{rid}", "dispatch_id": "d_prior"},
+                "prior_dispatch_id": "d_prior",
+            }
+            poller = D.AdoptionPoller(
+                adopted, ctx,
+                machine_cfg=ctx.cfg.machines["alpha"],
+            )
+            poller.run()
+
+        # Restore for any further test isolation
+        monkeypatch.setattr(D.MachineSlot, "start", original_start)
+
+        # Cap: machine.slots == 1, so only one successor MachineSlot spawned
+        assert ctx.successors_spawned.get("alpha") == 1
+        assert len(spawned) == 1
+        # MachineSlot threads carry a ``slot-`` prefix from __init__
+        assert "alpha#post-adopt-" in spawned[0]
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_pending_successor_queued_when_preflight_not_ready(tmp_path, monkeypatch):
+    """If an adoption finishes BEFORE preflight has set
+    ``new_launch_machines_ready``, the successor request is queued in
+    ``pending_successors`` instead of spawning a slot immediately.
+    """
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        # NOTE: do NOT set new_launch_machines_ready
+        assert not ctx.new_launch_machines_ready.is_set()
+
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal", lambda *a, **kw: {"success": True},
+        )
+        # Block MachineSlot.start so this test doesn't accidentally spawn
+        monkeypatch.setattr(
+            D.MachineSlot, "start", lambda self: None,
+        )
+
+        adopted = {
+            "run_id": 42,
+            "machine": "alpha",
+            "unit_dir": tmp_path / "u42",
+            "state": {"gous_uid": "Galpha", "dispatch_id": "d_prior"},
+            "prior_dispatch_id": "d_prior",
+        }
+        poller = D.AdoptionPoller(
+            adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"],
+        )
+        poller.run()
+
+        # Queued, NOT spawned
+        assert ctx.pending_successors.get("alpha") == 1
+        assert ctx.successors_spawned.get("alpha", 0) == 0
+        assert ctx.dynamic_slots == []
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_adoption_warns_when_gous_uid_unresolvable(tmp_path, monkeypatch, caplog):
+    """If neither state nor DB can resolve a gous_uid, the poller logs
+    a WARNING and skips mark_inflight (so scheduler stays consistent).
+    """
+    import logging as _logging
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal", lambda *a, **kw: {"success": True},
+        )
+        monkeypatch.setattr(D.MachineSlot, "start", lambda self: None)
+
+        adopted = {
+            "run_id": 7,
+            "machine": "alpha",
+            "unit_dir": tmp_path / "u7",
+            "state": {},   # no gous_uid
+            "prior_dispatch_id": "d_prior",
+        }
+        poller = D.AdoptionPoller(
+            adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"],
+        )
+        with caplog.at_level(_logging.WARNING, logger="panta_rei.imaging.dispatch"):
+            poller.run()
+
+        # Warning emitted; mark_inflight skipped → no in_flight entry
+        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+        assert any("no resolvable gous_uid" in r.message for r in warnings), (
+            f"expected warning; got {[r.message for r in warnings]}"
+        )
+        assert ctx.scheduler.in_flight == {}
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
