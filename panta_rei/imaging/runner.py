@@ -1274,6 +1274,7 @@ def run_tclean_feather_parallel(
     log_path: Optional[Path] = None,
     extra_env: Optional[dict] = None,
     aux_products: tuple[str, ...] = ("mask", "residual", "pb"),
+    on_publish_start=lambda: None,
 ) -> tuple[bool, str, Optional[str]]:
     """Execute tclean+feather via mpicasa subprocess for MPI parallelism.
 
@@ -1499,6 +1500,12 @@ def run_tclean_feather_parallel(
             log.warning("aux %s: no canonical path resolved, skipping", kind)
             continue
         pair.append((local_aux, canonical))
+
+    # F2.f: notify caller (remote_worker) that publish is about to start
+    # so it can flip state.json to Phase.PUBLISHING.  Exceptions propagate
+    # — a failed state write means the orchestrator can't reliably tell
+    # whether publish is in progress, so publish is also unsafe to start.
+    on_publish_start()
 
     ok, msg = _publish_pair(pair, policy=publish_policy)
     if not ok:

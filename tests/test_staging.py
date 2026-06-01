@@ -1103,3 +1103,809 @@ def test_cache_link_into_cleans_partial_on_rename_failure(tmp_path, monkeypatch)
         staging.cache_link_into(src, dst)
     leftover_partials = list(dst.parent.glob(f".*.partial"))
     assert leftover_partials == [], f"partial leaked: {leftover_partials}"
+
+
+# ---------------------------------------------------------------------------
+# Staging reclaim hardening (PID-reuse, bounded waits, typed exceptions)
+# v1+v2+v3+v4+v5 plan tests
+# ---------------------------------------------------------------------------
+
+import json as _json
+import socket as _sock
+import shutil as _sh
+
+
+# Behavioural lock-side --------------------------------------------------------
+
+def test_mkdir_lock_times_out_when_holder_persists(tmp_path, monkeypatch):
+    """T1: a wedged ``_holder_alive_locally`` (always True) must surface
+    as ``StaleLockTimeout`` after the configured bound — NOT loop forever."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(), "pid": os.getpid(),
+    }))
+    monkeypatch.setattr(staging, "_holder_alive_locally",
+                        lambda *_a, **_kw: True)
+    lock = staging._MkdirLock(
+        dir_path=lock_dir,
+        wait_timeout_sec=0.3,
+        poll_sleep=(0.01, 0.02),
+    )
+    with pytest.raises(staging.StaleLockTimeout):
+        lock.__enter__()
+
+
+def test_mkdir_lock_deadline_also_bounds_reclaim_loop(tmp_path, monkeypatch):
+    """T1b (post-impl review fix): the deadline must fire even when
+    the loop is stuck in the reclaim path (holder reported dead every
+    iteration but mkdir keeps failing — e.g., a filesystem replaying
+    the directory or a peer racing us).  Without a top-of-loop deadline
+    check, the v3 implementation would loop forever here."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(), "pid": 1,
+    }))
+    # Always-dead holder forces the reclaim branch every iteration.
+    monkeypatch.setattr(staging, "_holder_alive_locally",
+                        lambda *_a, **_kw: False)
+    # Make mkdir always raise FileExistsError so we never escape the
+    # reclaim cycle (simulating a peer constantly recreating the dir).
+    real_mkdir = Path.mkdir
+
+    def _always_exists(self, *a, **kw):
+        if self == lock_dir:
+            raise FileExistsError(str(self))
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", _always_exists)
+    lock = staging._MkdirLock(
+        dir_path=lock_dir,
+        wait_timeout_sec=0.3,
+        poll_sleep=(0.01, 0.02),
+    )
+    with pytest.raises(staging.StaleLockTimeout):
+        lock.__enter__()
+
+
+def _holder_reader(d):
+    """Test helper: holder.json bytes or None."""
+    return staging._read_blob(d / "holder.json")
+
+
+def test_atomic_reclaim_returns_false_when_dir_missing(tmp_path):
+    """T1c: ``_atomic_reclaim`` must return False (not raise) if the
+    target directory has already been claimed/removed by a peer."""
+    nonexistent = tmp_path / "gone"
+    assert staging._atomic_reclaim(
+        nonexistent,
+        expected_fingerprint=None,
+        read_fingerprint=_holder_reader,
+    ) is False
+
+
+def test_atomic_reclaim_unique_winner_on_concurrent_calls(tmp_path):
+    """T1d: under contention, at most one ``_atomic_reclaim`` succeeds —
+    the rest get False.  Empirical safety guarantee for the race
+    Codex flagged: two reclaimers cannot both wipe the same dir."""
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    fp_bytes = b'{"pid": 1, "host": "ghost"}'
+    (stale / "holder.json").write_bytes(fp_bytes)
+
+    results: list[bool] = []
+    barrier = threading.Barrier(8)
+
+    def _race():
+        barrier.wait()
+        results.append(staging._atomic_reclaim(
+            stale,
+            expected_fingerprint=fp_bytes,
+            read_fingerprint=_holder_reader,
+        ))
+
+    threads = [threading.Thread(target=_race) for _ in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert results.count(True) == 1
+    assert results.count(False) == 7
+    assert not stale.exists()
+
+
+def test_atomic_reclaim_puts_back_fresh_generation(tmp_path):
+    """T1e (Codex round-2 post-impl): if the directory we rename has a
+    DIFFERENT fingerprint than the stale generation we observed (i.e.,
+    a fresh holder won the lock between our snapshot and our rename),
+    we must put it back rather than wipe the fresh holder."""
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    fresh_bytes = b'{"pid": 99999, "host": "alive"}'
+    (stale / "holder.json").write_bytes(fresh_bytes)
+    stale_snapshot = b'{"pid": 1, "host": "ghost"}'
+
+    result = staging._atomic_reclaim(
+        stale,
+        expected_fingerprint=stale_snapshot,
+        read_fingerprint=_holder_reader,
+    )
+    assert result is False
+    assert stale.exists()
+    assert (stale / "holder.json").read_bytes() == fresh_bytes
+
+
+def test_atomic_reclaim_none_snapshot_uses_age_fallback(tmp_path, monkeypatch):
+    """T1f (Codex round-3 post-impl, blocking #1): when the stale gen
+    had no fingerprint (mid-mkdir window), an old dir is still safely
+    reclaimed via mtime-age fallback, but a freshly-mkdir'd dir
+    (mtime within grace) is put back rather than wiped."""
+    # Case A: old, fingerprint-less stale dir → reclaim.
+    old = tmp_path / "old"
+    old.mkdir()
+    ancient = time.time() - 3600
+    os.utime(old, (ancient, ancient))
+    assert staging._atomic_reclaim(
+        old,
+        expected_fingerprint=None,
+        read_fingerprint=_holder_reader,
+        malformed_grace_sec=1.0,
+    ) is True
+    assert not old.exists()
+
+    # Case B: a fresh mkdir under us → put back, NOT wiped.
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    # No holder.json written yet (race window).
+    result = staging._atomic_reclaim(
+        fresh,
+        expected_fingerprint=None,
+        read_fingerprint=_holder_reader,
+        malformed_grace_sec=30.0,   # fresh dir's age << grace
+    )
+    assert result is False
+    assert fresh.exists()
+
+
+def test_atomic_reclaim_token_fingerprint_blocks_pid_reuse(tmp_path):
+    """T1g (Codex round-3 post-impl, blocking #3): the token-side
+    fingerprint reader includes starttime_ticks so a PID-reused fresh
+    holder with the same numeric pid but different start-time is NOT
+    falsely matched and wiped."""
+    slot = tmp_path / "0"
+    slot.mkdir()
+    # Stale generation snapshot: pid=N, starttime_ticks=S_old.
+    stale_pid = b"12345"
+    stale_st = b"7000"
+    (slot / "pid").write_bytes(stale_pid)
+    (slot / "starttime_ticks").write_bytes(stale_st)
+    stale_fp = staging._read_token_fingerprint(slot)
+    assert stale_fp == stale_pid + b"|" + stale_st
+
+    # Fresh holder takes over: same numeric PID, different start time.
+    (slot / "pid").write_bytes(stale_pid)
+    (slot / "starttime_ticks").write_bytes(b"9999")
+
+    result = staging._atomic_reclaim(
+        slot,
+        expected_fingerprint=stale_fp,
+        read_fingerprint=staging._read_token_fingerprint,
+    )
+    assert result is False
+    assert slot.exists()
+    assert (slot / "starttime_ticks").read_bytes() == b"9999"
+
+
+def test_atomic_reclaim_failed_put_back_leaves_stranded_copy(
+    tmp_path, monkeypatch,
+):
+    """T1h (Codex round-3 post-impl, blocking #2): if put-back fails
+    (renameat2 reports EEXIST: a third contender is at stale_dir, OR
+    renameat2 isn't available on this platform), we must NOT rmtree
+    the renamed copy — that would destroy a valid holder while another
+    owns the original path.  Leave it stranded for operator follow-up."""
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    fresh_bytes = b'{"pid": 99999, "host": "alive"}'
+    (stale / "holder.json").write_bytes(fresh_bytes)
+
+    # Force _safe_restore to return False (simulating EEXIST OR
+    # renameat2 unavailable).
+    monkeypatch.setattr(staging, "_safe_restore", lambda *_a, **_kw: False)
+
+    result = staging._atomic_reclaim(
+        stale,
+        expected_fingerprint=b'something-else',
+        read_fingerprint=_holder_reader,
+    )
+    assert result is False
+    stranded = list(tmp_path.glob("stale.reclaim.*"))
+    assert len(stranded) == 1
+    assert (stranded[0] / "holder.json").read_bytes() == fresh_bytes
+
+
+def test_safe_restore_refuses_to_overwrite_empty_third_contender(tmp_path):
+    """T1i (Codex round-4 post-impl, blocking): _safe_restore must
+    NOT clobber an empty third-contender directory at the destination,
+    even though plain os.rename(dir, empty_dir) succeeds on POSIX."""
+    # Skip if renameat2 isn't available — the fallback is "always
+    # return False" which trivially satisfies the contract.
+    libc = staging._load_libc()
+    if libc is False or not hasattr(libc, "renameat2"):
+        pytest.skip("renameat2 unavailable on this platform")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "marker").write_text("our_renamed_copy")
+
+    dst = tmp_path / "dst"
+    dst.mkdir()  # third contender's fresh empty dir
+
+    ok = staging._safe_restore(src, dst)
+    assert ok is False
+    # Both must remain intact.
+    assert src.exists() and (src / "marker").exists()
+    assert dst.exists() and not (dst / "marker").exists()
+
+
+def test_read_token_fingerprint_returns_none_when_starttime_missing(tmp_path):
+    """T1j (Codex round-4 post-impl, high): tokens lacking
+    starttime_ticks (old-shape OR mid-write) must return None so the
+    age-based fallback handles them, NOT a PID-only false-match."""
+    slot = tmp_path / "0"
+    slot.mkdir()
+    (slot / "pid").write_text("12345")
+    # No starttime_ticks file.
+    assert staging._read_token_fingerprint(slot) is None
+
+    # With both files present, returns the canonical fingerprint.
+    (slot / "starttime_ticks").write_text("7000")
+    fp = staging._read_token_fingerprint(slot)
+    assert fp == b"12345|7000"
+
+
+def test_read_token_fingerprint_returns_none_for_empty_or_malformed(tmp_path):
+    """T1k (Codex round-5 post-impl, high): empty/malformed metadata
+    files must produce None, not "pid|" or "|st" — those shapes would
+    collide across generations under PID reuse if either side was mid-
+    write (Path.write_text truncates before writing)."""
+    def _slot(name, pid_content, st_content):
+        s = tmp_path / name
+        s.mkdir()
+        if pid_content is not None:
+            (s / "pid").write_text(pid_content)
+        if st_content is not None:
+            (s / "starttime_ticks").write_text(st_content)
+        return s
+
+    # Empty starttime_ticks (mid-write window).
+    s = _slot("empty_st", "12345", "")
+    assert staging._read_token_fingerprint(s) is None
+    # Empty pid.
+    s = _slot("empty_pid", "", "7000")
+    assert staging._read_token_fingerprint(s) is None
+    # Whitespace-only.
+    s = _slot("ws", "  \n", "  ")
+    assert staging._read_token_fingerprint(s) is None
+    # Malformed pid (non-numeric).
+    s = _slot("bad_pid", "not-a-pid", "7000")
+    assert staging._read_token_fingerprint(s) is None
+    # Malformed starttime.
+    s = _slot("bad_st", "12345", "garbage")
+    assert staging._read_token_fingerprint(s) is None
+    # Negative pid/starttime.
+    s = _slot("neg_pid", "-1", "7000")
+    assert staging._read_token_fingerprint(s) is None
+    # Trailing newline IS tolerated (write_text default behaviour).
+    s = _slot("trailing_nl", "12345\n", "7000\n")
+    assert staging._read_token_fingerprint(s) == b"12345|7000"
+
+
+def test_acquire_staging_token_deadline_bounds_reclaim_loop(
+    tmp_path, monkeypatch,
+):
+    """T13b (post-impl review fix): the outer token loop must enforce
+    the deadline on every iteration, including pathological reclaim
+    paths where _token_holder_alive keeps reporting dead but mkdir
+    keeps failing."""
+    tokens = tmp_path / "tokens"
+    tokens.mkdir()
+    # Pre-create slot 0 in a state that triggers the reclaim path.
+    (tokens / "0").mkdir()
+    (tokens / "0" / "host").write_text("otherhost-fake")
+    (tokens / "0" / "pid").write_text("1")
+
+    # Always-dead so reclaim runs every iteration.
+    monkeypatch.setattr(staging, "_token_holder_alive",
+                        lambda *_a, **_kw: False)
+    # Make slot.mkdir always raise so the for-loop never returns.
+    real_mkdir = Path.mkdir
+
+    def _always_exists(self, *a, **kw):
+        if self.parent == tokens:
+            raise FileExistsError(str(self))
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", _always_exists)
+    with pytest.raises(staging.TokenAcquireTimeout):
+        staging.acquire_staging_token(
+            tokens, n_slots=1, holder_id="t/x",
+            timeout_sec=0.3, poll_sleep=(0.01, 0.02),
+        )
+
+
+def test_mkdir_lock_no_timeout_when_none_passed(tmp_path, monkeypatch):
+    """T2: ``wait_timeout_sec=None`` preserves unbounded behaviour;
+    when the holder finally clears the lock acquires."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(), "pid": os.getpid(),
+    }))
+    release = threading.Event()
+    acquired = threading.Event()
+
+    def _alive(*_a, **_kw):
+        # While the test is "holding" the lock, report alive; once we set
+        # `release`, report dead so the contender reclaims.
+        return not release.is_set()
+
+    monkeypatch.setattr(staging, "_holder_alive_locally", _alive)
+
+    def _worker():
+        with staging._MkdirLock(
+            dir_path=lock_dir,
+            wait_timeout_sec=None,
+            poll_sleep=(0.01, 0.02),
+        ):
+            acquired.set()
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    # Worker should still be blocked
+    assert not acquired.wait(timeout=0.3)
+    release.set()
+    assert acquired.wait(timeout=2.0)
+    t.join()
+
+
+def test_mkdir_lock_progress_log_emits(tmp_path, monkeypatch, caplog):
+    """T3: while waiting, ``_MkdirLock`` logs a periodic WARN."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(), "pid": os.getpid(),
+    }))
+    monkeypatch.setattr(staging, "_holder_alive_locally",
+                        lambda *_a, **_kw: True)
+    monkeypatch.setattr(staging, "_MKDIR_LOCK_PROGRESS_LOG_SEC", 0.05)
+    caplog.set_level("WARNING", logger=staging.log.name)
+    lock = staging._MkdirLock(
+        dir_path=lock_dir,
+        wait_timeout_sec=0.3,
+        poll_sleep=(0.01, 0.02),
+    )
+    with pytest.raises(staging.StaleLockTimeout):
+        lock.__enter__()
+    assert any("still waiting for lock" in r.message for r in caplog.records)
+
+
+def test_stale_lock_timeout_not_subclass_of_oserror():
+    """T4: ``StaleLockTimeout`` MUST NOT be an ``OSError`` so callers'
+    ``except OSError`` clauses don't silently swallow it."""
+    assert not isinstance(staging.StaleLockTimeout(), OSError)
+    assert not isinstance(staging.StaleLockTimeout(), TimeoutError)
+
+
+def test_acquire_cache_populate_propagates_stale_lock_timeout(
+    tmp_path, monkeypatch,
+):
+    """T5: a StaleLockTimeout from the inner GC lock must propagate
+    out of ``acquire_cache_populate`` (NOT be eaten by ``except OSError``)."""
+    src = _fake_ms(tmp_path / "src")
+    cache = tmp_path / "cache"
+
+    real_enter = staging._MkdirLock.__enter__
+
+    def _boom(self):
+        raise staging.StaleLockTimeout(f"forced timeout on {self.dir_path}")
+
+    monkeypatch.setattr(staging._MkdirLock, "__enter__", _boom)
+    with pytest.raises(staging.StaleLockTimeout):
+        staging.acquire_cache_populate(
+            cache, src, timeout_sec=2, poll_sleep=(0.01, 0.02),
+        )
+
+
+def test_stage_one_falls_back_on_stale_lock_timeout(tmp_path, monkeypatch):
+    """T6: a ``StaleLockTimeout`` from ``acquire_cache_populate`` (e.g.
+    the inner GC-lock wedged) must be caught by ``stage_one`` and routed
+    to the NAS-direct fallback — same behaviour as the existing
+    ``TimeoutError`` path.  Per plan v2 Delta 5 + v4 Delta 8: a wedged
+    cache GC lock should not fail an otherwise-stageable unit."""
+    src = _fake_ms(tmp_path / "src")
+    cache = tmp_path / "cache"
+    dst = tmp_path / "dst"
+
+    def _raise(*_a, **_kw):
+        raise staging.StaleLockTimeout("populate timeout")
+
+    monkeypatch.setattr(staging, "acquire_cache_populate", _raise)
+    final, source = staging.stage_one(
+        str(src), dst, method="cp", bucket="ms", cache_root=cache,
+    )
+    assert source == "nas_direct"
+    assert final.exists()
+
+
+def test_inner_gc_lock_capped_by_outer_populate_deadline(tmp_path, monkeypatch):
+    """T7: when the caller passes a small ``timeout_sec``, the inner
+    ``_MkdirLock`` wait must be capped by remaining budget rather than
+    the 300s default."""
+    src = _fake_ms(tmp_path / "src")
+    cache = tmp_path / "cache"
+    captured: dict = {}
+
+    real_init = staging._MkdirLock.__init__
+
+    def _spy_init(self, *a, **kw):
+        captured.setdefault("waits", []).append(kw.get("wait_timeout_sec"))
+        return real_init(self, *a, **kw)
+
+    monkeypatch.setattr(staging._MkdirLock, "__init__", _spy_init)
+    outcome, lock = staging.acquire_cache_populate(
+        cache, src, timeout_sec=1.0, poll_sleep=(0.01, 0.02),
+    )
+    if lock is not None:
+        with lock:
+            pass
+    assert outcome in ("populate", "hit")
+    inner_waits = [w for w in captured["waits"] if w is not None]
+    assert inner_waits, "no _MkdirLock with bounded wait observed"
+    assert all(w <= 1.0 for w in inner_waits), (
+        f"inner wait exceeded outer budget: {inner_waits}"
+    )
+
+
+# PID-reuse + identity ---------------------------------------------------------
+
+def test_holder_alive_detects_pid_reuse_via_starttime(tmp_path):
+    """T8: same PID but different start-time ticks → stale."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    own_start = staging._read_proc_starttime(os.getpid())
+    assert own_start is not None
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(),
+        "pid": os.getpid(),
+        "starttime_ticks": int(own_start) + 1,
+    }))
+    assert staging._holder_alive_locally(lock_dir) is False
+
+
+def test_holder_alive_back_compat_no_starttime(tmp_path):
+    """T9: holder.json without ``starttime_ticks`` falls through to the
+    PID-only check (alive when PID is alive)."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(), "pid": os.getpid(),
+    }))
+    assert staging._holder_alive_locally(lock_dir) is True
+
+
+def test_mkdir_lock_meta_identity_cannot_be_overridden(tmp_path):
+    """T10: caller-supplied ``holder_meta`` with bogus host/pid must NOT
+    overwrite the real identity record."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock = staging._MkdirLock(
+        dir_path=lock_dir,
+        holder_meta={"pid": 99999, "host": "bogus.example.com",
+                     "starttime_ticks": -1},
+        wait_timeout_sec=1.0,
+        poll_sleep=(0.01, 0.02),
+    )
+    with lock:
+        meta = _json.loads((lock_dir / "holder.json").read_text())
+        assert meta["pid"] == os.getpid()
+        assert meta["host"] == _sock.gethostname()
+        # starttime_ticks should be the real one (not -1), or None.
+        own_start = staging._read_proc_starttime(os.getpid())
+        assert meta["starttime_ticks"] == own_start
+
+
+def test_populating_writer_includes_starttime(tmp_path):
+    """T11: ``acquire_cache_populate``'s manual ``.populating/holder.json``
+    must include ``starttime_ticks`` (identity-last, real value)."""
+    src = _fake_ms(tmp_path / "src")
+    cache = tmp_path / "cache"
+    outcome, lock = staging.acquire_cache_populate(
+        cache, src, timeout_sec=5, poll_sleep=(0.01, 0.02),
+    )
+    assert outcome == "populate"
+    populating = cache / staging._cache_key(src) / ".populating"
+    meta = _json.loads((populating / "holder.json").read_text())
+    assert meta["host"] == _sock.gethostname()
+    assert meta["pid"] == os.getpid()
+    assert "starttime_ticks" in meta
+    own_start = staging._read_proc_starttime(os.getpid())
+    assert meta["starttime_ticks"] == own_start
+    with lock:
+        pass
+
+
+# Hostname --------------------------------------------------------------------
+
+def test_same_host_recognizes_short_fqdn_and_uppercase(monkeypatch):
+    """T12: short/FQDN/uppercase all recognised as same host
+    (case-insensitive per RFC 952/1123)."""
+    monkeypatch.setattr(_sock, "gethostname", lambda: "almap8")
+    monkeypatch.setattr(_sock, "getfqdn", lambda: "almap8.alma.ac.uk")
+    # Reimport names inside staging too — it uses ``socket`` module ref.
+    monkeypatch.setattr(staging.socket, "gethostname", lambda: "almap8")
+    monkeypatch.setattr(staging.socket, "getfqdn", lambda: "almap8.alma.ac.uk")
+    assert staging._same_host("almap8") is True
+    assert staging._same_host("almap8.alma.ac.uk") is True
+    assert staging._same_host("ALMAP8") is True
+    assert staging._same_host("Almap8.ALMA.ac.uk") is True
+    assert staging._same_host("almap9") is False
+    assert staging._same_host("") is False
+
+
+def test_holder_alive_cross_host_still_returns_true(tmp_path, monkeypatch):
+    """T13: a holder.json from a different host must report alive (we
+    have no local way to check; coordinator/operator handles)."""
+    lock_dir = tmp_path / ".stage.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "holder.json").write_text(_json.dumps({
+        "host": "definitely-not-this-host.example",
+        "pid": 2 ** 22,  # almost certainly dead, but cross-host short-circuit
+    }))
+    assert staging._holder_alive_locally(lock_dir) is True
+
+
+# Token-side ------------------------------------------------------------------
+
+def test_acquire_staging_token_times_out_when_all_slots_pinned(tmp_path):
+    """T14: all slots pinned with live PID + matching starttime →
+    ``TokenAcquireTimeout``."""
+    tok = tmp_path / "tokens"
+    tok.mkdir()
+    own_start = staging._read_proc_starttime(os.getpid())
+    for i in range(2):
+        slot = tok / str(i)
+        slot.mkdir()
+        (slot / "host").write_text(_sock.gethostname())
+        (slot / "pid").write_text(str(os.getpid()))
+        (slot / "holder").write_text(f"pinned/{i}")
+        (slot / "acquired_at").write_text(str(time.time()))
+        if own_start is not None:
+            (slot / "starttime_ticks").write_text(str(own_start))
+    with pytest.raises(staging.TokenAcquireTimeout):
+        staging.acquire_staging_token(
+            tok, n_slots=2, holder_id="contender",
+            poll_sleep=(0.01, 0.02), timeout_sec=0.3,
+        )
+
+
+def test_acquire_staging_token_reclaims_on_starttime_mismatch(tmp_path):
+    """T15: slot 0 pinned with mismatched starttime_ticks → reclaimed
+    and acquired."""
+    tok = tmp_path / "tokens"
+    tok.mkdir()
+    own_start = staging._read_proc_starttime(os.getpid())
+    slot = tok / "0"
+    slot.mkdir()
+    (slot / "host").write_text(_sock.gethostname())
+    (slot / "pid").write_text(str(os.getpid()))
+    (slot / "holder").write_text("ghost")
+    (slot / "acquired_at").write_text(str(time.time()))
+    if own_start is not None:
+        (slot / "starttime_ticks").write_text(str(int(own_start) + 1))
+    i = staging.acquire_staging_token(
+        tok, n_slots=1, holder_id="real",
+        poll_sleep=(0.01, 0.02), timeout_sec=2,
+    )
+    assert i == 0
+    # The slot's new metadata must be OUR holder_id
+    assert (slot / "holder").read_text() == "real"
+    staging.release_staging_token(tok, i)
+
+
+def test_token_metadata_includes_starttime_ticks(tmp_path):
+    """T16: fresh ``acquire_staging_token`` writes ``starttime_ticks``."""
+    tok = tmp_path / "tokens"
+    i = staging.acquire_staging_token(
+        tok, n_slots=2, holder_id="x",
+        poll_sleep=(0.01, 0.02), timeout_sec=2,
+    )
+    slot = tok / str(i)
+    assert (slot / "host").exists()
+    assert (slot / "pid").exists()
+    assert (slot / "holder").exists()
+    assert (slot / "acquired_at").exists()
+    assert (slot / "starttime_ticks").exists()
+    # starttime parses as int
+    assert int((slot / "starttime_ticks").read_text().strip()) >= 0
+    staging.release_staging_token(tok, i)
+
+
+def test_list_held_tokens_exposes_starttime(tmp_path):
+    """T17: ``list_held_tokens`` returns dict with ``starttime_ticks``
+    when present."""
+    tok = tmp_path / "tokens"
+    i = staging.acquire_staging_token(
+        tok, n_slots=1, holder_id="x",
+        poll_sleep=(0.01, 0.02), timeout_sec=2,
+    )
+    held = staging.list_held_tokens(tok)
+    assert len(held) == 1
+    assert "starttime_ticks" in held[0]
+    assert isinstance(held[0]["starttime_ticks"], int)
+    staging.release_staging_token(tok, i)
+
+
+def test_list_held_tokens_back_compat_old_token(tmp_path):
+    """T18 (BACK-COMPAT CRITICAL): an old-shape token (no
+    ``starttime_ticks`` file) must report ``starttime_ticks: None`` and
+    NOT be misclassified as malformed.  Misclassification would cause
+    the dispatch ``TokenReaper`` to drop live cross-version tokens."""
+    tok = tmp_path / "tokens"
+    tok.mkdir()
+    slot = tok / "0"
+    slot.mkdir()
+    (slot / "host").write_text(_sock.gethostname())
+    (slot / "pid").write_text(str(os.getpid()))
+    (slot / "holder").write_text("old-style/1")
+    (slot / "acquired_at").write_text(str(time.time()))
+    # NO starttime_ticks file
+    held = staging.list_held_tokens(tok)
+    assert len(held) == 1
+    rec = held[0]
+    assert rec["host"] == _sock.gethostname()
+    assert rec["pid"] == os.getpid()
+    assert rec["holder"] == "old-style/1"
+    assert rec["starttime_ticks"] is None
+
+
+def test_token_malformed_grace_window_preserved(tmp_path):
+    """T19: a mid-write token (slot dir exists but no host/pid yet) within
+    the malformed grace window must NOT be stolen by a contender."""
+    tok = tmp_path / "tokens"
+    tok.mkdir()
+    slot = tok / "0"
+    slot.mkdir()
+    # No metadata files yet — simulates the brief mkdir-then-write window.
+    # _token_holder_alive should report True within the grace window.
+    assert staging._token_holder_alive(slot, malformed_grace_sec=60.0) is True
+
+
+def test_token_lease_propagates_token_acquire_timeout(tmp_path):
+    """T20: ``TokenLease.acquire_if_needed`` propagates
+    ``TokenAcquireTimeout`` from ``acquire_staging_token``."""
+    tok = tmp_path / "tokens"
+    tok.mkdir()
+    own_start = staging._read_proc_starttime(os.getpid())
+    slot = tok / "0"
+    slot.mkdir()
+    (slot / "host").write_text(_sock.gethostname())
+    (slot / "pid").write_text(str(os.getpid()))
+    (slot / "holder").write_text("pinned")
+    (slot / "acquired_at").write_text(str(time.time()))
+    if own_start is not None:
+        (slot / "starttime_ticks").write_text(str(own_start))
+    lease = staging.TokenLease(
+        tok, n_slots=1, holder_id="contender", timeout_sec=0.3,
+    )
+    with pytest.raises(staging.TokenAcquireTimeout):
+        lease.acquire_if_needed()
+
+
+def test_token_acquire_timeout_is_timeout_error():
+    """T21 (back-compat sanity): existing callers ``except TimeoutError``
+    still catch the new typed subclass."""
+    assert isinstance(staging.TokenAcquireTimeout(), TimeoutError)
+    assert issubclass(staging.TokenAcquireTimeout, TimeoutError)
+
+
+def test_token_acquire_timeout_default_changed_to_1800():
+    """T22: ``acquire_staging_token``'s default ``timeout_sec`` changed
+    from None to 1800s (the new bound)."""
+    import inspect
+    sig = inspect.signature(staging.acquire_staging_token)
+    assert sig.parameters["timeout_sec"].default == 1800.0
+    assert staging._DEFAULT_TOKEN_WAIT_TIMEOUT_SEC == 1800.0
+
+
+# Eviction --------------------------------------------------------------------
+
+def test_cache_evict_until_free_times_out_on_stale_gc_lock(
+    tmp_path, monkeypatch, caplog,
+):
+    """T23: a wedged GC lock surfaces as 0 evictions + WARN log."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    # Pre-create the GC lock dir and pin it with a live holder.
+    gc_lock = cache / ".gc.lock.d"
+    gc_lock.mkdir()
+    (gc_lock / "holder.json").write_text(_json.dumps({
+        "host": _sock.gethostname(), "pid": os.getpid(),
+    }))
+    monkeypatch.setattr(staging, "_holder_alive_locally",
+                        lambda *_a, **_kw: True)
+    caplog.set_level("WARNING", logger=staging.log.name)
+    n = staging.cache_evict_until_free(
+        cache, target_free_bytes=1, wait_timeout_sec=0.3,
+    )
+    assert n == 0
+    assert any("GC lock timeout" in r.message for r in caplog.records)
+
+
+# v5 Delta 1 / 2 additions ----------------------------------------------------
+
+def test_stage_one_propagates_token_acquire_timeout_through_populate(
+    tmp_path, monkeypatch,
+):
+    """T24 (v5 Delta 1): the narrowed populate ``except`` clause must
+    re-raise ``TokenAcquireTimeout`` rather than downgrade to NAS-direct.
+    Also asserts NAS-direct path is NOT entered."""
+    src = _fake_ms(tmp_path / "src")
+    cache = tmp_path / "cache"
+
+    # Force token-lease acquire to raise TokenAcquireTimeout.
+    nas_calls = {"n": 0}
+    acquire_calls = {"n": 0}
+
+    def _spy_do_nas_read(*_a, **_kw):
+        nas_calls["n"] += 1
+
+    monkeypatch.setattr(staging, "_do_nas_read", _spy_do_nas_read)
+
+    def _raise_timeout(self):
+        acquire_calls["n"] += 1
+        raise staging.TokenAcquireTimeout("forced for test")
+
+    monkeypatch.setattr(staging.TokenLease, "acquire_if_needed", _raise_timeout)
+
+    tokens = tmp_path / "tokens"
+    lease = staging.TokenLease(tokens, n_slots=1, holder_id="x")
+    with pytest.raises(staging.TokenAcquireTimeout):
+        staging.stage_one(
+            str(src), tmp_path / "dst", method="cp", bucket="ms",
+            cache_root=cache, token_lease=lease,
+        )
+    # NAS-direct must NOT have been attempted.
+    assert nas_calls["n"] == 0
+    # And the populate block must NOT have looped through to NAS-direct
+    # for a second token attempt — proves the narrowed except clause
+    # actually re-raises rather than silently retrying.
+    assert acquire_calls["n"] == 1
+
+
+def test_stage_one_eviction_inherits_populate_deadline(tmp_path, monkeypatch):
+    """T25 (v5 Delta 2): the populate-branch's call to
+    ``cache_evict_until_free`` must pass a ``wait_timeout_sec`` capped
+    by the outer ``cache_populate_timeout_sec``."""
+    src = _fake_ms(tmp_path / "src")
+    cache = tmp_path / "cache"
+    captured: dict = {}
+
+    real_evict = staging.cache_evict_until_free
+
+    def _spy_evict(*a, **kw):
+        captured["wait_timeout_sec"] = kw.get("wait_timeout_sec")
+        return real_evict(*a, **kw)
+
+    monkeypatch.setattr(staging, "cache_evict_until_free", _spy_evict)
+    # cache_min_free_bytes must be set to trigger eviction.
+    staging.stage_one(
+        str(src), tmp_path / "dst", method="cp", bucket="ms",
+        cache_root=cache, cache_min_free_bytes=1,
+        cache_populate_timeout_sec=10.0,
+    )
+    assert "wait_timeout_sec" in captured, (
+        "cache_evict_until_free not called with wait_timeout_sec"
+    )
+    assert captured["wait_timeout_sec"] is not None
+    assert captured["wait_timeout_sec"] <= 10.0, (
+        f"wait_timeout_sec={captured['wait_timeout_sec']} exceeded outer 10s budget"
+    )

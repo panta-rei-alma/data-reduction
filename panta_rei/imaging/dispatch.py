@@ -71,11 +71,26 @@ class GlobalCfg:
     heartbeat_interval_sec: int = 30
     heartbeat_stale_threshold_sec: int = 300
     max_stale_alive_sec: int = 3600
-    state_appeared_timeout_sec: int = 60
+    # Raised from 60s (v5 plan F2.e): cold-cache NFS-backed worker startup
+    # can need several minutes under contention.  Bounded waste per failed
+    # unit is now ~300s + verify-or-quarantine flow.
+    state_appeared_timeout_sec: int = 300
     poll_interval_sec: int = 10
     cleanup_interval_sec: int = 30
     token_reaper_interval_sec: int = 60
     ssh_timeout_sec: int = 30
+    # How long to wait for ``worker.pidfile`` to appear after a launch
+    # whose wrapper_pid is unknown (ssh-timeout, ssh rc!=0, or successful
+    # ssh with unparsable pidfile).  See F2.c + Delta 3.
+    launch_pidfile_wait_sec: int = 30
+    # Single grace knob applied to BOTH worker-side (graceful publish
+    # finish) and orchestrator-side (SIGTERM-to-SIGKILL wait, plus 30s
+    # buffer).  See v4 Delta 6.
+    worker_shutdown_grace_sec: int = 300
+    # If state.json reappears as ``publishing``/``running`` after the
+    # initial state_appeared_timeout, resume polling for up to this many
+    # seconds before quarantining the host.  See F2.h.
+    late_state_grace_sec: int = 1800
 
 
 @dataclass
@@ -304,7 +319,25 @@ class SchedulerState:
     # target for each (machine, gous) pair.  Adopted units inherit the
     # *prior* dispatch_id; new units use the current one.
     pair_dispatch_id: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Per-dispatch host quarantine (v3 F2.d): a host added here is
+    # excluded from pick(), causes its MachineSlot.run() to exit, and
+    # blocks GousCleaner / end-of-run sweep from touching anything on it.
+    quarantined_machines: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def quarantine(self, machine: str, *, reason: str = "") -> None:
+        with self.lock:
+            self.quarantined_machines.add(machine)
+
+    def quarantine_all(self, machines) -> None:
+        with self.lock:
+            for m in machines:
+                if m:
+                    self.quarantined_machines.add(m)
+
+    def is_quarantined(self, machine: str) -> bool:
+        with self.lock:
+            return machine in self.quarantined_machines
 
     def queued_for_gous_on_machine(self, gous: str, machine: str) -> int:
         with self.lock:
@@ -321,6 +354,9 @@ class SchedulerState:
     def pick(self, machine: str, run_id_assigner) -> Optional[ImagingUnit]:
         """Return a unit for *machine* per the affinity strategy."""
         with self.lock:
+            # Quarantined host: refuse to assign new work (F2.d).
+            if machine in self.quarantined_machines:
+                return None
             # 1. mapped + staged on this machine
             for i, u in enumerate(self.queue):
                 if (self.gous_machine.get(u.gous_uid) == machine
@@ -547,6 +583,107 @@ def ssh_kill_pgid(machine: str, pgid: int, signal_name: str = "TERM",
 
 
 # ---------------------------------------------------------------------------
+# Verify-or-quarantine cleanup (shared by _dispatch_one + AdoptionPoller +
+# reconcile_prior).  See plan v3 F2.b/v4 Delta 1.
+# ---------------------------------------------------------------------------
+
+# Outcomes from verify_and_kill_worker:
+VERIFY_DEAD = "dead"                # confirmed not running (or PID reused)
+VERIFY_KILLED = "killed"            # alive but TERM/KILL confirmed it dead
+VERIFY_INCONCLUSIVE = "inconclusive"  # ssh-unreachable or kill didn't take
+
+
+def verify_and_kill_worker(
+    machine: str,
+    wrapper_pid: Optional[int],
+    expected_tokens: list[str],
+    g: GlobalCfg,
+    *,
+    sleep_fn=time.sleep,
+) -> tuple[str, str]:
+    """Verify worker ownership, kill if needed, return outcome.
+
+    Returns ``(outcome, message)`` where ``outcome`` is one of
+    ``VERIFY_DEAD``, ``VERIFY_KILLED``, ``VERIFY_INCONCLUSIVE``.
+
+    - ``VERIFY_DEAD``: worker confirmed not running (genuinely dead per
+      ``__DEAD__`` or PID reused for unrelated cmdline).  Safe to
+      MARK_DONE FAILED.
+    - ``VERIFY_KILLED``: worker was alive and we successfully killed it
+      (verified dead after TERM, or after escalation to KILL).  Safe to
+      MARK_DONE FAILED.
+    - ``VERIFY_INCONCLUSIVE``: ssh failed or kill didn't take.  Caller
+      MUST quarantine the host — cleanup is unverified.
+    """
+    if not wrapper_pid:
+        # No PID to verify or kill; caller should treat as inconclusive
+        # (worker may exist with unknown pid).
+        return VERIFY_INCONCLUSIVE, "no wrapper_pid to verify"
+
+    alive, info = ssh_pid_alive(
+        machine, int(wrapper_pid), expected_tokens, timeout=10,
+    )
+    if alive is None:
+        return VERIFY_INCONCLUSIVE, f"ssh-unreachable: {info}"
+    if alive is False:
+        if info:
+            # PID reused for an unrelated process; our worker is gone.
+            return VERIFY_DEAD, f"pid_reused_or_token_mismatch: {info!r}"
+        # __DEAD__ — worker is genuinely not running anymore.
+        return VERIFY_DEAD, "worker_already_exited"
+
+    # alive is True — send SIGTERM, wait the grace, verify.
+    ssh_kill_pgid(machine, int(wrapper_pid), "TERM")
+    sleep_fn(g.worker_shutdown_grace_sec + 30)
+    alive2, info2 = ssh_pid_alive(
+        machine, int(wrapper_pid), expected_tokens, timeout=10,
+    )
+    if alive2 is False:
+        return VERIFY_KILLED, f"sigterm_killed: {info2!r}"
+    if alive2 is None:
+        return VERIFY_INCONCLUSIVE, f"ssh-unreachable post-TERM: {info2}"
+
+    # Still alive — escalate to SIGKILL.
+    ssh_kill_pgid(machine, int(wrapper_pid), "KILL")
+    sleep_fn(5)
+    alive3, info3 = ssh_pid_alive(
+        machine, int(wrapper_pid), expected_tokens, timeout=10,
+    )
+    if alive3 is False:
+        return VERIFY_KILLED, f"sigkill_killed: {info3!r}"
+    if alive3 is None:
+        return VERIFY_INCONCLUSIVE, f"ssh-unreachable post-KILL: {info3}"
+    return VERIFY_INCONCLUSIVE, f"still alive after SIGKILL: {info3!r}"
+
+
+def _read_pidfile(nas_unit_dir: Path) -> Optional[int]:
+    """Return the wrapper_pid recorded in worker.pidfile, or None."""
+    p = Path(nas_unit_dir) / "worker.pidfile"
+    try:
+        return int(p.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _wait_for_pidfile(
+    nas_unit_dir: Path,
+    wait_sec: float,
+    *,
+    sleep_fn=time.sleep,
+    poll_interval: float = 1.0,
+) -> Optional[int]:
+    """Poll for worker.pidfile up to wait_sec; return parsed PID or None."""
+    deadline = time.monotonic() + max(0.0, float(wait_sec))
+    while True:
+        pid = _read_pidfile(nas_unit_dir)
+        if pid is not None:
+            return pid
+        if time.monotonic() >= deadline:
+            return None
+        sleep_fn(poll_interval)
+
+
+# ---------------------------------------------------------------------------
 # Remote launch via a NAS-resident shell launcher script
 # ---------------------------------------------------------------------------
 
@@ -653,6 +790,33 @@ def launch_detached(
 # Polling
 # ---------------------------------------------------------------------------
 
+# Synthetic reasons returned by poll_state_until_terminal when the caller
+# must run the verify-or-quarantine flow (i.e. the worker state was NOT
+# directly observed as terminal).
+_SYNTHETIC_REASONS = frozenset({
+    "state_missing_timeout",
+    "heartbeat_stale_alive",
+    "state_appeared_after_timeout",
+})
+
+
+def _is_observed_terminal(final: Optional[dict]) -> bool:
+    """Return True iff *final* represents a worker-observed terminal state.
+
+    Synthetic terminals produced by orchestrator timeouts (missing
+    state.json, stale-alive heartbeat, grace expiry) are NOT observed:
+    the remote worker may still be alive and a successor must NOT be
+    spawned without first verifying or quarantining.
+    """
+    if not final:
+        return False
+    if final.get("phase") not in {"done", "failed"}:
+        return False
+    if final.get("reason") in _SYNTHETIC_REASONS:
+        return False
+    return True
+
+
 def poll_state_until_terminal(
     machine: str,
     nas_unit_dir: Path,
@@ -689,10 +853,14 @@ def poll_state_until_terminal(
                 state_appeared = True
             else:
                 if time.monotonic() - started > g.state_appeared_timeout_sec:
-                    # Worker never wrote state — likely crashed at launch
+                    # Worker never wrote state — possibly cold-NFS slow
+                    # startup (worker still alive) or crashed at launch.
+                    # Caller (F2.b) decides between verify+kill and
+                    # quarantine; we just signal the synthetic reason.
                     return {
                         "phase": "failed",
                         "success": False,
+                        "reason": "state_missing_timeout",
                         "error_message": (
                             f"state.json never appeared within "
                             f"{g.state_appeared_timeout_sec}s"
@@ -750,17 +918,20 @@ def poll_state_until_terminal(
                     state.get("run_id"), machine, info,
                 )
                 continue
-            # Alive but heartbeat stale — bound by max_stale_alive
+            # Alive but heartbeat stale — bound by max_stale_alive.
+            # v4 Delta 1: do NOT kill here.  We return a synthetic reason
+            # and let the caller run the verify-or-quarantine flow so an
+            # unverified kill can never silently drop the slot.
             if hb_age > g.max_stale_alive_sec:
-                ssh_kill_pgid(machine, state.get("worker_pgid") or 0, "TERM")
                 return {
                     **state,
                     "phase": "failed",
                     "success": False,
+                    "reason": "heartbeat_stale_alive",
                     "error_message": (
                         f"worker pid {pid} alive but heartbeat stale "
                         f"{hb_age:.0f}s > max_stale_alive "
-                        f"{g.max_stale_alive_sec}s — killed"
+                        f"{g.max_stale_alive_sec}s"
                     ),
                 }
 
@@ -840,14 +1011,43 @@ def write_unit_manifest(
 # Reconciliation pass
 # ---------------------------------------------------------------------------
 
+@dataclass
+class ReconcileResult:
+    """Outcome of reconcile_prior().
+
+    ``adoptable`` is the list of adopt-candidate dicts (back-compat with
+    callers that ignore quarantine).  ``quarantined_hosts`` is a set of
+    hosts whose prior-dispatch cleanup was inconclusive — the orchestrator
+    must seed these into Scheduler.quarantined_machines before preflight
+    and slot creation so they are excluded for the whole new dispatch.
+    """
+    adoptable: list[dict] = field(default_factory=list)
+    quarantined_hosts: set[str] = field(default_factory=set)
+
+    # Back-compat: iterate / len() should behave like the old `list[dict]`
+    # return so callers that simply did ``adoptable = reconcile_prior(...)``
+    # keep working until they migrate to the named field.
+    def __iter__(self):
+        return iter(self.adoptable)
+
+    def __len__(self):
+        return len(self.adoptable)
+
+    def __bool__(self):
+        return bool(self.adoptable) or bool(self.quarantined_hosts)
+
+    def __getitem__(self, idx):
+        return self.adoptable[idx]
+
+
 def reconcile_prior(
     db_manager: DatabaseManager,
     base_dir: Path,
     g: GlobalCfg,
     *,
     abandon: bool = False,
-) -> list[dict]:
-    """Reconcile prior dispatches.  Returns a list of adoptable runs.
+) -> ReconcileResult:
+    """Reconcile prior dispatches.  Returns a ReconcileResult.
 
     For each non-terminal dispatch in the DB:
 
@@ -860,14 +1060,17 @@ def reconcile_prior(
         - Non-terminal + stale heartbeat + ssh-unreachable → keep,
           log warning (coordinator can't safely declare dead).
     - Additionally iterate DB rows in non-terminal state for which no
-      state file exists → if the launch_log shows failure or the
-      heartbeat is missing entirely → MARK_FAILED.
+      state file exists.  v4 Delta 4: this is INCONCLUSIVE, not safe:
+        - ``worker.pidfile`` present → verify+kill; quarantine on
+          inconclusive cleanup.
+        - ``worker.pidfile`` absent → quarantine the host AND leave
+          the row ACTIVE for the next dispatch to recover.
 
     ``abandon=True`` skips all adoption and force-FAILs in-flight units
     of prior dispatches.
     """
     dispatch_root = base_dir / "imaging" / "dispatch"
-    adoptable: list[dict] = []
+    result = ReconcileResult()
 
     with db_manager.connect() as con:
         prior = DispatchesQueries.list_running(con)
@@ -896,7 +1099,7 @@ def reconcile_prior(
                 seen_run_ids.add(run_id)
                 _reconcile_state_entry(
                     db_manager, d_id, run_id, state, run_subdir, g,
-                    adoptable, abandon=abandon,
+                    result, abandon=abandon,
                 )
 
         # Pass 2: DB rows for this dispatch with no state file
@@ -905,11 +1108,69 @@ def reconcile_prior(
         for row in db_rows:
             if row["id"] in seen_run_ids:
                 continue
-            # No state.json — this row's launch likely failed
-            _mark_failed(
-                db_manager, row["id"],
-                error="no state.json found at reconciliation",
-            )
+            if abandon:
+                # --abandon-prior overrides Delta 4 — operator has
+                # explicitly asked to drop the prior dispatch.
+                _mark_failed(
+                    db_manager, row["id"],
+                    error="abandoned by --abandon-prior (no state.json)",
+                )
+                continue
+            # F5 + Delta 4: no state.json may mean (a) launch never
+            # wrote state and crashed, or (b) launch was in progress
+            # when the prior orchestrator died, and the worker may
+            # still be alive on a host we don't know.  Treat as
+            # INCONCLUSIVE.
+            unit_dir = units_dir / str(row["id"])
+            pid = _read_pidfile(unit_dir) if unit_dir.exists() else None
+            machine = (row.get("hostname") or "").split(".", 1)[0]
+            if pid and machine:
+                expected_tokens = [
+                    f"--dispatch-id {d_id}",
+                    f"--run-id {int(row['id'])}",
+                ]
+                outcome, detail = verify_and_kill_worker(
+                    machine, pid, expected_tokens, g,
+                )
+                log.info(
+                    "reconcile: pidfile verify run_id=%d machine=%s "
+                    "outcome=%s detail=%s",
+                    row["id"], machine, outcome, detail,
+                )
+                if outcome == VERIFY_INCONCLUSIVE:
+                    result.quarantined_hosts.add(machine)
+                    log.warning(
+                        "reconcile: QUARANTINE machine=%s run_id=%d "
+                        "(pidfile present, cleanup unverified) — leaving "
+                        "row ACTIVE",
+                        machine, row["id"],
+                    )
+                else:
+                    _mark_failed(
+                        db_manager, row["id"],
+                        error=f"reconcile: no state.json; "
+                              f"worker {outcome} ({detail})",
+                    )
+            else:
+                # No pidfile — Delta 4: still inconclusive.  Quarantine
+                # the host (if we know it) and leave the row active.
+                if machine:
+                    result.quarantined_hosts.add(machine)
+                    log.warning(
+                        "reconcile: QUARANTINE machine=%s run_id=%d "
+                        "(no state.json, no pidfile) — leaving row ACTIVE "
+                        "for next reconcile",
+                        machine, row["id"],
+                    )
+                else:
+                    # No host known — fall back to MARK_DONE FAILED so
+                    # the row doesn't pile up forever (we have no host
+                    # to quarantine and no evidence of liveness).
+                    _mark_failed(
+                        db_manager, row["id"],
+                        error="no state.json found at reconciliation "
+                              "(no pidfile, no recorded host)",
+                    )
 
     # Mark prior dispatches done if they have no surviving non-terminal rows
     for d in prior:
@@ -942,12 +1203,12 @@ def reconcile_prior(
             expected_tokens=["run_imaging_dispatch"],
         )
 
-    return adoptable
+    return result
 
 
 def _reconcile_state_entry(
     db_manager, dispatch_id, run_id, state, unit_dir,
-    g: GlobalCfg, adoptable, *, abandon: bool,
+    g: GlobalCfg, result: "ReconcileResult", *, abandon: bool,
 ) -> None:
     """Apply one prior unit's state to the DB; possibly mark for adoption."""
     phase = state.get("phase", "starting")
@@ -978,7 +1239,7 @@ def _reconcile_state_entry(
         hb_age = float("inf")
 
     if hb_age < g.heartbeat_stale_threshold_sec:
-        adoptable.append({
+        result.adoptable.append({
             "machine": machine, "run_id": run_id,
             "unit_dir": unit_dir, "state": state,
             "expected_tokens": expected_tokens,
@@ -993,7 +1254,7 @@ def _reconcile_state_entry(
             "%.0fs (cmdline ok)",
             run_id, machine, hb_age,
         )
-        adoptable.append({
+        result.adoptable.append({
             "machine": machine, "run_id": run_id,
             "unit_dir": unit_dir, "state": state,
             "expected_tokens": expected_tokens,
@@ -1006,12 +1267,26 @@ def _reconcile_state_entry(
             error=f"abandoned (no heartbeat {hb_age:.0f}s, pid {pid} dead/reused: {info!r})",
         )
         return
-    # alive is None — ssh failed; do NOT mark failed
-    log.warning(
-        "ssh-unreachable during reconcile of run_id=%d on %s: %s; "
-        "leaving row active (rerun --reconcile or use --abandon-prior)",
-        run_id, machine, info,
-    )
+    # alive is None — ssh-unreachable.  Same fail-closed treatment as the
+    # F5 no-pidfile path: we cannot prove the worker is dead, so quarantine
+    # the host (if we know it) and leave the row ACTIVE for the next
+    # reconcile_prior to recover.  Logging the warning is not enough on its
+    # own; without quarantine the next dispatch would happily schedule new
+    # work onto a host with an unverified live worker.
+    if machine:
+        result.quarantined_hosts.add(machine)
+        log.warning(
+            "reconcile: QUARANTINE machine=%s run_id=%d "
+            "(stale heartbeat, ssh-unreachable: %s) — leaving row ACTIVE",
+            machine, run_id, info,
+        )
+    else:
+        log.warning(
+            "ssh-unreachable during reconcile of run_id=%d on %s: %s; "
+            "leaving row active (no host known to quarantine; rerun "
+            "--reconcile or use --abandon-prior)",
+            run_id, machine, info,
+        )
 
 
 def _apply_terminal_to_db(db_manager, run_id, state, unit_dir) -> None:
@@ -1355,6 +1630,14 @@ class GousCleaner(threading.Thread):
         m = self.cfg.machines.get(machine)
         if m is None:
             return
+        # v3 F2.d: never rm -rf on a quarantined host — its worker may
+        # still be alive and reading inputs.
+        if self.scheduler.is_quarantined(machine):
+            log.info(
+                "cleaner: skipping cleanup for %s on quarantined %s",
+                gous, machine,
+            )
+            return
         # Adopted prior-dispatch units live under /raid/d_<prior_id>/...
         # (not /raid/d_<new_id>/...), so we resolve the dispatch_id per
         # pair before building the rm path.
@@ -1409,15 +1692,49 @@ class MachineSlot(threading.Thread):
 
     def run(self) -> None:
         while not self._stop_event.is_set():
+            # Quarantine check BEFORE pick so a quarantine raced into the
+            # scheduler between iterations also exits the slot.
+            if self.ctx.scheduler.is_quarantined(self.machine.name):
+                log.warning(
+                    "slot %s exiting: %s quarantined",
+                    self.slot_id, self.machine.name,
+                )
+                return
             unit = self.ctx.scheduler.pick(self.machine.name, self._next_run_id)
             if unit is None:
                 # Drained — exit slot
+                return
+            # Non-blocking 5: another thread (e.g. an AdoptionPoller
+            # finishing on this host, or _dispatch_one in a sibling slot)
+            # may have quarantined this host between the pre-pick check
+            # above and now.  Re-check immediately before dispatching so
+            # we don't oversubscribe the host with one extra unit.  The
+            # picked unit is dropped from this slot's view; the next
+            # dispatch's reconcile_prior + selection will re-discover it
+            # (we deliberately have not run mark_inflight / INSERT_QUEUED
+            # for it yet, so there is no DB row to leave dangling).
+            if self.ctx.scheduler.is_quarantined(self.machine.name):
+                log.warning(
+                    "slot %s exiting: %s quarantined between pick() and "
+                    "dispatch; dropping unit %s/%s/spw%s (will be "
+                    "re-selected by the next dispatch)",
+                    self.slot_id, self.machine.name,
+                    unit.gous_uid, unit.source_name, unit.spw_id,
+                )
                 return
             try:
                 self._dispatch_one(unit)
             except Exception:
                 log.exception("slot %s crashed on unit %s/%s/spw%s",
                               self.slot_id, unit.gous_uid, unit.source_name, unit.spw_id)
+            # Post-dispatch quarantine check: _dispatch_one may have
+            # quarantined the host on inconclusive cleanup (F2.d).
+            if self.ctx.scheduler.is_quarantined(self.machine.name):
+                log.warning(
+                    "slot %s exiting: %s quarantined",
+                    self.slot_id, self.machine.name,
+                )
+                return
 
     def _next_run_id(self) -> Optional[int]:  # not used by current scheduler
         return None
@@ -1484,88 +1801,207 @@ class MachineSlot(threading.Thread):
             return
         run_id = int(row_id_holder["id"])
 
-        # 2. Build NAS unit dir + manifest
-        nas_unit_dir = c.dispatch_dir / "units" / str(run_id)
-        nas_unit_dir.mkdir(parents=True, exist_ok=True)
-
-        # Use the GOUS-union of inputs the coordinator pre-computed
-        expected_inputs = c.gous_inputs[unit.gous_uid]
-
-        manifest_path = write_unit_manifest(
-            nas_unit_dir,
-            unit=unit,
-            expected_inputs=expected_inputs,
-            publish_dir=c.publish_dir,
-            nproc=self.machine.nproc,
-            casa_path=c.cfg.casa_path,
-            deconvolver=c.deconvolver,
-            scales=c.scales,
-        )
-
-        # 3. Build per-unit launcher.sh on NAS
-        raid_dir = f"{self.machine.raid}/d_{c.dispatch_id}"
-        # Per-host cross-dispatch staging cache lives next to the
-        # per-dispatch dir, scoped to this host's /raid only.
-        cache_root = (
-            f"{self.machine.raid}/cache"
-            if self.machine.cache_min_free_gb is not None else None
-        )
-        launcher = write_launcher_script(
-            nas_unit_dir, c.cfg,
-            raid_dir=raid_dir,
-            manifest_path=str(manifest_path),
-            run_id=run_id,
-            dispatch_id=c.dispatch_id,
-            transfer_method=c.transfer_method,
-            publish_policy=c.publish_policy,
-            tokens_dir=str(c.tokens_dir),
-            max_concurrent_staging=c.cfg.global_cfg.max_concurrent_staging,
-            heartbeat_interval=c.cfg.global_cfg.heartbeat_interval_sec,
-            cache_root=cache_root,
-            cache_min_free_gb=self.machine.cache_min_free_gb,
-        )
-
-        # 4. Mark in-flight before SSH so the cleaner doesn't fire.
-        # Tag with the *current* dispatch_id so cleanup hits the right
-        # /raid/d_<id>/... tree.
-        c.scheduler.mark_inflight(
-            machine, unit.gous_uid, run_id, dispatch_id=c.dispatch_id,
-        )
-
-        # Once mark_inflight is set we MUST release it with mark_terminal
-        # — otherwise pick() will skip this (machine, GOUS) for the rest
-        # of the dispatch.  The sentinel below + try/finally guarantees
-        # that, even if poll_state_until_terminal raises or any other
-        # unexpected exception occurs between here and the bottom.
+        # Sentinels covering everything that must be reconciled in the
+        # ``finally`` below.  Initialised BEFORE the try so they're always
+        # defined regardless of where in the pre-launch path we crash.
+        #
+        # Once mark_inflight is set we MUST either:
+        #   - release it with mark_terminal (cleanup verified — FAILED
+        #     or SUCCESS), or
+        #   - quarantine the host (cleanup unverified — leave run row
+        #     active for next dispatch's reconcile_prior to recover).
+        #
+        # Sentinels:
+        #   ``terminal_recorded``     — mark_terminal was called.
+        #   ``quarantine_recorded``   — _quarantine_and_log was called
+        #                               (or the host is otherwise known
+        #                               to have been deliberately
+        #                               quarantined for this unit).  The
+        #                               finally must not undo this by
+        #                               re-running the post-launch
+        #                               recovery path.
+        #   ``worker_possibly_launched`` — launch_detached returned;
+        #                                  remote worker may be alive
+        #                                  even on SSH failure (Delta 2).
+        #   ``mark_inflight_called``  — scheduler.mark_inflight succeeded;
+        #                               only then is mark_terminal valid.
         terminal_recorded = False
+        quarantine_recorded = False
+        worker_possibly_launched = False
+        mark_inflight_called = False
+        wrapper_pid: Optional[int] = None
+        nas_unit_dir: Optional[Path] = None
+
+        expected_tokens = [
+            f"--dispatch-id {c.dispatch_id}",
+            f"--run-id {run_id}",
+        ]
+
+        def _emit_mark_done_failed(error_message: str, retcode: int = 1) -> None:
+            log.info(
+                "dispatch: MARK_DONE FAILED run_id=%d machine=%s reason=%s "
+                "error=%s",
+                run_id, machine, "synthetic", error_message,
+            )
+            log.warning(
+                "slot %s unit run_id=%d failed: %s",
+                self.slot_id, run_id, error_message,
+            )
+            c.db_writer.q.put({
+                "op": "MARK_DONE",
+                "run_id": run_id,
+                "status": ImagingRunStatus.FAILED,
+                "retcode": int(retcode),
+                "finished_at": now_iso(),
+                "duration_sec": 0.0,
+                "error_message": error_message,
+            })
+
+        def _quarantine_and_log(reason: str, detail: str) -> None:
+            """Quarantine the host; do NOT MARK_DONE; do NOT mark_terminal.
+
+            Sets ``quarantine_recorded`` so the outer ``finally`` does not
+            undo this by re-running the post-launch recovery path (which
+            would otherwise re-verify and possibly MARK_DONE the row that
+            we have deliberately left ACTIVE).
+            """
+            nonlocal quarantine_recorded
+            c.scheduler.quarantine(machine, reason=reason)
+            quarantine_recorded = True
+            log.warning(
+                "dispatch: QUARANTINE machine=%s run_id=%d reason=%s detail=%s "
+                "— run row left ACTIVE for next reconcile_prior",
+                machine, run_id, reason, detail,
+            )
+
         try:
+            # 2. Build NAS unit dir + manifest.  Delta 2: this MUST live
+            # inside the try/finally so a pre-launch crash (e.g. NAS write
+            # failure during manifest/launcher generation) is recoverable.
+            # A pre-launch failure provably did not launch a worker, so
+            # the finally can safely MARK_DONE FAILED + mark_terminal
+            # (gated on ``mark_inflight_called`` to avoid spurious
+            # mark_terminal for an unregistered (machine, gous) pair).
+            nas_unit_dir = c.dispatch_dir / "units" / str(run_id)
+            nas_unit_dir.mkdir(parents=True, exist_ok=True)
+
+            # Use the GOUS-union of inputs the coordinator pre-computed
+            expected_inputs = c.gous_inputs[unit.gous_uid]
+
+            manifest_path = write_unit_manifest(
+                nas_unit_dir,
+                unit=unit,
+                expected_inputs=expected_inputs,
+                publish_dir=c.publish_dir,
+                nproc=self.machine.nproc,
+                casa_path=c.cfg.casa_path,
+                deconvolver=c.deconvolver,
+                scales=c.scales,
+            )
+
+            # 3. Build per-unit launcher.sh on NAS
+            raid_dir = f"{self.machine.raid}/d_{c.dispatch_id}"
+            # Per-host cross-dispatch staging cache lives next to the
+            # per-dispatch dir, scoped to this host's /raid only.
+            cache_root = (
+                f"{self.machine.raid}/cache"
+                if self.machine.cache_min_free_gb is not None else None
+            )
+            launcher = write_launcher_script(
+                nas_unit_dir, c.cfg,
+                raid_dir=raid_dir,
+                manifest_path=str(manifest_path),
+                run_id=run_id,
+                dispatch_id=c.dispatch_id,
+                transfer_method=c.transfer_method,
+                publish_policy=c.publish_policy,
+                tokens_dir=str(c.tokens_dir),
+                max_concurrent_staging=c.cfg.global_cfg.max_concurrent_staging,
+                heartbeat_interval=c.cfg.global_cfg.heartbeat_interval_sec,
+                cache_root=cache_root,
+                cache_min_free_gb=self.machine.cache_min_free_gb,
+            )
+
+            # 4. Mark in-flight before SSH so the cleaner doesn't fire.
+            # Tag with the *current* dispatch_id so cleanup hits the right
+            # /raid/d_<id>/... tree.
+            c.scheduler.mark_inflight(
+                machine, unit.gous_uid, run_id, dispatch_id=c.dispatch_id,
+            )
+            mark_inflight_called = True
+
             # 5. Launch detached
-            ok, msg, wrapper_pid = launch_detached(
+            ok, msg, _wpid = launch_detached(
                 machine, launcher, nas_unit_dir,
                 timeout=c.cfg.global_cfg.ssh_timeout_sec,
             )
-            if not ok:
-                c.db_writer.q.put({
-                    "op": "MARK_DONE",
-                    "run_id": run_id,
-                    "status": ImagingRunStatus.FAILED,
-                    "retcode": 255,
-                    "finished_at": now_iso(),
-                    "duration_sec": 0.0,
-                    "error_message": f"ssh launch failed: {msg}",
-                })
-                c.scheduler.mark_terminal(
-                    machine, unit.gous_uid, run_id, success=False,
+            wrapper_pid = _wpid
+            # Delta 2: any return from launch_detached (ok or not) means
+            # the SSH command may have backgrounded the worker before
+            # returning.  Mark worker_possibly_launched so the crash/
+            # finally path uses verify-or-quarantine.
+            worker_possibly_launched = True
+
+            # Delta 3: if wrapper_pid is unknown for any reason (ssh
+            # timeout, ssh rc!=0, or ssh ok but unparsable pidfile),
+            # wait briefly for worker.pidfile to appear and parse it.
+            if wrapper_pid is None:
+                wrapper_pid = _wait_for_pidfile(
+                    nas_unit_dir,
+                    c.cfg.global_cfg.launch_pidfile_wait_sec,
                 )
-                terminal_recorded = True
+
+            if not ok:
+                # SSH launch did not return cleanly.  If we now have a
+                # pidfile, the worker likely launched — run verify+kill.
+                # If we don't, treat as inconclusive (Delta 3) and
+                # quarantine.
+                if wrapper_pid is not None:
+                    outcome, detail = verify_and_kill_worker(
+                        machine, wrapper_pid, expected_tokens,
+                        c.cfg.global_cfg,
+                    )
+                    if outcome == VERIFY_INCONCLUSIVE:
+                        _quarantine_and_log(
+                            "ssh_launch_failed_unverified",
+                            f"{msg}; {detail}",
+                        )
+                        return
+                    # Verified dead/killed → safe to MARK_DONE FAILED.
+                    _emit_mark_done_failed(
+                        f"ssh launch failed: {msg}; cleanup={detail}",
+                        retcode=255,
+                    )
+                    c.scheduler.mark_terminal(
+                        machine, unit.gous_uid, run_id, success=False,
+                    )
+                    terminal_recorded = True
+                    return
+                # No pidfile after wait — inconclusive.
+                _quarantine_and_log(
+                    "ssh_launch_failed_no_pidfile",
+                    f"{msg}; no worker.pidfile after "
+                    f"{c.cfg.global_cfg.launch_pidfile_wait_sec}s",
+                )
+                return
+
+            # Delta 3 (non-blocking 4): ok=True but we never learned a
+            # wrapper_pid, even after waiting for the pidfile.  Per v4
+            # Delta 3 this is explicitly inconclusive — absence of the
+            # pidfile is NOT proof the worker didn't launch.  Quarantine
+            # rather than polling, to avoid silently scheduling more work
+            # onto a host that may have a live worker we can't track.
+            if wrapper_pid is None:
+                _quarantine_and_log(
+                    "launch_ok_no_pidfile",
+                    f"launch_detached returned ok={ok} msg={msg!r} but no "
+                    f"worker.pidfile appeared within "
+                    f"{c.cfg.global_cfg.launch_pidfile_wait_sec}s",
+                )
                 return
 
             # 6. Poll until terminal
             t0 = time.monotonic()
-            expected_tokens = [
-                f"--dispatch-id {c.dispatch_id}",
-                f"--run-id {run_id}",
-            ]
 
             def _on_phase(phase, state):
                 if phase == "running":
@@ -1606,16 +2042,81 @@ class MachineSlot(threading.Thread):
                 on_phase_change=_on_phase,
                 on_poll=_on_poll,
             )
+
+            # 6b. Synthetic-terminal handling (F2.b + F2.h + Delta 1).
+            # If final.reason is in _SYNTHETIC_REASONS, we did NOT observe
+            # a real terminal — run verify-or-quarantine before MARK_DONE.
+            if not _is_observed_terminal(final) and final.get("phase") == "failed":
+                reason = final.get("reason")
+                # F2.b.i: re-read state.json once.  If phase is now
+                # publishing/done/running, resume polling for the late-state
+                # grace window.  If grace expires without a terminal, quarantine.
+                if reason == "state_missing_timeout":
+                    pid_for_kill = (
+                        wrapper_pid
+                        if wrapper_pid is not None
+                        else _read_pidfile(nas_unit_dir)
+                    )
+                    final = self._handle_state_missing_timeout(
+                        nas_unit_dir, machine, expected_tokens,
+                        pid_for_kill, _on_phase, _on_poll, run_id,
+                    )
+                    if final is None:
+                        # Quarantine path taken inside helper.
+                        _quarantine_and_log(
+                            "state_missing_timeout_unverified",
+                            "see prior log line for verify outcome",
+                        )
+                        return
+                elif reason == "heartbeat_stale_alive":
+                    # Delta 1: worker alive but heartbeat dead.  Verify + kill.
+                    pid_for_kill = (
+                        final.get("worker_pgid")
+                        or final.get("worker_pid")
+                        or wrapper_pid
+                    )
+                    outcome, detail = verify_and_kill_worker(
+                        machine, pid_for_kill, expected_tokens,
+                        c.cfg.global_cfg,
+                    )
+                    if outcome == VERIFY_INCONCLUSIVE:
+                        _quarantine_and_log(
+                            "heartbeat_stale_alive_unverified",
+                            detail,
+                        )
+                        return
+                    final = {
+                        **final,
+                        "error_message": (
+                            (final.get("error_message") or "")
+                            + f" — cleanup={detail}"
+                        ),
+                    }
+
             elapsed = time.monotonic() - t0
 
-            # 7. Apply terminal state to DB
+            # 7. Apply terminal state to DB (observed terminal OR verified-cleanup
+            # synthetic terminal).  F1 + F3: INFO + WARN log lines.
+            success = bool(final.get("success"))
+            status = (ImagingRunStatus.SUCCESS if success
+                      else ImagingRunStatus.FAILED)
+            err = final.get("error_message")
+            log.info(
+                "dispatch: MARK_DONE %s run_id=%d machine=%s elapsed=%.1fs "
+                "error=%s",
+                status, run_id, machine, elapsed, err,
+            )
+            if not success:
+                log.warning(
+                    "slot %s unit run_id=%d failed: %s",
+                    self.slot_id, run_id, err,
+                )
             prov = final.get("provenance") or {}
             c.db_writer.q.put({
                 "op": "MARK_DONE",
                 "run_id": run_id,
-                "status": (ImagingRunStatus.SUCCESS if final.get("success")
-                           else ImagingRunStatus.FAILED),
-                "retcode": 0 if final.get("success") else 1,
+                "status": status,
+                "retcode": 0 if success else 1,
                 "finished_at": final.get("finished_at") or now_iso(),
                 "duration_sec": float(elapsed),
                 "output_fits": final.get("output_fits"),
@@ -1623,50 +2124,194 @@ class MachineSlot(threading.Thread):
                                   if final.get("spw_selection") else None),
                 "field_selection": (json.dumps(final["field_selection"])
                                     if final.get("field_selection") else None),
-                "error_message": final.get("error_message"),
+                "error_message": err,
                 "job_json_path": prov.get("job_json"),
             })
             empty = c.scheduler.mark_terminal(
-                machine, unit.gous_uid, run_id,
-                success=bool(final.get("success")),
+                machine, unit.gous_uid, run_id, success=success,
             )
             terminal_recorded = True
             if empty:
                 # Possible cleanup opportunity — let the cleaner sweep
                 log.debug("(machine=%s, gous=%s) drained", machine, unit.gous_uid)
         finally:
-            if not terminal_recorded:
-                # Unexpected exception path (e.g. poll_state_until_terminal
-                # raised).  Release the scheduler slot with FAILED so the
-                # outer MachineSlot.run() can pick the next unit, and emit
-                # a terminal DB event so reconciliation later isn't blocked
-                # on this run sitting in non-terminal status.
-                log.exception(
-                    "MachineSlot crashed mid-dispatch: machine=%s gous=%s "
-                    "run_id=%d; marking FAILED",
-                    machine, unit.gous_uid, run_id,
-                )
+            # Blocking 1 + 2: only enter the recovery path if NEITHER a
+            # terminal nor a deliberate quarantine has been recorded.
+            # ``quarantine_recorded`` covers the case where a control-flow
+            # path (e.g. ssh_launch_failed_no_pidfile) intentionally left
+            # the row ACTIVE on a quarantined host and returned — without
+            # this guard the finally would re-verify and possibly MARK_DONE
+            # the row, undoing the quarantine.
+            if not terminal_recorded and not quarantine_recorded:
+                # Delta 2: split crash/finally into pre-launch (safe
+                # MARK_DONE) vs post-launch (verify-or-quarantine).
+                # Pre-launch: no worker ever started — mark FAILED.
+                # Post-launch: worker may be alive — quarantine.
+                if not worker_possibly_launched:
+                    log.exception(
+                        "MachineSlot crashed pre-launch: machine=%s gous=%s "
+                        "run_id=%d; marking FAILED",
+                        machine, unit.gous_uid, run_id,
+                    )
+                    # v5 Delta 11 wording: only MARK_DONE if we have a
+                    # run_id allocated, and only mark_terminal if
+                    # mark_inflight was actually called.  This avoids a
+                    # spurious mark_terminal for an unregistered pair if
+                    # the pre-launch crash happened between INSERT_QUEUED
+                    # and mark_inflight (e.g. manifest write failure).
+                    if run_id:
+                        try:
+                            _emit_mark_done_failed(
+                                "MachineSlot crashed pre-launch",
+                            )
+                        except Exception:
+                            log.exception(
+                                "failed to emit MARK_DONE for run_id=%d",
+                                run_id,
+                            )
+                        if mark_inflight_called:
+                            try:
+                                c.scheduler.mark_terminal(
+                                    machine, unit.gous_uid, run_id,
+                                    success=False,
+                                )
+                            except Exception:
+                                log.exception(
+                                    "failed to mark_terminal for machine=%s "
+                                    "gous=%s run_id=%d",
+                                    machine, unit.gous_uid, run_id,
+                                )
+                else:
+                    log.exception(
+                        "MachineSlot crashed POST-launch: machine=%s gous=%s "
+                        "run_id=%d; worker may be alive",
+                        machine, unit.gous_uid, run_id,
+                    )
+                    # If we have a wrapper_pid in this scope, try to verify+kill.
+                    pid_for_kill: Optional[int] = wrapper_pid
+                    if pid_for_kill is None and nas_unit_dir is not None:
+                        pid_for_kill = _read_pidfile(nas_unit_dir)
+                    if pid_for_kill is not None:
+                        outcome, detail = verify_and_kill_worker(
+                            machine, pid_for_kill, expected_tokens,
+                            c.cfg.global_cfg,
+                        )
+                        if outcome != VERIFY_INCONCLUSIVE:
+                            # Verified dead — safe to MARK_DONE FAILED.
+                            try:
+                                _emit_mark_done_failed(
+                                    f"MachineSlot crashed post-launch; "
+                                    f"cleanup={detail}",
+                                )
+                            except Exception:
+                                log.exception(
+                                    "failed to emit MARK_DONE for run_id=%d",
+                                    run_id,
+                                )
+                            try:
+                                c.scheduler.mark_terminal(
+                                    machine, unit.gous_uid, run_id,
+                                    success=False,
+                                )
+                            except Exception:
+                                log.exception(
+                                    "failed to mark_terminal for machine=%s "
+                                    "gous=%s run_id=%d",
+                                    machine, unit.gous_uid, run_id,
+                                )
+                            return
+                    # Inconclusive → quarantine, leave row active.
+                    _quarantine_and_log(
+                        "post_launch_crash_unverified",
+                        "MachineSlot crashed after launch_detached returned",
+                    )
+
+    def _handle_state_missing_timeout(
+        self,
+        nas_unit_dir: Path,
+        machine: str,
+        expected_tokens: list[str],
+        wrapper_pid: Optional[int],
+        on_phase_change,
+        on_poll,
+        run_id: int,
+    ) -> Optional[dict]:
+        """F2.b: handle the state_missing_timeout synthetic terminal.
+
+        Returns the final terminal state if we have one to MARK_DONE,
+        or None if we've already quarantined the host and the caller
+        must return without MARK_DONE.
+        """
+        c = self.ctx
+        g = c.cfg.global_cfg
+        state_path = nas_unit_dir / "state.json"
+        # Re-read state.json once.
+        cur_state: dict = {}
+        if state_path.exists():
+            try:
+                cur_state = json.loads(state_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                cur_state = {}
+        phase = cur_state.get("phase")
+        if phase in ("publishing", "done", "running"):
+            log.info(
+                "dispatch: state_appeared_after_timeout machine=%s run_id=%d "
+                "phase=%s — resuming polling within late_state_grace_sec=%d",
+                machine, run_id, phase, g.late_state_grace_sec,
+            )
+            late_started = time.monotonic()
+            # Bounded re-poll: build a tweaked GlobalCfg with the late
+            # grace as the new state_appeared_timeout AND constrain the
+            # total time spent here.
+            while True:
+                # Quick poll loop reusing poll_state_until_terminal.
                 try:
-                    c.db_writer.q.put({
-                        "op": "MARK_DONE",
-                        "run_id": run_id,
-                        "status": ImagingRunStatus.FAILED,
-                        "retcode": 1,
-                        "finished_at": now_iso(),
-                        "duration_sec": 0.0,
-                        "error_message": "MachineSlot crashed mid-dispatch",
-                    })
-                except Exception:
-                    log.exception("failed to emit MARK_DONE for run_id=%d", run_id)
-                try:
-                    c.scheduler.mark_terminal(
-                        machine, unit.gous_uid, run_id, success=False,
+                    late_final = poll_state_until_terminal(
+                        machine, nas_unit_dir, g=g,
+                        expected_tokens=expected_tokens,
+                        on_phase_change=on_phase_change,
+                        on_poll=on_poll,
                     )
                 except Exception:
                     log.exception(
-                        "failed to mark_terminal for machine=%s gous=%s "
-                        "run_id=%d", machine, unit.gous_uid, run_id,
+                        "late-state re-poll crashed run_id=%d", run_id,
                     )
+                    late_final = None
+                # Observed terminal → return it.
+                if _is_observed_terminal(late_final):
+                    return late_final
+                # Another synthetic — check the grace budget.
+                if (time.monotonic() - late_started) >= g.late_state_grace_sec:
+                    log.warning(
+                        "dispatch: late_state_grace_expired machine=%s "
+                        "run_id=%d — quarantine",
+                        machine, run_id,
+                    )
+                    # F2.h: grace expiry → quarantine, NEVER MARK_DONE.
+                    return None
+                # Otherwise loop and re-poll.
+        # phase is None / starting / staging — proceed to verify+kill.
+        outcome, detail = verify_and_kill_worker(
+            machine, wrapper_pid, expected_tokens, g,
+        )
+        log.info(
+            "dispatch: state_missing_timeout verify run_id=%d machine=%s "
+            "outcome=%s detail=%s",
+            run_id, machine, outcome, detail,
+        )
+        if outcome == VERIFY_INCONCLUSIVE:
+            return None
+        # Cleanup verified — synthesize a FAILED terminal so the normal
+        # MARK_DONE flow proceeds with the typed error_message.
+        return {
+            "phase": "failed",
+            "success": False,
+            "reason": "state_missing_timeout",
+            "error_message": (
+                f"state.json never appeared within "
+                f"{g.state_appeared_timeout_sec}s; cleanup={detail}"
+            ),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1706,9 +2351,11 @@ class LiveCountWatchdog(threading.Thread):
                 live_s = sum(1 for s in self.slots if s.is_alive())
                 with self.ctx.dynamic_slots_lock:
                     live_d = sum(1 for s in self.ctx.dynamic_slots if s.is_alive())
+                with self.ctx.scheduler.lock:
+                    q_n = len(self.ctx.scheduler.quarantined_machines)
                 log.info(
-                    "watchdog: adoption=%d slots=%d dynamic=%d",
-                    live_a, live_s, live_d,
+                    "watchdog: adoption=%d slots=%d dynamic=%d quarantined=%d",
+                    live_a, live_s, live_d, q_n,
                 )
             except Exception:
                 log.exception("watchdog tick failed")
@@ -1780,6 +2427,7 @@ class AdoptionPoller(threading.Thread):
 
         final: Optional[dict] = None
         crashed_exc: Optional[BaseException] = None
+        quarantine_pending = False
         t0 = time.monotonic()
         try:
             last_db_hb_state = {"t": 0.0}
@@ -1807,40 +2455,95 @@ class AdoptionPoller(threading.Thread):
             except Exception as e:
                 log.exception("adoption poller crashed for run_id=%d", run_id)
                 crashed_exc = e
+
+            # Delta 8: synthetic-terminal final → verify-or-quarantine
+            # before MARK_DONE (mirror _dispatch_one's F2.b/F2.h flow).
+            quarantine_pending = False
+            if (
+                final is not None
+                and not _is_observed_terminal(final)
+                and final.get("phase") == "failed"
+            ):
+                # Look up wrapper_pid from state.json's worker_pgid or
+                # pidfile so we can run the verify+kill flow.
+                pid_for_kill = (
+                    final.get("worker_pgid")
+                    or final.get("worker_pid")
+                    or _read_pidfile(unit_dir)
+                )
+                outcome, detail = verify_and_kill_worker(
+                    machine, pid_for_kill, expected_tokens,
+                    c.cfg.global_cfg,
+                )
+                log.info(
+                    "adoption: synthetic terminal verify run_id=%d "
+                    "machine=%s reason=%s outcome=%s detail=%s",
+                    run_id, machine, final.get("reason"), outcome, detail,
+                )
+                if outcome == VERIFY_INCONCLUSIVE:
+                    quarantine_pending = True
+                else:
+                    final = {
+                        **final,
+                        "error_message": (
+                            (final.get("error_message") or "")
+                            + f" — cleanup={detail}"
+                        ),
+                    }
         finally:
             elapsed = time.monotonic() - t0
             success = bool(final and final.get("success"))
             prov = (final or {}).get("provenance") or {}
-            # Always emit a terminal DB event so reconciliation on the
-            # next dispatch has a definite status to read.  On poller
-            # crash, mark FAILED and stash the exception text — the
-            # remote worker may still be alive, but the DB needs a
-            # terminal state to release this run from "non-terminal".
-            err_msg = (
-                (final or {}).get("error_message")
-                if final
-                else f"adoption poller crashed: {crashed_exc!r}"
-            )
-            c.db_writer.q.put({
-                "op": "MARK_DONE",
-                "run_id": run_id,
-                "status": (ImagingRunStatus.SUCCESS if success
-                           else ImagingRunStatus.FAILED),
-                "retcode": 0 if success else 1,
-                "finished_at": (final or {}).get("finished_at") or now_iso(),
-                "duration_sec": float(elapsed),
-                "output_fits": (final or {}).get("output_fits"),
-                "spw_selection": (json.dumps((final or {})["spw_selection"])
-                                  if (final or {}).get("spw_selection") else None),
-                "field_selection": (json.dumps((final or {})["field_selection"])
-                                    if (final or {}).get("field_selection") else None),
-                "error_message": err_msg,
-                "job_json_path": prov.get("job_json"),
-            })
-            if gous_uid:
-                c.scheduler.mark_terminal(
-                    machine, gous_uid, run_id, success=success,
+
+            if quarantine_pending or crashed_exc is not None:
+                # Adoption cleanup is unverified.  Quarantine the host
+                # (Delta 8) and leave the run row ACTIVE so the next
+                # dispatch's reconcile_prior can recover it.  Crashes
+                # also fall through here because we can't confirm the
+                # worker terminated.
+                c.scheduler.quarantine(
+                    machine, reason="adoption_cleanup_unverified",
                 )
+                log.warning(
+                    "adoption: QUARANTINE machine=%s run_id=%d "
+                    "(crashed=%s, quarantine_pending=%s) — leaving row "
+                    "ACTIVE for next reconcile_prior",
+                    machine, run_id, crashed_exc is not None,
+                    quarantine_pending,
+                )
+            else:
+                err_msg = (final or {}).get("error_message")
+                status = (ImagingRunStatus.SUCCESS if success
+                          else ImagingRunStatus.FAILED)
+                log.info(
+                    "adoption: MARK_DONE %s run_id=%d machine=%s "
+                    "elapsed=%.1fs error=%s",
+                    status, run_id, machine, elapsed, err_msg,
+                )
+                if not success:
+                    log.warning(
+                        "adoption: run_id=%d on %s failed: %s",
+                        run_id, machine, err_msg,
+                    )
+                c.db_writer.q.put({
+                    "op": "MARK_DONE",
+                    "run_id": run_id,
+                    "status": status,
+                    "retcode": 0 if success else 1,
+                    "finished_at": (final or {}).get("finished_at") or now_iso(),
+                    "duration_sec": float(elapsed),
+                    "output_fits": (final or {}).get("output_fits"),
+                    "spw_selection": (json.dumps((final or {})["spw_selection"])
+                                      if (final or {}).get("spw_selection") else None),
+                    "field_selection": (json.dumps((final or {})["field_selection"])
+                                        if (final or {}).get("field_selection") else None),
+                    "error_message": err_msg,
+                    "job_json_path": prov.get("job_json"),
+                })
+                if gous_uid:
+                    c.scheduler.mark_terminal(
+                        machine, gous_uid, run_id, success=success,
+                    )
             # Successor-slot spawn: take the now-freed slot capacity
             # and dispatch a fresh MachineSlot to consume queued units
             # on this machine.  Capped by the monotonic
@@ -1848,17 +2551,17 @@ class AdoptionPoller(threading.Thread):
             # machine's slot count, regardless of how many adoptions
             # terminate on the same host.
             #
-            # IMPORTANT: only spawn if ``final is not None`` — i.e. we
-            # actually observed the adopted worker reach a terminal
-            # state.  If the poller itself crashed (``crashed_exc`` set,
-            # ``final`` is None), the remote worker may still be alive;
-            # spawning a successor in that case would oversubscribe the
-            # host.  We've already emitted MARK_DONE FAILED and called
-            # mark_terminal for DB/scheduler consistency, but we hold
-            # off on a replacement slot for safety.
+            # F4 + Delta 8: only spawn if the terminal was OBSERVED (not
+            # synthesized by our timeout, not on a quarantined host, not
+            # on poll crash).  Otherwise the worker may still be alive
+            # and a successor would oversubscribe.
             m_cfg = self.machine_cfg
             to_start: Optional[MachineSlot] = None
-            if m_cfg is not None and final is not None:
+            if (
+                m_cfg is not None
+                and _is_observed_terminal(final)
+                and not c.scheduler.is_quarantined(machine)
+            ):
                 with c.dynamic_slots_lock:
                     if not c.new_launch_machines_ready.is_set():
                         # Preflight hasn't run yet — queue for drain.
@@ -2145,6 +2848,20 @@ def run_dispatch(
         db_writer.start()
 
         scheduler = SchedulerState(queue=list(ready))
+        # Delta 5: seed quarantined hosts surfaced by reconcile_prior
+        # (e.g. prior-dispatch run with no state/no pidfile, or
+        # inconclusive verify+kill).  Must happen BEFORE preflight so
+        # quarantined hosts are skipped end-to-end.
+        if isinstance(adoptable, ReconcileResult):
+            qhosts = adoptable.quarantined_hosts
+        else:
+            qhosts = set()
+        if qhosts:
+            scheduler.quarantine_all(qhosts)
+            log.warning(
+                "dispatch: seeded %d quarantined host(s) from reconcile: %s",
+                len(qhosts), sorted(qhosts),
+            )
         ctx = DispatchContext(
             cfg=cfg, dispatch_id=dispatch_id, dispatch_dir=dispatch_dir,
             publish_dir=publish_dir, tokens_dir=tokens_dir,
@@ -2219,6 +2936,15 @@ def run_dispatch(
             nas_probe = str(publish_dir.parent if publish_dir.parent.exists()
                             else publish_dir)
             for name, m in cfg.machines.items():
+                # Delta 5: a host quarantined by reconcile_prior never
+                # gets a preflight or a slot.
+                if scheduler.is_quarantined(name):
+                    log.warning(
+                        "skipping preflight for %s: quarantined by "
+                        "reconcile_prior",
+                        name,
+                    )
+                    continue
                 required_gb = max_gous_gb + 50 + (m.slots * max_gous_gb)
                 ok, details = ssh_preflight_machine(
                     name, m, cfg,
@@ -2371,6 +3097,14 @@ def run_dispatch(
             m = cfg.machines.get(m_name)
             if m is None:
                 continue
+            # v3 F2.d: never rm -rf on a quarantined host (a worker may
+            # still be alive and reading inputs).
+            if scheduler.is_quarantined(m_name):
+                log.info(
+                    "end-of-run sweep: skipping %s/%s (quarantined)",
+                    m_name, did,
+                )
+                continue
             try:
                 ssh_run(
                     m_name,
@@ -2386,8 +3120,31 @@ def run_dispatch(
         # 17. Stop DB writer + mark dispatch(es) done.
         db_writer.stop()
         db_writer.join(timeout=10)
+        # v5 Delta 11: if any rows for THIS dispatch remain non-terminal
+        # (e.g. left active by a quarantine), DO NOT mark the dispatch
+        # DONE — otherwise reconcile_prior scans only RUNNING dispatches
+        # and the orphan row becomes invisible.
         with db_manager.connect() as con:
-            DispatchesQueries.mark_terminal(con, dispatch_id, DispatchState.DONE)
+            current_active = ImagingRunsQueries.list_running_for_dispatch(
+                con, dispatch_id,
+            )
+        if current_active:
+            unresolved_ids = sorted(r["id"] for r in current_active)
+            with scheduler.lock:
+                qhosts = sorted(scheduler.quarantined_machines)
+            log.warning(
+                "dispatch %s left RUNNING: %d unresolved run(s) %s, "
+                "quarantined hosts: %s — next dispatch's reconcile_prior "
+                "will recover",
+                dispatch_id, len(unresolved_ids), unresolved_ids, qhosts,
+            )
+        else:
+            with db_manager.connect() as con:
+                DispatchesQueries.mark_terminal(
+                    con, dispatch_id, DispatchState.DONE,
+                )
+                con.commit()
+        with db_manager.connect() as con:
             # Prior dispatches: mark DONE if they have no surviving
             # non-terminal rows now that adoptions have completed.
             for prior_did in prior_dispatch_ids:
