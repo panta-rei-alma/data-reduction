@@ -61,6 +61,38 @@ TERMINAL_PHASES = {Phase.DONE, Phase.FAILED}
 
 
 # ---------------------------------------------------------------------------
+# Graceful shutdown (F2.g)
+# ---------------------------------------------------------------------------
+
+# Flipped to True by the SIGTERM handler.  Checked at safe points in
+# run_unit so the worker can finish an in-flight publish before exiting.
+# Module-level so the handler closure stays simple and so it survives
+# across imports if anything ever re-imports the module.
+_shutdown_requested: bool = False
+
+
+def _install_sigterm_handler() -> None:
+    """Install a SIGTERM handler that requests a graceful shutdown.
+
+    Orchestrator sends SIGTERM via ``ssh_kill_pgid(..., "TERM")``;
+    handler flips ``_shutdown_requested`` so safe-point checks in
+    run_unit can elect to finish publish before exiting.
+    """
+    def _handler(signum, frame):
+        global _shutdown_requested
+        _shutdown_requested = True
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        # Not a main thread, or signal can't be installed on this OS.
+        pass
+
+
+def _shutdown_is_requested() -> bool:
+    return _shutdown_requested
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat thread
 # ---------------------------------------------------------------------------
 
@@ -337,6 +369,7 @@ def _copy_provenance_to_nas(
 def run_unit(args: argparse.Namespace) -> int:
     """Process a single imaging unit end-to-end."""
     pgid = _setup_pgid()
+    _install_sigterm_handler()
 
     manifest_path = Path(args.manifest)
     raid_dir = Path(args.raid_dir)
@@ -441,6 +474,15 @@ def run_unit(args: argparse.Namespace) -> int:
 
         from panta_rei.imaging.runner import run_tclean_feather_parallel
 
+        # F2.f: flip state.json to PUBLISHING immediately before the runner
+        # starts the publish step.  This lets the orchestrator's re-read in
+        # the verify-or-quarantine flow safely distinguish "still tclean-ing"
+        # (running) from "actively publishing", and avoid killing during a
+        # publish that could corrupt the canonical FITS.
+        def _on_publish_start() -> None:
+            base_state["phase"] = Phase.PUBLISHING
+            write_state_atomic(state_path, base_state)
+
         success, msg, output_fits = run_tclean_feather_parallel(
             unit=unit,
             output_dir=publish_dir,
@@ -459,11 +501,8 @@ def run_unit(args: argparse.Namespace) -> int:
                 "OPENBLAS_NUM_THREADS": "1",
                 "MKL_NUM_THREADS": "1",
             },
+            on_publish_start=_on_publish_start,
         )
-
-        # ---------- PUBLISHING is done inside run_tclean_feather_parallel ----------
-        base_state["phase"] = Phase.PUBLISHING
-        write_state_atomic(state_path, base_state)
 
         # ---------- COPY PROVENANCE TO NAS ----------
         provenance = _copy_provenance_to_nas(

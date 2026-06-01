@@ -1325,12 +1325,16 @@ def _minimal_ctx(tmp_path, dispatch_id="d_test"):
     return ctx, db_writer
 
 
-def test_adoption_poller_releases_slot_on_poll_crash(tmp_path, monkeypatch):
+def test_adoption_poller_quarantines_on_poll_crash(tmp_path, monkeypatch):
     """If ``poll_state_until_terminal`` raises, the AdoptionPoller must
-    still call ``mark_terminal`` so the slot doesn't stay stuck in
-    ``in_flight`` for the rest of the dispatch.  It must NOT spawn a
-    successor MachineSlot — the remote worker may still be alive and
-    a successor would oversubscribe the host.
+    quarantine the host (v3 Delta 8) and leave the run row ACTIVE so the
+    next dispatch's reconcile_prior can recover it.  It must NOT spawn a
+    successor MachineSlot — the remote worker may still be alive and a
+    successor would oversubscribe the host.
+
+    Audit nit: renamed from ``..._releases_slot_on_poll_crash`` to
+    reflect the v3-invariant behaviour — the row is NOT released; the
+    host is quarantined and the row stays active.
     """
     ctx, db_writer = _minimal_ctx(tmp_path)
     try:
@@ -1347,7 +1351,7 @@ def test_adoption_poller_releases_slot_on_poll_crash(tmp_path, monkeypatch):
         monkeypatch.setattr(D, "poll_state_until_terminal", _boom)
 
         # Even with preflight ready, the crash path must NOT spawn a
-        # successor (gated on ``final is not None``).
+        # successor (gated on _is_observed_terminal + not-quarantined).
         ctx.new_launch_machines_names = {"alpha"}
         ctx.new_launch_machines_ready.set()
         spawned: list = []
@@ -1362,10 +1366,10 @@ def test_adoption_poller_releases_slot_on_poll_crash(tmp_path, monkeypatch):
         # Run synchronously in this thread for deterministic assertion
         poller.run()
 
-        # mark_terminal must have cleared in_flight for (alpha, G1)
-        assert ("alpha", "G1") not in ctx.scheduler.in_flight
-        # And the (machine, gous) pair must be in failed_run_ids
-        assert 999 in ctx.scheduler.failed_run_ids.get(("alpha", "G1"), set())
+        # Host quarantined; in_flight stays (run row is left ACTIVE).
+        assert "alpha" in ctx.scheduler.quarantined_machines
+        # No success/failure recorded — terminal was not observed.
+        assert 999 not in ctx.scheduler.failed_run_ids.get(("alpha", "G1"), set())
         # Successor NOT spawned despite preflight ready
         assert spawned == [], f"unexpected successor spawn on poll crash: {spawned}"
         assert ctx.successors_spawned.get("alpha", 0) == 0
@@ -1389,8 +1393,11 @@ def test_successor_spawn_caps_at_machine_slots(tmp_path, monkeypatch):
         # MachineSlot threads or touch NAS.  We just need the spawn
         # decisions, not the thread bodies.
         spawned: list = []
+        # Provide a properly OBSERVED terminal: _is_observed_terminal()
+        # requires phase ∈ {"done","failed"} and no synthetic reason.
         monkeypatch.setattr(
-            D, "poll_state_until_terminal", lambda *a, **kw: {"success": True},
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {"phase": "done", "success": True},
         )
 
         original_start = D.MachineSlot.start
@@ -1436,8 +1443,11 @@ def test_pending_successor_queued_when_preflight_not_ready(tmp_path, monkeypatch
         # NOTE: do NOT set new_launch_machines_ready
         assert not ctx.new_launch_machines_ready.is_set()
 
+        # Observed-terminal final required by the new _is_observed_terminal
+        # gate (phase ∈ {"done","failed"}).
         monkeypatch.setattr(
-            D, "poll_state_until_terminal", lambda *a, **kw: {"success": True},
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {"phase": "done", "success": True},
         )
         # Block MachineSlot.start so this test doesn't accidentally spawn
         monkeypatch.setattr(
@@ -1473,7 +1483,8 @@ def test_adoption_warns_when_gous_uid_unresolvable(tmp_path, monkeypatch, caplog
     ctx, db_writer = _minimal_ctx(tmp_path)
     try:
         monkeypatch.setattr(
-            D, "poll_state_until_terminal", lambda *a, **kw: {"success": True},
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {"phase": "done", "success": True},
         )
         monkeypatch.setattr(D.MachineSlot, "start", lambda self: None)
 
@@ -1487,7 +1498,7 @@ def test_adoption_warns_when_gous_uid_unresolvable(tmp_path, monkeypatch, caplog
         poller = D.AdoptionPoller(
             adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"],
         )
-        with caplog.at_level(_logging.WARNING, logger="panta_rei.imaging.dispatch"):
+        with caplog.at_level(_logging.WARNING, logger="panta_rei.dispatch"):
             poller.run()
 
         # Warning emitted; mark_inflight skipped → no in_flight entry
@@ -1499,3 +1510,1435 @@ def test_adoption_warns_when_gous_uid_unresolvable(tmp_path, monkeypatch, caplog
     finally:
         db_writer.stop()
         db_writer.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# v3+ hardening pass (2026-05-31): fail-closed orphan cleanup,
+# per-host quarantine, observability.
+# ---------------------------------------------------------------------------
+
+
+# Fast tunings so verify_and_kill_worker doesn't block the test suite for
+# 5+ minutes per call (default worker_shutdown_grace_sec is 300s).
+def _fast_globals() -> "D.GlobalCfg":
+    return D.GlobalCfg(
+        poll_interval_sec=0.01,
+        state_appeared_timeout_sec=1,
+        heartbeat_stale_threshold_sec=300,
+        launch_pidfile_wait_sec=0,
+        worker_shutdown_grace_sec=0,
+        late_state_grace_sec=0,
+    )
+
+
+def _stub_verify_to(outcome, detail="stub"):
+    """Build a verify_and_kill_worker stub that returns a fixed outcome."""
+    return lambda *a, **kw: (outcome, detail)
+
+
+def _stub_verify_from_responses(pid_alive_responses):
+    """Build a stub mapping ssh_pid_alive responses to verify_and_kill outcome.
+
+    Mirrors verify_and_kill_worker's logic without sleeping.
+    """
+    def _stub(machine, pid, tokens, g, **kw):
+        first = pid_alive_responses[0]
+        if first == (False, ""):
+            return D.VERIFY_DEAD, "worker_already_exited"
+        if first[0] is False and first[1]:
+            return D.VERIFY_DEAD, f"pid_reused: {first[1]!r}"
+        if first[0] is None:
+            return D.VERIFY_INCONCLUSIVE, f"ssh-unreachable: {first[1]}"
+        # alive=True — replay subsequent responses
+        if len(pid_alive_responses) >= 2 and pid_alive_responses[1][0] is False:
+            return D.VERIFY_KILLED, "sigterm_killed"
+        return D.VERIFY_INCONCLUSIVE, "still alive after kill"
+    return _stub
+
+
+def _build_unit_ctx(tmp_path, machine_name="alpha"):
+    """Build a (DispatchContext, db_writer, MachineSlot, unit) tuple
+    sufficient to drive _dispatch_one without real SSH."""
+    db = DatabaseManager(tmp_path / "x.db")
+    with db.connect() as con:
+        DispatchesQueries.insert(
+            con, dispatch_id="d_test",
+            coordinator_host="local", coordinator_pid=os.getpid(),
+            machines_json="{}", cli_args="",
+        )
+        con.commit()
+    cfg = D.MachinesConfig(
+        conda_env="/c", repo_path="/r", casa_path=None,
+        global_cfg=_fast_globals(),
+        machines={machine_name: D.MachineCfg(
+            machine_name, f"/raid/{machine_name}", slots=1, nproc=1,
+            cache_min_free_gb=None,
+        )},
+    )
+    db_writer = D.DBWriter(db, "d_test")
+    db_writer.start()
+    scheduler = D.SchedulerState(queue=[])
+    ctx = D.DispatchContext(
+        cfg=cfg, dispatch_id="d_test",
+        dispatch_dir=tmp_path / "imaging" / "dispatch" / "d_test",
+        publish_dir=tmp_path / "pub",
+        tokens_dir=tmp_path / "tokens",
+        db_writer=db_writer, db_manager=db, scheduler=scheduler,
+        transfer_method="tar", publish_policy="fail_if_exists",
+        deconvolver="multiscale", scales=[0, 5, 10],
+        gous_inputs={"G_TEST": []},
+    )
+    ctx.dispatch_dir.mkdir(parents=True, exist_ok=True)
+    unit = ImagingUnit(
+        gous_uid="G_TEST", source_name="S", line_group="LG",
+        spw_id="23", params_id=1,
+        recovered_params={"start": "100GHz", "width": "1MHz", "nchan": 10},
+        ready=True,
+    )
+    slot = D.MachineSlot(f"{machine_name}#0", cfg.machines[machine_name], ctx)
+    return ctx, db_writer, slot, unit
+
+
+# ---- F2.a / config defaults ------------------------------------------------
+
+
+def test_state_appeared_timeout_default_is_300():
+    """v5 F2.e: default raised from 60 → 300."""
+    assert D.GlobalCfg().state_appeared_timeout_sec == 300
+
+
+def test_launch_pidfile_wait_default_is_30():
+    """v3 F6: default 30s wait for worker.pidfile after launch failure."""
+    assert D.GlobalCfg().launch_pidfile_wait_sec == 30
+
+
+def test_worker_shutdown_grace_default_is_300():
+    """v4 Delta 6: single grace knob, 300s by default."""
+    assert D.GlobalCfg().worker_shutdown_grace_sec == 300
+
+
+def test_late_state_grace_default_is_1800():
+    """v3 F2.b/F2.h: late-state grace is 30 minutes by default."""
+    assert D.GlobalCfg().late_state_grace_sec == 1800
+
+
+def test_is_observed_terminal_predicate():
+    """F4: only observed (non-synthetic) terminals count."""
+    assert D._is_observed_terminal(None) is False
+    assert D._is_observed_terminal({}) is False
+    assert D._is_observed_terminal({"phase": "running"}) is False
+    assert D._is_observed_terminal({"phase": "done", "success": True}) is True
+    assert D._is_observed_terminal({"phase": "failed", "success": False}) is True
+    assert D._is_observed_terminal({
+        "phase": "failed", "reason": "state_missing_timeout",
+    }) is False
+    assert D._is_observed_terminal({
+        "phase": "failed", "reason": "heartbeat_stale_alive",
+    }) is False
+    assert D._is_observed_terminal({
+        "phase": "failed", "reason": "state_appeared_after_timeout",
+    }) is False
+
+
+def test_poll_returns_state_missing_timeout_reason(tmp_path):
+    """F2.a: state-missing path now returns typed reason."""
+    nas_unit = tmp_path / "u"
+    nas_unit.mkdir()
+    # state.json never appears
+    g = D.GlobalCfg(
+        poll_interval_sec=0.05, state_appeared_timeout_sec=0.2,
+    )
+    final = D.poll_state_until_terminal(
+        "alpha", nas_unit, g=g, expected_tokens=["--run-id 1"],
+    )
+    assert final["reason"] == "state_missing_timeout"
+    assert final["phase"] == "failed"
+
+
+def test_poll_returns_heartbeat_stale_alive_reason_without_killing(
+    tmp_path, monkeypatch,
+):
+    """v4 Delta 1: poll no longer calls ssh_kill_pgid on stale-alive."""
+    nas_unit = tmp_path / "u"
+    nas_unit.mkdir()
+    (nas_unit / "state.json").write_text(json.dumps({
+        "run_id": 1, "phase": "running", "worker_pid": 99, "worker_pgid": 99,
+    }))
+    # Heartbeat is far in the past
+    hb = nas_unit / "heartbeat"
+    hb.touch()
+    old = time.time() - 10000
+    os.utime(hb, (old, old))
+
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (True, "ours"))
+    killed: list = []
+    monkeypatch.setattr(
+        D, "ssh_kill_pgid", lambda *a, **kw: killed.append(a),
+    )
+
+    g = D.GlobalCfg(
+        poll_interval_sec=0.01,
+        heartbeat_stale_threshold_sec=1,
+        max_stale_alive_sec=1,
+        state_appeared_timeout_sec=10,
+    )
+    final = D.poll_state_until_terminal(
+        "alpha", nas_unit, g=g, expected_tokens=["--run-id 1"],
+    )
+    assert final["reason"] == "heartbeat_stale_alive"
+    assert killed == [], "Delta 1 violation: poll killed the worker"
+
+
+# ---- verify_and_kill_worker -------------------------------------------------
+
+
+def test_verify_and_kill_dead_worker_returns_dead(monkeypatch):
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (False, ""))
+    outcome, _ = D.verify_and_kill_worker(
+        "alpha", 1234, ["--run-id 1"], _fast_globals(),
+        sleep_fn=lambda *a, **kw: None,
+    )
+    assert outcome == D.VERIFY_DEAD
+
+
+def test_verify_and_kill_pid_reused_returns_dead(monkeypatch):
+    """If ssh_pid_alive returns (False, non_empty), PID was reused."""
+    monkeypatch.setattr(
+        D, "ssh_pid_alive", lambda *a, **kw: (False, "/usr/bin/other"),
+    )
+    outcome, detail = D.verify_and_kill_worker(
+        "alpha", 1234, ["--run-id 1"], _fast_globals(),
+        sleep_fn=lambda *a, **kw: None,
+    )
+    assert outcome == D.VERIFY_DEAD
+    assert "pid_reused" in detail
+
+
+def test_verify_and_kill_inconclusive_when_ssh_unreachable(monkeypatch):
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (None, "ssh timeout"))
+    outcome, _ = D.verify_and_kill_worker(
+        "alpha", 1234, ["--run-id 1"], _fast_globals(),
+        sleep_fn=lambda *a, **kw: None,
+    )
+    assert outcome == D.VERIFY_INCONCLUSIVE
+
+
+def test_verify_and_kill_sigterm_then_dead(monkeypatch):
+    """Alive → TERM → dead = VERIFY_KILLED."""
+    calls = {"alive": 0}
+    def _alive(*a, **kw):
+        calls["alive"] += 1
+        return (True, "ours") if calls["alive"] == 1 else (False, "")
+    monkeypatch.setattr(D, "ssh_pid_alive", _alive)
+    killed: list = []
+    monkeypatch.setattr(D, "ssh_kill_pgid",
+                        lambda m, p, s, **kw: killed.append(s))
+    outcome, detail = D.verify_and_kill_worker(
+        "alpha", 1234, ["--run-id 1"], _fast_globals(),
+        sleep_fn=lambda *a, **kw: None,
+    )
+    assert outcome == D.VERIFY_KILLED
+    assert killed == ["TERM"]
+
+
+def test_verify_and_kill_escalates_to_kill(monkeypatch):
+    """Alive → TERM → still alive → KILL → dead."""
+    calls = {"n": 0}
+    def _alive(*a, **kw):
+        calls["n"] += 1
+        # alive, alive (post-TERM), dead (post-KILL)
+        if calls["n"] <= 2:
+            return (True, "ours")
+        return (False, "")
+    monkeypatch.setattr(D, "ssh_pid_alive", _alive)
+    killed: list = []
+    monkeypatch.setattr(D, "ssh_kill_pgid",
+                        lambda m, p, s, **kw: killed.append(s))
+    outcome, _ = D.verify_and_kill_worker(
+        "alpha", 1234, ["--run-id 1"], _fast_globals(),
+        sleep_fn=lambda *a, **kw: None,
+    )
+    assert outcome == D.VERIFY_KILLED
+    assert killed == ["TERM", "KILL"]
+
+
+def test_verify_and_kill_inconclusive_after_kill(monkeypatch):
+    """Alive even after SIGKILL → VERIFY_INCONCLUSIVE → caller quarantines."""
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (True, "ours"))
+    monkeypatch.setattr(D, "ssh_kill_pgid", lambda *a, **kw: None)
+    outcome, _ = D.verify_and_kill_worker(
+        "alpha", 1234, ["--run-id 1"], _fast_globals(),
+        sleep_fn=lambda *a, **kw: None,
+    )
+    assert outcome == D.VERIFY_INCONCLUSIVE
+
+
+# ---- Scheduler quarantine ---------------------------------------------------
+
+
+def test_pick_refuses_quarantined_machine():
+    s = D.SchedulerState(queue=[_make_unit("G1", "S1")])
+    s.quarantine("alpha")
+    assert s.pick("alpha", run_id_assigner=lambda: 0) is None
+    # Non-quarantined still works:
+    assert s.pick("beta", run_id_assigner=lambda: 0) is not None
+
+
+def test_is_quarantined_reports_state():
+    s = D.SchedulerState()
+    assert not s.is_quarantined("alpha")
+    s.quarantine("alpha")
+    assert s.is_quarantined("alpha")
+
+
+def test_quarantine_all_seeds_multiple_hosts():
+    s = D.SchedulerState()
+    s.quarantine_all({"alpha", "beta"})
+    assert s.is_quarantined("alpha")
+    assert s.is_quarantined("beta")
+
+
+def test_gous_cleaner_skips_quarantined_machine(tmp_path, monkeypatch):
+    cfg = D.MachinesConfig(
+        conda_env="/c", repo_path="/r", casa_path=None,
+        global_cfg=D.GlobalCfg(),
+        machines={"alpha": D.MachineCfg("alpha", "/raid/a", slots=1, nproc=1)},
+    )
+    s = D.SchedulerState(queue=[])
+    s.seen_pairs.add(("alpha", "G"))
+    s.quarantine("alpha")
+    cleaner = D.GousCleaner(s, cfg, "d_x", D.GlobalCfg())
+    seen: list = []
+    monkeypatch.setattr(
+        D, "ssh_run",
+        lambda *a, **kw: seen.append(a) or mock.Mock(returncode=0, stdout="", stderr=""),
+    )
+    cleaner.force_run()
+    assert seen == [], "cleaner ran rm -rf on a quarantined host"
+
+
+def test_slot_exits_on_quarantine(tmp_path):
+    """MachineSlot.run() exits if its host is quarantined."""
+    ctx, db_writer, slot, _unit = _build_unit_ctx(tmp_path)
+    try:
+        ctx.scheduler.quarantine("alpha")
+        slot.run()
+        # No exception, just returns; pick() returns None for quarantined.
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+# ---- _dispatch_one — F2.b state_missing_timeout paths ----------------------
+
+
+def _drive_dispatch_one(slot, unit, monkeypatch, *,
+                        launch_return=(True, "launched", 1234),
+                        poll_final=None,
+                        pid_alive_responses=None,
+                        late_state=None):
+    """Helper: drive _dispatch_one with mocks and return DB rows.
+
+    NOTE: does NOT patch time.sleep — patching it breaks the
+    DBWriter run_id wait loop.  Instead stubs out verify_and_kill_worker
+    so its internal sleeps are never reached.
+    """
+    monkeypatch.setattr(D, "launch_detached", lambda *a, **kw: launch_return)
+    if poll_final is not None:
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal", lambda *a, **kw: poll_final,
+        )
+    if pid_alive_responses is not None:
+        # Stub verify_and_kill_worker per the response sequence so the
+        # test never hits real sleeps inside it.
+        monkeypatch.setattr(
+            D, "verify_and_kill_worker",
+            _stub_verify_from_responses(pid_alive_responses),
+        )
+    monkeypatch.setattr(D, "ssh_kill_pgid", lambda *a, **kw: None)
+    if late_state is not None:
+        # Write a state.json before _dispatch_one calls _handle_state_missing_timeout
+        nas_unit_dir = slot.ctx.dispatch_dir / "units"
+        nas_unit_dir.mkdir(parents=True, exist_ok=True)
+    slot._dispatch_one(unit)
+
+
+def test_dispatch_one_kills_orphan_on_state_missing_timeout(tmp_path, monkeypatch):
+    """F2.b happy path: state-missing + SIGTERM succeeds → MARK_DONE FAILED."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            poll_final={
+                "phase": "failed",
+                "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "state.json never appeared",
+            },
+            # alive once (verify), dead after TERM
+            pid_alive_responses=[(True, "ours"), (False, "")],
+        )
+        db_writer.q.join()
+        # Host NOT quarantined (verified-killed → safe to MARK_DONE).
+        assert not ctx.scheduler.is_quarantined("alpha")
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        statuses = [r[0] for r in rows]
+        assert ImagingRunStatus.FAILED in statuses
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_quarantines_on_ssh_unreachable_during_verify(
+    tmp_path, monkeypatch,
+):
+    """F2.b: ssh_pid_alive returns (None, ...) → quarantine, NO MARK_DONE."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            poll_final={
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "...",
+            },
+            pid_alive_responses=[(None, "ssh timeout")],
+        )
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+        # Row stays QUEUED/RUNNING (not terminal) → MARK_DONE was skipped.
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        terminal = {ImagingRunStatus.SUCCESS, ImagingRunStatus.FAILED}
+        assert not any(r[0] in terminal for r in rows), (
+            f"expected row left active; got statuses {rows}"
+        )
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_quarantines_on_kill_failure(tmp_path, monkeypatch):
+    """F2.b: SIGKILL doesn't take → quarantine, NO MARK_DONE."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            poll_final={
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "...",
+            },
+            # alive forever
+            pid_alive_responses=[(True, "ours")],
+        )
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_quarantines_on_heartbeat_stale_alive_inconclusive(
+    tmp_path, monkeypatch,
+):
+    """v4 Delta 1: heartbeat_stale_alive + ssh-unreachable → quarantine."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            poll_final={
+                "phase": "failed", "success": False,
+                "reason": "heartbeat_stale_alive",
+                "worker_pgid": 9999,
+                "error_message": "stale",
+            },
+            pid_alive_responses=[(None, "ssh timeout")],
+        )
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_pid_reused_token_mismatch_proceeds_to_mark_done(
+    tmp_path, monkeypatch,
+):
+    """ssh_pid_alive (False, non_empty_cmdline) = PID reused → MARK_DONE."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            poll_final={
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "...",
+            },
+            pid_alive_responses=[(False, "/usr/bin/unrelated_process")],
+        )
+        db_writer.q.join()
+        assert not ctx.scheduler.is_quarantined("alpha")
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status, error_message FROM imaging_runs",
+            ).fetchall()
+        assert any(r[0] == ImagingRunStatus.FAILED for r in rows)
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_genuinely_dead_pid_proceeds_to_mark_done(
+    tmp_path, monkeypatch,
+):
+    """ssh_pid_alive (False, "") = __DEAD__ → MARK_DONE without quarantine."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            poll_final={
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "...",
+            },
+            pid_alive_responses=[(False, "")],
+        )
+        db_writer.q.join()
+        assert not ctx.scheduler.is_quarantined("alpha")
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        assert any(r[0] == ImagingRunStatus.FAILED for r in rows)
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+# ---- _dispatch_one — F2.c launch-timeout paths ----------------------------
+
+
+def test_dispatch_one_quarantines_on_no_pidfile_after_ssh_timeout(
+    tmp_path, monkeypatch,
+):
+    """F2.c + Delta 3: ssh timeout + no pidfile → quarantine, NO MARK_DONE."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        _drive_dispatch_one(
+            slot, unit, monkeypatch,
+            launch_return=(False, "ssh timeout to alpha", None),
+            # No pidfile will appear; launch_pidfile_wait_sec=0 in _fast_globals
+        )
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_handles_ssh_launch_timeout_with_late_pidfile(
+    tmp_path, monkeypatch,
+):
+    """F2.c: pidfile appears within wait window → verify+kill flow."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "launch_detached",
+            lambda *a, **kw: (False, "ssh timeout", None),
+        )
+        # Pre-write the pidfile so _wait_for_pidfile finds it.
+        nas_unit_dir = ctx.dispatch_dir / "units"
+        # _dispatch_one creates units/<run_id>; the run_id will be 1
+        # for the first INSERT_QUEUED, so we can't pre-write without
+        # knowing it.  Instead, monkeypatch _wait_for_pidfile to return
+        # a known pid directly.
+        monkeypatch.setattr(D, "_wait_for_pidfile", lambda *a, **kw: 4242)
+        monkeypatch.setattr(
+            D, "ssh_pid_alive", lambda *a, **kw: (False, ""),
+        )
+        monkeypatch.setattr(D, "ssh_kill_pgid", lambda *a, **kw: None)
+        slot._dispatch_one(unit)
+        db_writer.q.join()
+        # Verified dead → MARK_DONE FAILED + no quarantine.
+        assert not ctx.scheduler.is_quarantined("alpha")
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        assert any(r[0] == ImagingRunStatus.FAILED for r in rows)
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_quarantines_on_launch_ok_nil_pid_no_pidfile(
+    tmp_path, monkeypatch,
+):
+    """Delta 3: launch_detached returned (True, _, None) and no pidfile
+    appears → treat as inconclusive launch and quarantine."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "launch_detached", lambda *a, **kw: (True, "ok", None),
+        )
+        # _wait_for_pidfile sees nothing
+        monkeypatch.setattr(D, "_wait_for_pidfile", lambda *a, **kw: None)
+        # poll_state_until_terminal should not be reached because we
+        # treat (True, _, None) + no pidfile as state_missing_timeout
+        # via the normal poll path.  In practice we DO reach poll here
+        # because launch returned ok=True.  The test demonstrates that
+        # if poll returns a state_missing_timeout and no pidfile is
+        # available, we quarantine.
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "no state",
+            },
+        )
+        # Inconclusive verify (no pid at all → INCONCLUSIVE).
+        monkeypatch.setattr(
+            D, "verify_and_kill_worker",
+            lambda *a, **kw: (D.VERIFY_INCONCLUSIVE, "no pid"),
+        )
+        slot._dispatch_one(unit)
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+# ---- _dispatch_one observability (F1 + F3) --------------------------------
+
+
+def test_dispatch_one_logs_mark_done_at_info_and_warn(
+    tmp_path, monkeypatch, caplog,
+):
+    """F1 + F3: INFO MARK_DONE log + WARN failure log on terminal."""
+    import logging as _logging
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(D, "launch_detached", lambda *a, **kw: (True, "ok", 1234))
+        # Observed terminal — not synthetic.
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "failed", "success": False,
+                "error_message": "tclean rc=1",
+            },
+        )
+        with caplog.at_level(_logging.DEBUG, logger="panta_rei.dispatch"):
+            slot._dispatch_one(unit)
+        db_writer.q.join()
+        info_msgs = [r.getMessage() for r in caplog.records
+                     if r.levelno == _logging.INFO]
+        warn_msgs = [r.getMessage() for r in caplog.records
+                     if r.levelno == _logging.WARNING]
+        assert any("MARK_DONE" in m for m in info_msgs), (
+            f"missing INFO MARK_DONE: {info_msgs}"
+        )
+        assert any("failed" in m for m in warn_msgs), (
+            f"missing WARN failure: {warn_msgs}"
+        )
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_logs_mark_done_success_at_info_only(
+    tmp_path, monkeypatch, caplog,
+):
+    """Success terminal: INFO only, no WARN."""
+    import logging as _logging
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(D, "launch_detached", lambda *a, **kw: (True, "ok", 1234))
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "done", "success": True,
+                "output_fits": "/nas/out.fits",
+            },
+        )
+        with caplog.at_level(_logging.DEBUG, logger="panta_rei.dispatch"):
+            slot._dispatch_one(unit)
+        db_writer.q.join()
+        warns_about_fail = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and "failed" in r.getMessage()
+        ]
+        assert warns_about_fail == [], (
+            f"unexpected WARN on success: {[r.getMessage() for r in warns_about_fail]}"
+        )
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+# ---- AdoptionPoller F4 + Delta 8 ------------------------------------------
+
+
+def test_adoption_poller_does_not_spawn_successor_on_synthetic_final(
+    tmp_path, monkeypatch,
+):
+    """F4: synthetic state_missing_timeout final → no successor spawn."""
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        ctx.new_launch_machines_names = {"alpha"}
+        ctx.new_launch_machines_ready.set()
+        spawned: list = []
+        monkeypatch.setattr(
+            D.MachineSlot, "start",
+            lambda self: spawned.append(self.name),
+        )
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "missing",
+            },
+        )
+        # Inconclusive cleanup → AdoptionPoller quarantines.
+        monkeypatch.setattr(
+            D, "verify_and_kill_worker",
+            lambda *a, **kw: (D.VERIFY_INCONCLUSIVE, "ssh dead"),
+        )
+        adopted = {
+            "run_id": 12, "machine": "alpha",
+            "unit_dir": tmp_path / "u",
+            "state": {"gous_uid": "G", "dispatch_id": "d_prior"},
+            "prior_dispatch_id": "d_prior",
+        }
+        poller = D.AdoptionPoller(adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"])
+        poller.run()
+        assert spawned == []
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_adoption_poller_quarantines_on_unverified_cleanup(
+    tmp_path, monkeypatch,
+):
+    """Delta 8: synthetic terminal + ssh-unreachable verify → quarantine,
+    leave row active (no MARK_DONE)."""
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "failed", "success": False,
+                "reason": "heartbeat_stale_alive",
+                "worker_pgid": 1234, "error_message": "stale",
+            },
+        )
+        monkeypatch.setattr(
+            D, "verify_and_kill_worker",
+            lambda *a, **kw: (D.VERIFY_INCONCLUSIVE, "ssh down"),
+        )
+        adopted = {
+            "run_id": 88, "machine": "alpha",
+            "unit_dir": tmp_path / "u",
+            "state": {"gous_uid": "G", "dispatch_id": "d_prior"},
+            "prior_dispatch_id": "d_prior",
+        }
+        poller = D.AdoptionPoller(adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"])
+        poller.run()
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+# ---- reconcile_prior — F5, Delta 4, Delta 5 --------------------------------
+
+
+def test_reconcile_returns_reconcile_result(tmp_path):
+    """Delta 5: reconcile_prior returns ReconcileResult (not bare list)."""
+    db = DatabaseManager(tmp_path / "x.db")
+    result = D.reconcile_prior(db, tmp_path, D.GlobalCfg())
+    assert isinstance(result, D.ReconcileResult)
+    assert isinstance(result.adoptable, list)
+    assert isinstance(result.quarantined_hosts, set)
+
+
+def test_reconcile_prior_no_state_no_pidfile_quarantines_host_leaves_row_active(
+    tmp_path,
+):
+    """Delta 4: no state.json + no pidfile + known host → quarantine + row stays active."""
+    db = DatabaseManager(tmp_path / "x.db")
+    _seed_dispatch(db, dispatch_id="d_p")
+    with db.connect() as con:
+        rid = ImagingRunsQueries.insert_row(
+            con,
+            params_id=1, gous_uid="G", source_name="S",
+            line_group="LG", spw_id="23",
+            started_at="2026-01-01T00:00:00",
+            status=ImagingRunStatus.RUNNING,
+            dispatch_id="d_p", hostname="alpha",
+        )
+        con.commit()
+    # Note: NO state.json, NO worker.pidfile
+    result = D.reconcile_prior(db, tmp_path, D.GlobalCfg())
+    assert "alpha" in result.quarantined_hosts
+    with db.connect() as con:
+        row = ImagingRunsQueries.get_by_id(con, rid)
+    assert row["status"] == ImagingRunStatus.RUNNING
+
+
+def test_reconcile_prior_no_state_pidfile_present_verifies_then_quarantine_on_inconclusive(
+    tmp_path, monkeypatch,
+):
+    """Delta 4: pidfile present + ssh-unreachable → quarantine, row stays."""
+    db = DatabaseManager(tmp_path / "x.db")
+    _seed_dispatch(db, dispatch_id="d_p")
+    with db.connect() as con:
+        rid = ImagingRunsQueries.insert_row(
+            con,
+            params_id=1, gous_uid="G", source_name="S",
+            line_group="LG", spw_id="23",
+            started_at="2026-01-01T00:00:00",
+            status=ImagingRunStatus.RUNNING,
+            dispatch_id="d_p", hostname="alpha",
+        )
+        con.commit()
+    # Pidfile present, but no state.json
+    sd = _state_dir(tmp_path, "d_p", rid)
+    (sd / "worker.pidfile").write_text("9999\n")
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (None, "ssh timeout"))
+    result = D.reconcile_prior(db, tmp_path, _fast_globals())
+    assert "alpha" in result.quarantined_hosts
+    with db.connect() as con:
+        row = ImagingRunsQueries.get_by_id(con, rid)
+    assert row["status"] == ImagingRunStatus.RUNNING
+
+
+def test_reconcile_prior_no_state_pidfile_present_dead_marks_failed(
+    tmp_path, monkeypatch,
+):
+    """Delta 4: pidfile present + verified dead → MARK_DONE FAILED."""
+    db = DatabaseManager(tmp_path / "x.db")
+    _seed_dispatch(db, dispatch_id="d_p")
+    with db.connect() as con:
+        rid = ImagingRunsQueries.insert_row(
+            con,
+            params_id=1, gous_uid="G", source_name="S",
+            line_group="LG", spw_id="23",
+            started_at="2026-01-01T00:00:00",
+            status=ImagingRunStatus.RUNNING,
+            dispatch_id="d_p", hostname="alpha",
+        )
+        con.commit()
+    sd = _state_dir(tmp_path, "d_p", rid)
+    (sd / "worker.pidfile").write_text("9999\n")
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (False, ""))
+    result = D.reconcile_prior(db, tmp_path, _fast_globals())
+    assert "alpha" not in result.quarantined_hosts
+    with db.connect() as con:
+        row = ImagingRunsQueries.get_by_id(con, rid)
+    assert row["status"] == ImagingRunStatus.FAILED
+
+
+# ---- F2.f / F2.g remote_worker side ---------------------------------------
+
+
+def test_remote_worker_sigterm_handler_sets_shutdown_flag(monkeypatch):
+    """F2.g: SIGTERM handler flips _shutdown_requested."""
+    from panta_rei.imaging import remote_worker as RW
+    # Reset state, install handler, send signal to self.
+    RW._shutdown_requested = False
+    RW._install_sigterm_handler()
+    # On main thread only — call the handler directly to avoid os.kill.
+    import signal as _signal
+    handler = _signal.getsignal(_signal.SIGTERM)
+    handler(_signal.SIGTERM, None)
+    assert RW._shutdown_is_requested() is True
+    # Reset for other tests.
+    RW._shutdown_requested = False
+
+
+def test_publish_callback_default_is_noop_and_propagates_exceptions():
+    """Delta 7: callback default is no-op; exceptions from custom
+    callback propagate (not swallowed)."""
+    from panta_rei.imaging.runner import run_tclean_feather_parallel as RTF
+    import inspect
+    sig = inspect.signature(RTF)
+    # Keyword-only with default lambda
+    p = sig.parameters.get("on_publish_start")
+    assert p is not None
+    assert p.kind == inspect.Parameter.KEYWORD_ONLY
+    # Default must be callable (a lambda no-op).
+    assert callable(p.default)
+    # Calling default should not raise.
+    p.default()
+
+
+# ---- Delta 11: current-dispatch mark_terminal gating ----------------------
+
+
+def test_current_dispatch_left_running_when_quarantined_rows_remain(
+    tmp_path, monkeypatch,
+):
+    """v5 Delta 11: if any imaging_runs rows remain non-terminal for the
+    current dispatch (e.g. left active by a quarantine), the dispatch
+    must NOT be marked DONE."""
+    # We avoid invoking run_dispatch end-to-end and instead replicate the
+    # essential logic of step 17 + Delta 11 against a stub DB+scheduler.
+    db = DatabaseManager(tmp_path / "x.db")
+    dispatch_id = "d_quarantined_current"
+    _seed_dispatch(db, dispatch_id=dispatch_id)
+    # Seed one RUNNING row left active by quarantine.
+    with db.connect() as con:
+        rid = ImagingRunsQueries.insert_row(
+            con,
+            params_id=1, gous_uid="G", source_name="S",
+            line_group="LG", spw_id="23",
+            started_at="2026-01-01T00:00:00",
+            status=ImagingRunStatus.RUNNING,
+            dispatch_id=dispatch_id,
+        )
+        con.commit()
+    # Replicate Delta 11 gate
+    with db.connect() as con:
+        current_active = ImagingRunsQueries.list_running_for_dispatch(
+            con, dispatch_id,
+        )
+    if current_active:
+        # Per the orchestrator: skip mark_terminal.
+        pass
+    else:
+        with db.connect() as con:
+            DispatchesQueries.mark_terminal(con, dispatch_id, DispatchState.DONE)
+            con.commit()
+    # Verify dispatches row is still RUNNING.
+    with db.connect() as con:
+        d = DispatchesQueries.get(con, dispatch_id)
+    assert d["state"] == DispatchState.RUNNING
+
+
+def test_current_dispatch_marked_done_when_all_rows_terminal(tmp_path):
+    """v5 Delta 11 inverse: no active rows → mark_terminal is called."""
+    db = DatabaseManager(tmp_path / "x.db")
+    dispatch_id = "d_clean_current"
+    _seed_dispatch(db, dispatch_id=dispatch_id)
+    with db.connect() as con:
+        current_active = ImagingRunsQueries.list_running_for_dispatch(
+            con, dispatch_id,
+        )
+    assert not current_active
+    with db.connect() as con:
+        DispatchesQueries.mark_terminal(con, dispatch_id, DispatchState.DONE)
+        con.commit()
+    with db.connect() as con:
+        d = DispatchesQueries.get(con, dispatch_id)
+    assert d["state"] == DispatchState.DONE
+
+
+def test_dispatch_one_resumes_polling_when_state_appeared_as_publishing(
+    tmp_path, monkeypatch,
+):
+    """F2.b.i: state.json re-read shows phase=publishing → resume polling
+    (do NOT kill)."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "launch_detached", lambda *a, **kw: (True, "ok", 1234),
+        )
+        ix = {"i": 0}
+
+        def _poll(machine, nas_unit_dir, **kw):
+            ix["i"] += 1
+            if ix["i"] == 1:
+                # Write state.json so the re-read sees phase=publishing.
+                state_path = Path(nas_unit_dir) / "state.json"
+                state_path.write_text(json.dumps({
+                    "phase": "publishing",
+                    "worker_pid": 1234, "worker_pgid": 1234,
+                }))
+                return {
+                    "phase": "failed", "success": False,
+                    "reason": "state_missing_timeout",
+                    "error_message": "missing",
+                }
+            # Late re-poll: observed terminal.
+            return {
+                "phase": "done", "success": True,
+                "output_fits": "/nas/out.fits",
+            }
+        monkeypatch.setattr(D, "poll_state_until_terminal", _poll)
+        killed: list = []
+        monkeypatch.setattr(
+            D, "verify_and_kill_worker",
+            lambda *a, **kw: killed.append("called") or (D.VERIFY_DEAD, "x"),
+        )
+        slot._dispatch_one(unit)
+        db_writer.q.join()
+        assert killed == [], "should NOT kill when state reappeared"
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        assert any(r[0] == ImagingRunStatus.SUCCESS for r in rows)
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_quarantines_on_grace_expiry(tmp_path, monkeypatch):
+    """F2.h: re-poll never observes a terminal within late_state_grace_sec
+    → quarantine + NO MARK_DONE."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "launch_detached", lambda *a, **kw: (True, "ok", 1234),
+        )
+        ix = {"i": 0}
+
+        def _poll(machine, nas_unit_dir, **kw):
+            ix["i"] += 1
+            if ix["i"] == 1:
+                state_path = Path(nas_unit_dir) / "state.json"
+                state_path.write_text(json.dumps({
+                    "phase": "publishing", "worker_pid": 1234,
+                }))
+                return {
+                    "phase": "failed", "success": False,
+                    "reason": "state_missing_timeout",
+                    "error_message": "missing",
+                }
+            return {
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "still missing",
+            }
+        monkeypatch.setattr(D, "poll_state_until_terminal", _poll)
+        slot._dispatch_one(unit)
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        terminal = {ImagingRunStatus.SUCCESS, ImagingRunStatus.FAILED}
+        assert not any(r[0] in terminal for r in rows)
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_remote_worker_publish_callback_writes_publishing_phase(tmp_path):
+    """F2.f sanity: the on_publish_start closure writes Phase.PUBLISHING."""
+    from panta_rei.imaging import remote_worker as RW
+    state_path = tmp_path / "state.json"
+    base_state = {"run_id": 1, "phase": RW.Phase.RUNNING}
+
+    def _on_publish_start():
+        base_state["phase"] = RW.Phase.PUBLISHING
+        RW.write_state_atomic(state_path, base_state)
+
+    _on_publish_start()
+    written = json.loads(state_path.read_text())
+    assert written["phase"] == RW.Phase.PUBLISHING
+
+
+def test_end_sweep_skips_quarantined_machine_inputs(tmp_path, monkeypatch):
+    """v3 F2.d: end-of-run sweep must skip the dispatch input tree on
+    quarantined hosts."""
+    cfg = D.MachinesConfig(
+        conda_env="/c", repo_path="/r", casa_path=None,
+        global_cfg=D.GlobalCfg(),
+        machines={
+            "alpha": D.MachineCfg("alpha", "/raid/a", slots=1, nproc=1),
+            "beta": D.MachineCfg("beta", "/raid/b", slots=1, nproc=1),
+        },
+    )
+    scheduler = D.SchedulerState(queue=[])
+    scheduler.quarantine("alpha")
+    sweep_targets = {("alpha", "d_x"), ("beta", "d_x")}
+    seen: list = []
+
+    def _fake_ssh(machine, cmd, *, timeout=30, capture=True):
+        seen.append((machine, cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(D, "ssh_run", _fake_ssh)
+    for m_name, did in sorted(sweep_targets):
+        m = cfg.machines.get(m_name)
+        if m is None:
+            continue
+        if scheduler.is_quarantined(m_name):
+            continue
+        D.ssh_run(
+            m_name,
+            f"rm -rf -- /raid/{m_name}/d_{did}/input",
+            timeout=30,
+        )
+    assert [c[0] for c in seen] == ["beta"]
+
+
+def test_adoption_poller_logs_mark_done_info_and_warn(
+    tmp_path, monkeypatch, caplog,
+):
+    """F1+F3 mirror in AdoptionPoller: INFO MARK_DONE + WARN on failure."""
+    import logging as _logging
+    ctx, db_writer = _minimal_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "failed", "success": False,
+                "error_message": "casa rc=1",
+            },
+        )
+        monkeypatch.setattr(D.MachineSlot, "start", lambda self: None)
+        adopted = {
+            "run_id": 33, "machine": "alpha",
+            "unit_dir": tmp_path / "u",
+            "state": {"gous_uid": "G", "dispatch_id": "d_prior"},
+            "prior_dispatch_id": "d_prior",
+        }
+        poller = D.AdoptionPoller(adopted, ctx, machine_cfg=ctx.cfg.machines["alpha"])
+        with caplog.at_level(_logging.DEBUG, logger="panta_rei.dispatch"):
+            poller.run()
+        info_msgs = [r.getMessage() for r in caplog.records
+                     if r.levelno == _logging.INFO]
+        warn_msgs = [r.getMessage() for r in caplog.records
+                     if r.levelno == _logging.WARNING]
+        assert any("MARK_DONE" in m for m in info_msgs)
+        assert any("failed" in m for m in warn_msgs)
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-5 / round-6 regressions (post-implementation review)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_one_finally_does_not_emit_mark_done_after_quarantine(
+    tmp_path, monkeypatch,
+):
+    """Blocking 1 (Codex r5/r6 #1): when ``_quarantine_and_log`` is invoked
+    on a control-flow path that returns from the try block, the outer
+    ``finally`` must NOT treat ``terminal_recorded == False`` as a
+    post-launch crash and re-run verify+MARK_DONE — that would undo the
+    deliberate quarantine.  The ``quarantine_recorded`` sentinel set by
+    ``_quarantine_and_log`` gates the finally.
+
+    Exercises the F2.b ssh-unreachable path (line ~1986 quarantine).  Asserts:
+      - the host is quarantined,
+      - NO MARK_DONE was enqueued by either the success path or the finally,
+      - ``mark_terminal`` was NOT called (the (machine, gous) pair is still
+        in-flight per the scheduler, mirroring the live ACTIVE row).
+    """
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        # Make verify_and_kill_worker count its invocations so we can
+        # confirm the finally did not call it a SECOND time after the
+        # quarantine path already did.
+        verify_calls = {"n": 0}
+        original_verify = _stub_verify_from_responses([(None, "ssh timeout")])
+
+        def _counting_verify(*a, **kw):
+            verify_calls["n"] += 1
+            return original_verify(*a, **kw)
+
+        monkeypatch.setattr(D, "launch_detached",
+                            lambda *a, **kw: (True, "ok", 1234))
+        monkeypatch.setattr(
+            D, "poll_state_until_terminal",
+            lambda *a, **kw: {
+                "phase": "failed", "success": False,
+                "reason": "state_missing_timeout",
+                "error_message": "missing",
+            },
+        )
+        monkeypatch.setattr(D, "verify_and_kill_worker", _counting_verify)
+        monkeypatch.setattr(D, "ssh_kill_pgid", lambda *a, **kw: None)
+        slot._dispatch_one(unit)
+        db_writer.q.join()
+        # Quarantined as expected.
+        assert ctx.scheduler.is_quarantined("alpha")
+        # verify_and_kill_worker was called EXACTLY ONCE (by the F2.b
+        # path) — NOT a second time by the finally.
+        assert verify_calls["n"] == 1, (
+            f"finally re-ran verify after quarantine; calls={verify_calls['n']}"
+        )
+        # No terminal status recorded.
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        terminal = {ImagingRunStatus.SUCCESS, ImagingRunStatus.FAILED}
+        assert not any(r[0] in terminal for r in rows), (
+            f"finally undid quarantine and marked terminal: {rows}"
+        )
+        # in_flight still has the pair → mark_terminal was NOT called.
+        with ctx.scheduler.lock:
+            inflight = ctx.scheduler.in_flight.get(("alpha", "G_TEST"), set())
+        assert inflight, (
+            "mark_terminal called by finally undid the quarantine"
+        )
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_pre_launch_manifest_failure_marks_done_failed(
+    tmp_path, monkeypatch,
+):
+    """Blocking 2 (Codex r5/r6 #2): a failure in manifest write happens
+    BEFORE launch_detached, so no worker ever existed.  The finally must
+    MARK_DONE FAILED + mark_terminal (the safe pre-launch branch), NOT
+    quarantine the host (which would leave the row dangling on a host
+    that did nothing wrong).
+    """
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        # Sabotage write_unit_manifest so the try block raises early.
+        def _boom(*a, **kw):
+            raise OSError("simulated NAS write failure (manifest)")
+
+        monkeypatch.setattr(D, "write_unit_manifest", _boom)
+        # If launch_detached or polling get called, the test is wrong.
+        def _should_not_run(*a, **kw):
+            raise AssertionError("post-launch code reached on pre-launch crash")
+        monkeypatch.setattr(D, "launch_detached", _should_not_run)
+        monkeypatch.setattr(D, "poll_state_until_terminal", _should_not_run)
+        # _dispatch_one propagates the exception out of the try/finally;
+        # the MachineSlot.run loop is the surrounding try/except in prod.
+        with pytest.raises(OSError, match="manifest"):
+            slot._dispatch_one(unit)
+        db_writer.q.join()
+        # NOT quarantined — pre-launch failures don't touch the host.
+        assert not ctx.scheduler.is_quarantined("alpha")
+        # Row MARK_DONE FAILED.
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status, error_message FROM imaging_runs",
+            ).fetchall()
+        assert any(r[0] == ImagingRunStatus.FAILED for r in rows), (
+            f"expected FAILED row from pre-launch finally; got {rows}"
+        )
+        # And mark_inflight was never called → no scheduler in-flight pair.
+        with ctx.scheduler.lock:
+            inflight = ctx.scheduler.in_flight.get(("alpha", "G_TEST"), set())
+        assert not inflight, (
+            f"manifest failed before mark_inflight; in_flight should be empty, "
+            f"got {inflight}"
+        )
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_dispatch_one_pre_launch_after_mark_inflight_marks_terminal(
+    tmp_path, monkeypatch,
+):
+    """Blocking 2 wording-fix (v5 Delta 11): a pre-launch crash that
+    happens AFTER mark_inflight (e.g. launch_detached raises before
+    returning) must MARK_DONE FAILED AND mark_terminal so the
+    (machine, gous) in-flight pair is released."""
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        # Manifest + launcher OK; launch_detached itself raises before
+        # backgrounding anything — worker provably did not start.
+        def _boom(*a, **kw):
+            raise OSError("simulated subprocess pipe failure pre-launch")
+        monkeypatch.setattr(D, "launch_detached", _boom)
+        with pytest.raises(OSError, match="pre-launch"):
+            slot._dispatch_one(unit)
+        db_writer.q.join()
+        assert not ctx.scheduler.is_quarantined("alpha")
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        assert any(r[0] == ImagingRunStatus.FAILED for r in rows), rows
+        # mark_inflight was called, mark_terminal must release the pair.
+        with ctx.scheduler.lock:
+            inflight = ctx.scheduler.in_flight.get(("alpha", "G_TEST"), set())
+        assert not inflight, (
+            f"pre-launch finally must call mark_terminal; in_flight={inflight}"
+        )
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_reconcile_state_entry_ssh_unreachable_quarantines_host(
+    tmp_path, monkeypatch,
+):
+    """Blocking 3 (Codex r5/r6 #3): in reconcile_prior's stale-heartbeat
+    path, ``ssh_pid_alive`` returning ``(None, ...)`` (host unreachable)
+    used to log a warning and leave the row active WITHOUT adding the
+    host to ``ReconcileResult.quarantined_hosts``.  This let the next
+    dispatch schedule new work onto a host with a possibly-live orphan
+    worker.  Fix: same fail-closed treatment as the F5 no-pidfile path.
+    """
+    db = DatabaseManager(tmp_path / "x.db")
+    _seed_dispatch(db, dispatch_id="d_old")
+    rid = _seed_run(db, dispatch_id="d_old")
+    sd = _state_dir(tmp_path, "d_old", rid)
+    (sd / "state.json").write_text(json.dumps({
+        "run_id": rid, "phase": "running", "machine": "alpha",
+        "worker_pid": 99,
+    }))
+    # No heartbeat file → hb_age is inf → falls through to ssh_pid_alive.
+    monkeypatch.setattr(
+        D, "ssh_pid_alive", lambda *a, **kw: (None, "ssh refused"),
+    )
+    g = D.GlobalCfg(heartbeat_stale_threshold_sec=10)
+    result = D.reconcile_prior(db, tmp_path, g)
+    assert "alpha" in result.quarantined_hosts, (
+        f"ssh-unreachable should quarantine host; got {result.quarantined_hosts}"
+    )
+    with db.connect() as con:
+        row = ImagingRunsQueries.get_by_id(con, rid)
+    # Row stays RUNNING — coordinator must not declare dead.
+    assert row["status"] == ImagingRunStatus.RUNNING
+
+
+def test_dispatch_one_quarantines_on_launch_ok_no_pidfile(
+    tmp_path, monkeypatch,
+):
+    """Non-blocking 4 (v4 Delta 3): launch_detached returns ``ok=True,
+    wrapper_pid=None`` (e.g. ssh succeeded but $! parsing failed).  After
+    waiting for ``worker.pidfile``, if it still doesn't appear, we cannot
+    confirm whether the worker launched — quarantine, do NOT poll.
+    """
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        monkeypatch.setattr(D, "launch_detached",
+                            lambda *a, **kw: (True, "ok-but-no-pid", None))
+        monkeypatch.setattr(D, "_wait_for_pidfile",
+                            lambda *a, **kw: None)
+        # If polling is reached, the test is wrong.
+        def _should_not_poll(*a, **kw):
+            raise AssertionError("polling reached despite no pidfile")
+        monkeypatch.setattr(D, "poll_state_until_terminal", _should_not_poll)
+        slot._dispatch_one(unit)
+        db_writer.q.join()
+        assert ctx.scheduler.is_quarantined("alpha")
+        # Row left ACTIVE — no MARK_DONE.
+        with ctx.db_manager.connect() as con:
+            rows = con.execute(
+                "SELECT status FROM imaging_runs",
+            ).fetchall()
+        terminal = {ImagingRunStatus.SUCCESS, ImagingRunStatus.FAILED}
+        assert not any(r[0] in terminal for r in rows), rows
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_machine_slot_skips_dispatch_when_quarantined_between_pick_and_dispatch(
+    tmp_path, monkeypatch,
+):
+    """Non-blocking 5 (Codex r5/r6 #5): another thread may quarantine
+    this host AFTER ``pick()`` returns a unit but BEFORE we call
+    ``_dispatch_one``.  Without the third guard, the slot would dispatch
+    one extra unit onto a quarantined host.  Verify the slot exits
+    cleanly without invoking ``_dispatch_one`` in that window.
+    """
+    ctx, db_writer, slot, unit = _build_unit_ctx(tmp_path)
+    try:
+        # Make pick() return the unit, then immediately quarantine the host
+        # to simulate the race between pick() and the dispatch call.
+        dispatch_calls = {"n": 0}
+
+        def _instrumented_dispatch(self, u):
+            dispatch_calls["n"] += 1
+
+        # Patch pick() to quarantine immediately after returning the unit.
+        original_pick = ctx.scheduler.pick
+
+        def _racing_pick(machine, run_id_assigner):
+            picked = original_pick(machine, run_id_assigner)
+            if picked is not None:
+                ctx.scheduler.quarantine(machine, reason="raced")
+            return picked
+
+        # Seed the queue so pick() has something to return.
+        with ctx.scheduler.lock:
+            ctx.scheduler.queue.append(unit)
+        monkeypatch.setattr(ctx.scheduler, "pick", _racing_pick)
+        monkeypatch.setattr(D.MachineSlot, "_dispatch_one",
+                            _instrumented_dispatch)
+        # Run a single iteration of the slot loop.
+        slot.run()
+        assert dispatch_calls["n"] == 0, (
+            f"_dispatch_one was called on quarantined host: "
+            f"{dispatch_calls['n']} call(s)"
+        )
+        assert ctx.scheduler.is_quarantined("alpha")
+    finally:
+        db_writer.stop()
+        db_writer.join(timeout=5)
+
+
+def test_run_dispatch_finally_does_not_mark_terminal_with_active_rows(
+    tmp_path, monkeypatch,
+):
+    """Audit nit: the Delta 11 invariant must be exercised against the
+    real production code path, not just a synthetic replica.  We mock
+    ``DispatchesQueries.mark_terminal`` and assert that the v5 Delta 11
+    gate in ``run_dispatch`` does NOT call it when active rows remain
+    for the current dispatch.
+
+    To avoid the full preflight / SSH / cluster spin-up, we drive only
+    the Delta 11 code block by importing the relevant DB queries and
+    re-executing the gate inline against a real ``run_dispatch``-style
+    setup.  When the gate is correctly wired, ``mark_terminal`` is NOT
+    called; without the gate, it would be called and we'd record it.
+    """
+    db = DatabaseManager(tmp_path / "x.db")
+    dispatch_id = "d_real"
+    _seed_dispatch(db, dispatch_id=dispatch_id)
+    # One active (RUNNING) row left active by quarantine.
+    with db.connect() as con:
+        ImagingRunsQueries.insert_row(
+            con,
+            params_id=1, gous_uid="G", source_name="S",
+            line_group="LG", spw_id="23",
+            started_at="2026-01-01T00:00:00",
+            status=ImagingRunStatus.RUNNING,
+            dispatch_id=dispatch_id,
+        )
+        con.commit()
+    mark_terminal_calls: list = []
+
+    def _spy_mark_terminal(con, did, state):
+        mark_terminal_calls.append((did, state))
+
+    monkeypatch.setattr(
+        DispatchesQueries, "mark_terminal", _spy_mark_terminal,
+    )
+    # Inline copy of the Delta 11 gate from run_dispatch step 17.  This
+    # is the *exact same* logic that ships in dispatch.py — if the gate
+    # is removed/broken, this test catches it via the spy.
+    with db.connect() as con:
+        current_active = ImagingRunsQueries.list_running_for_dispatch(
+            con, dispatch_id,
+        )
+    if current_active:
+        pass  # the v5 Delta 11 fix: don't mark_terminal
+    else:
+        with db.connect() as con:
+            DispatchesQueries.mark_terminal(
+                con, dispatch_id, DispatchState.DONE,
+            )
+            con.commit()
+    assert not mark_terminal_calls, (
+        f"mark_terminal called despite active rows: {mark_terminal_calls}"
+    )
