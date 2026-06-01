@@ -440,6 +440,7 @@ def run_unit(args: argparse.Namespace) -> int:
     token_lease = _staging.TokenLease(
         tokens_dir, max_concurrent_staging,
         holder_id=f"{dispatch_id}/{run_id}",
+        timeout_sec=float(getattr(args, "token_wait_timeout_sec", None) or _staging._DEFAULT_TOKEN_WAIT_TIMEOUT_SEC),
     )
 
     try:
@@ -596,6 +597,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--publish-policy", default="fail_if_exists",
                     choices=["fail_if_exists", "overwrite"])
     ap.add_argument("--heartbeat-interval", type=float, default=30)
+    ap.add_argument("--token-wait-timeout-sec", type=float, default=None,
+                    help="Bound on worker-side wait for a NAS staging token. "
+                         "None defaults to staging._DEFAULT_TOKEN_WAIT_TIMEOUT_SEC.")
 
     # Preflight subcommand
     pf = sub.add_parser("preflight", help="Check raid + NAS + free space.")

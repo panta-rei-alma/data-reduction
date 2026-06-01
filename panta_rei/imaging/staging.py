@@ -23,6 +23,8 @@ Key primitives:
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import hashlib
 import json
 import logging
@@ -32,11 +34,83 @@ import shutil
 import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Typed exceptions and module-level constants for bounded waits
+# ---------------------------------------------------------------------------
+
+class StaleLockTimeout(Exception):
+    """``_MkdirLock`` could not acquire within ``wait_timeout_sec``.
+
+    Deliberately NOT a ``TimeoutError`` (which is itself an ``OSError``)
+    so that callers' existing ``except OSError`` clauses for filesystem
+    races do not silently swallow the bounded-wait signal.
+    """
+
+
+class TokenAcquireTimeout(TimeoutError):
+    """``acquire_staging_token`` could not acquire a slot in time.
+
+    IS-A ``TimeoutError`` to preserve the existing ``acquire_staging_token``
+    contract (callers and tests expect ``TimeoutError``).  A dedicated
+    subclass lets ``stage_one``'s populate block discriminate this
+    unit-fatal case from generic filesystem ``ETIMEDOUT``.
+    """
+
+
+_MKDIR_LOCK_DEFAULT_WAIT_SEC = 300.0
+_DEFAULT_TOKEN_WAIT_TIMEOUT_SEC = 1800.0
+_MKDIR_LOCK_PROGRESS_LOG_SEC = 60.0
+
+
+def _read_proc_starttime(pid: int) -> Optional[int]:
+    """Return field 22 of ``/proc/<pid>/stat`` (starttime in clock ticks).
+
+    Returns ``None`` if the PID is dead or ``/proc`` is unreadable.
+    Used to disambiguate PID reuse: the start-time is stable for the
+    lifetime of a process and differs when the kernel hands the same
+    numeric PID to a fresh process.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        rparen = data.rfind(b")")
+        if rparen < 0:
+            return None
+        fields = data[rparen + 2:].split()
+        if len(fields) < 20:
+            return None
+        return int(fields[19])
+    except (OSError, ValueError):
+        return None
+
+
+def _same_host(stored: str) -> bool:
+    """True iff *stored* names the current host.
+
+    Compares against ``socket.gethostname()`` and ``socket.getfqdn()`` in
+    both short and FQDN forms.  Case-insensitive per RFC 952/1123.  Two
+    truly-different hosts that share a short name would false-positive
+    here; on this fleet hostnames are unique on the short form.
+    """
+    if not stored:
+        return False
+    stored_low = stored.strip().lower()
+    own: set[str] = set()
+    for name in (socket.gethostname(), socket.getfqdn()):
+        name_low = (name or "").strip().lower()
+        if not name_low:
+            continue
+        own.add(name_low)
+        own.add(name_low.split(".", 1)[0])
+    return stored_low in own or stored_low.split(".", 1)[0] in own
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +145,17 @@ class _MkdirLock:
     primitive we rely on.  If a previous holder crashed, the lock dir
     persists indefinitely — so on every contended attempt we read the
     holder's metadata and self-heal: if the holder is on the same host
-    and its PID is dead, we ``rmtree`` and retry.  This bounds recovery
-    to a single host's /proc check (no SSH from the worker).
+    and its PID is dead (including same-numeric-PID-but-fresh-process
+    via start-time disambiguation), we ``rmtree`` and retry.  This
+    bounds recovery to a single host's /proc check (no SSH from the
+    worker).
 
-    For cross-host stale lock recovery (a holder on a different host
-    that died), the coordinator's stale-holder reaper handles it.
+    Cross-host stale lock-dir recovery is NOT implemented today.  A
+    stale lock-dir from a remote worker surfaces on the local worker
+    as ``StaleLockTimeout`` after ``wait_timeout_sec``; callers then
+    fall back (cache locks) or fail the unit (stage locks).  A
+    coordinator-side reaper analogous to ``TokenReaper`` is a documented
+    follow-up.
 
     There is a small live-lock race between ``mkdir`` and the
     ``holder.json`` write: a contender that observes the directory
@@ -89,16 +169,42 @@ class _MkdirLock:
     acquired: bool = False
     # Grace window for a freshly-mkdir'd lock to publish its metadata.
     missing_metadata_grace_sec: float = 3.0
+    # Bounded wait — None disables (test/legacy convenience).  Production
+    # defaults to _MKDIR_LOCK_DEFAULT_WAIT_SEC.
+    wait_timeout_sec: Optional[float] = _MKDIR_LOCK_DEFAULT_WAIT_SEC
+    # Poll sleep range (uniform random); tests can pass tight values.
+    poll_sleep: tuple[float, float] = (0.5, 1.5)
 
     def __enter__(self) -> "_MkdirLock":
+        started = time.monotonic()
+        last_progress_log_at = started
+        deadline: Optional[float] = (
+            started + self.wait_timeout_sec
+            if self.wait_timeout_sec is not None else None
+        )
         while True:
+            # Bound EVERY iteration, not just the alive-True branch.
+            # Reclaim-loop pathological cases (filesystem replaying the
+            # stale lock, repeated metadata-missing observations) must
+            # also surface as StaleLockTimeout rather than spin forever.
+            now = time.monotonic()
+            if deadline is not None and now > deadline:
+                holder_meta = _read_holder_meta(self.dir_path)
+                raise StaleLockTimeout(
+                    f"could not acquire {self.dir_path} in "
+                    f"{self.wait_timeout_sec:.0f}s "
+                    f"(holder={holder_meta})"
+                )
             try:
                 self.dir_path.mkdir(parents=True, exist_ok=False)
                 self.acquired = True
+                # Identity fields LAST so a caller-supplied holder_meta
+                # cannot override host/pid/starttime_ticks.
                 meta = {
+                    **(self.holder_meta or {}),
                     "host": socket.gethostname(),
                     "pid": os.getpid(),
-                    **self.holder_meta,
+                    "starttime_ticks": _read_proc_starttime(os.getpid()),
                 }
                 # Atomic publish of holder metadata so contenders never
                 # see a half-written file.
@@ -107,22 +213,234 @@ class _MkdirLock:
                 os.replace(str(tmp), str(self.dir_path / "holder.json"))
                 return self
             except FileExistsError:
+                # Snapshot the holder fingerprint BEFORE the alive check
+                # so the post-rename race-detection compares against the
+                # same generation we judged stale.  holder.json already
+                # encodes pid + starttime_ticks, so PID-reuse cannot
+                # produce a false-positive match.
+                fp_snapshot = _read_blob(self.dir_path / "holder.json")
                 if not _holder_alive_locally(
                     self.dir_path,
                     missing_metadata_grace_sec=self.missing_metadata_grace_sec,
                 ):
-                    # Stale lock from a crashed holder — recover.
                     log.warning(
                         "stale stage lock detected at %s; reclaiming",
                         self.dir_path,
                     )
-                    shutil.rmtree(self.dir_path, ignore_errors=True)
+                    _atomic_reclaim(
+                        self.dir_path,
+                        expected_fingerprint=fp_snapshot,
+                        read_fingerprint=lambda d: _read_blob(d / "holder.json"),
+                        malformed_grace_sec=self.missing_metadata_grace_sec,
+                    )
                     continue
-                time.sleep(random.uniform(0.5, 1.5))
+                if now - last_progress_log_at >= _MKDIR_LOCK_PROGRESS_LOG_SEC:
+                    holder_meta = _read_holder_meta(self.dir_path)
+                    log.warning(
+                        "still waiting for lock at %s; holder=%s waited=%.0fs",
+                        self.dir_path, holder_meta, now - started,
+                    )
+                    last_progress_log_at = now
+                time.sleep(random.uniform(*self.poll_sleep))
 
     def __exit__(self, *exc_info) -> None:
         if self.acquired:
             shutil.rmtree(self.dir_path, ignore_errors=True)
+
+
+def _read_holder_meta(lock_dir: Path) -> Optional[dict]:
+    """Best-effort read of ``holder.json`` for diagnostics; never raises."""
+    try:
+        return json.loads((Path(lock_dir) / "holder.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _atomic_reclaim(
+    stale_dir: Path,
+    *,
+    expected_fingerprint: Optional[bytes],
+    read_fingerprint,
+    malformed_grace_sec: float = 3.0,
+) -> bool:
+    """Atomically reclaim *stale_dir* IFF its generation matches.
+
+    Returns ``True`` iff we removed the generation we observed as
+    stale.  Returns ``False`` if another reclaimer beat us, the
+    directory vanished, or the post-rename generation does not match
+    (in which case we restore it).
+
+    The race-closing story:
+    1. ``os.rename`` is atomic, so exactly one contender can move
+       ``stale_dir`` for a given observation.  Losers see
+       ``FileNotFoundError`` and return ``False``.
+    2. After rename, the winner reads the post-rename fingerprint via
+       *read_fingerprint*.  If it matches *expected_fingerprint*, the
+       moved directory IS the stale generation — safe to ``rmtree``.
+    3. If it does not match, a fresh holder won the lock between our
+       fingerprint snapshot and our rename.  We reverse-rename to put
+       the fresh holder back.  If the reverse-rename fails (a third
+       contender ``mkdir``'d at ``stale_dir`` in the gap), we DO NOT
+       ``rmtree`` the renamed copy — that would silently delete a
+       valid holder while a different one owns the original path.
+       The stranded ``.reclaim.<uuid>`` directory is logged loudly
+       for operator follow-up; data integrity is preserved at the
+       cost of a leaked directory.
+
+    Fingerprint design:
+    - Callers snapshot the bytes BEFORE the liveness check.
+    - The fingerprint MUST be strong enough to disambiguate two
+      different live processes (PID reuse: same numeric PID but
+      different start-time).  For lock-dirs, ``holder.json`` already
+      encodes ``pid`` + ``starttime_ticks``.  For tokens, the
+      fingerprint reader concatenates ``pid`` and ``starttime_ticks``
+      file contents.
+    - When the stale generation legitimately has no fingerprint
+      (mkdir won but holder published nothing — the malformed window),
+      callers pass ``expected_fingerprint=None``.  In that case we
+      fall back to an mtime-age check: only rmtree if the directory
+      is older than *malformed_grace_sec* (mirrors
+      ``_holder_alive_locally``'s grace logic) — a freshly-mkdir'd
+      dir under us would have age < grace and be put back.
+
+    Residual race: a fresh holder that mkdir's, writes the
+    fingerprint, AND has the same fingerprint bytes as the stale gen
+    (e.g., same pid+starttime — astronomically unlikely with
+    start-time check) — would still match and be rmtree'd.  This
+    is a microsecond-scale window we accept as a defense-in-depth
+    backstop; the primary protection remains the bounded
+    ``wait_timeout_sec`` plus the dispatch-side ``TokenReaper`` for
+    tokens.
+    """
+    reclaim_path = stale_dir.with_name(
+        stale_dir.name + f".reclaim.{uuid.uuid4().hex}"
+    )
+    try:
+        os.rename(str(stale_dir), str(reclaim_path))
+    except (FileNotFoundError, OSError):
+        return False
+
+    actual = read_fingerprint(reclaim_path)
+    safe_to_remove = False
+    if expected_fingerprint is not None and actual == expected_fingerprint:
+        safe_to_remove = True
+    elif expected_fingerprint is None and actual is None:
+        # Both fingerprint-less — distinguish "still old stale lock"
+        # from "fresh mkdir under us" via directory mtime age.
+        try:
+            age = time.time() - reclaim_path.stat().st_mtime
+        except OSError:
+            age = float("inf")
+        if age >= malformed_grace_sec:
+            safe_to_remove = True
+
+    if safe_to_remove:
+        shutil.rmtree(reclaim_path, ignore_errors=True)
+        return True
+
+    # Not safe — restore the path so the fresh holder (or whoever
+    # legitimately owns it now) is not disrupted.  Use renameat2 with
+    # RENAME_NOREPLACE: plain os.rename would clobber an empty third-
+    # contender directory at stale_dir.  If renameat2 is unavailable
+    # OR the destination exists, leave the .reclaim.<uuid> stranded
+    # rather than risk overwriting a valid holder.
+    if not _safe_restore(reclaim_path, stale_dir):
+        log.error(
+            "reclaim race at %s: moved an unexpected generation, "
+            "could not safely restore (renameat2 unavailable or "
+            "destination occupied). Stranded copy left at %s; "
+            "manual investigation needed.",
+            stale_dir, reclaim_path,
+        )
+    return False
+
+
+def _read_blob(path: Path) -> Optional[bytes]:
+    """Best-effort bytes-read; returns None on any OSError."""
+    try:
+        return Path(path).read_bytes()
+    except OSError:
+        return None
+
+
+def _read_token_fingerprint(slot_dir: Path) -> Optional[bytes]:
+    """Generation fingerprint for a staging token slot.
+
+    Returns the canonical bytes ``<pid>|<starttime_ticks>`` only when
+    BOTH files exist AND each parses as a non-negative integer (after
+    stripping).  Returns ``None`` for absent/empty/malformed files so
+    ``_atomic_reclaim`` falls back to the mtime-age path rather than
+    match a partial generation by PID alone — a fresh holder mid-write
+    can briefly expose a zero-length ``starttime_ticks`` file
+    (``Path.write_text`` truncates before writing), which would
+    otherwise let an old same-PID stale slot's fingerprint collide
+    with the new generation's "pid|empty".
+    """
+    pid_bytes = _read_blob(slot_dir / "pid")
+    st_bytes = _read_blob(slot_dir / "starttime_ticks")
+    if pid_bytes is None or st_bytes is None:
+        return None
+    try:
+        pid = int(pid_bytes.strip())
+        st = int(st_bytes.strip())
+    except (ValueError, AttributeError):
+        return None
+    if pid < 0 or st < 0:
+        return None
+    return f"{pid}|{st}".encode()
+
+
+# renameat2 + RENAME_NOREPLACE: atomic rename that REFUSES to clobber
+# an existing destination.  POSIX ``os.rename`` allows renaming a
+# non-empty dir onto an empty dir (which would commandeer a third
+# contender's freshly-mkdir'd slot during reclaim put-back).  Linux
+# 3.15+ exposes ``renameat2`` for the no-replace semantic; on older
+# kernels or non-Linux, ``_safe_restore`` falls back to "leave
+# stranded" rather than risk overwriting a fresh holder.
+
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+_libc = None
+
+
+def _load_libc():
+    global _libc
+    if _libc is not None:
+        return _libc
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    try:
+        _libc = ctypes.CDLL(libc_name, use_errno=True)
+    except OSError:
+        _libc = False  # sentinel: failed to load
+    return _libc
+
+
+def _safe_restore(reclaim_path: Path, original_path: Path) -> bool:
+    """Try to rename *reclaim_path* back to *original_path* WITHOUT
+    overwriting an existing destination.
+
+    Returns ``True`` on a successful restore.  Returns ``False`` if
+    the destination already exists OR renameat2 is unavailable on
+    this platform.  Crucially, this NEVER clobbers a fresh empty
+    directory that a third contender may have just created at
+    *original_path* — closing the rename-over-empty-dir hazard that
+    plain ``os.rename`` would expose.
+    """
+    libc = _load_libc()
+    if libc is False or not hasattr(libc, "renameat2"):
+        return False
+    libc.renameat2.restype = ctypes.c_int
+    libc.renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    ret = libc.renameat2(
+        _AT_FDCWD, str(reclaim_path).encode(),
+        _AT_FDCWD, str(original_path).encode(),
+        _RENAME_NOREPLACE,
+    )
+    return ret == 0
 
 
 def _holder_alive_locally(
@@ -132,7 +450,9 @@ def _holder_alive_locally(
     """Return True iff the lock's holder is on this host AND alive.
 
     Cross-host holders are reported as alive (no local check is
-    possible) — the coordinator's reaper handles those.
+    possible).  Cross-host stale lock-dir recovery is not implemented
+    today — callers rely on the bounded ``_MkdirLock`` wait to surface
+    a typed ``StaleLockTimeout`` instead of looping forever.
 
     Missing ``holder.json`` could mean either (a) a crashed holder
     that never wrote metadata, or (b) a freshly-mkdir'd lock whose
@@ -141,18 +461,16 @@ def _holder_alive_locally(
     ``missing_metadata_grace_sec`` for the file to appear before
     declaring stale.
 
-    Same-host holder: PID-only liveness via ``os.kill(pid, 0)``.  We
-    deliberately do NOT validate the cmdline here because (a) the
-    ``/proc/<pid>/cmdline`` of an unrelated PID-reuse victim is
-    indistinguishable from a legitimate other Python process, and (b)
-    the cross-host coordinator reaper handles cmdline-based PID reuse
-    detection more carefully.
+    Same-host liveness: ``os.kill(pid, 0)`` plus start-time match.
+    The start-time check disambiguates PID reuse: a fresh process at
+    the same numeric PID has a different ``/proc/<pid>/stat`` field
+    22.  Holders written by older versions (no ``starttime_ticks``
+    field) fall back to PID-only liveness — graceful degradation.
     """
     holder_file = Path(lock_dir) / "holder.json"
     if not holder_file.exists():
         # Race: holder may be mid-write.  Give it a grace window before
-        # declaring stale.  Polling is short (50ms) to keep contention
-        # latency low on legitimate stale-lock recovery paths.
+        # declaring stale.
         deadline = time.monotonic() + max(0.0, missing_metadata_grace_sec)
         while time.monotonic() < deadline:
             time.sleep(0.05)
@@ -167,22 +485,33 @@ def _holder_alive_locally(
 
     host = meta.get("host")
     pid = int(meta.get("pid", 0))
+    starttime = meta.get("starttime_ticks")
     if not pid:
         return False
-    if host and host != socket.gethostname():
-        # Different host — caller must rely on the coordinator reaper.
+    if host and not _same_host(host):
         return True
 
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Process exists but is owned by another user — treat as alive.
         return True
     except OSError:
-        return True  # ambiguous — assume alive
+        return True
+
+    if starttime is not None:
+        current = _read_proc_starttime(pid)
+        if current is None:
+            # PID died between os.kill and stat read — stale.
+            return False
+        try:
+            if int(current) != int(starttime):
+                # PID was reused — original holder is gone.
+                return False
+        except (TypeError, ValueError):
+            return True
+    return True
 
 
 def acquire_stage_lock(gous_dir: Path, holder_meta: dict | None = None) -> _MkdirLock:
@@ -202,46 +531,153 @@ def acquire_stage_lock(gous_dir: Path, holder_meta: dict | None = None) -> _Mkdi
 # NAS staging tokens (global concurrency cap)
 # ---------------------------------------------------------------------------
 
+def _token_holder_alive(
+    slot_dir: Path,
+    malformed_grace_sec: float = 60.0,
+) -> bool:
+    """Return True iff the token slot's holder is on this host AND alive.
+
+    Mirrors ``_holder_alive_locally`` but for the per-token metadata
+    shape (``host``, ``pid``, ``holder``, ``acquired_at``, optional
+    ``starttime_ticks``) used by :func:`acquire_staging_token`.
+
+    Missing-metadata slots get a ``malformed_grace_sec`` window before
+    being declared stale — mirrors the dispatch-side
+    ``_TOKEN_MALFORMED_GRACE_SEC`` so an in-flight acquire's brief
+    mkdir-then-write window is not stolen.
+
+    Cross-host holders are treated as alive; the dispatch coordinator's
+    ``TokenReaper`` performs cross-host cleanup via ``ssh_pid_alive``.
+    """
+    slot_dir = Path(slot_dir)
+    host_file = slot_dir / "host"
+    pid_file = slot_dir / "pid"
+
+    # Missing host or pid: respect the grace window for in-flight
+    # acquires that have mkdir'd the slot but not yet written metadata.
+    if not host_file.exists() or not pid_file.exists():
+        try:
+            slot_mtime = slot_dir.stat().st_mtime
+        except OSError:
+            return False
+        age = time.time() - slot_mtime
+        if age < malformed_grace_sec:
+            return True
+        return False
+
+    try:
+        host = host_file.read_text().strip()
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if not pid:
+        return False
+    if host and not _same_host(host):
+        return True
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+    st_file = slot_dir / "starttime_ticks"
+    if st_file.exists():
+        try:
+            stored = int(st_file.read_text().strip())
+        except (OSError, ValueError):
+            return True
+        current = _read_proc_starttime(pid)
+        if current is None:
+            return False
+        if current != stored:
+            return False
+    return True
+
+
 def acquire_staging_token(
     tokens_root: Path,
     n_slots: int,
     *,
     holder_id: str,
     poll_sleep: tuple[float, float] = (1.0, 3.0),
-    timeout_sec: Optional[float] = None,
+    timeout_sec: Optional[float] = _DEFAULT_TOKEN_WAIT_TIMEOUT_SEC,
 ) -> int:
     """Acquire one of *n_slots* tokens under *tokens_root*.
 
     Atomic primitive: ``os.mkdir(tokens_root/<i>)``.  Returns the index
-    of the slot acquired.  On crash, the token directory persists; the
-    coordinator's reaper :func:`reap_stale_tokens` drops it after
-    confirming the holder PID is dead.
+    of the slot acquired.  ``timeout_sec`` bounds the wait — defaults to
+    30 minutes; ``None`` opts out (legacy / test convenience).
+
+    Raises :class:`TokenAcquireTimeout` (an alias of ``TimeoutError``)
+    when the bound is exceeded.  Same-host stale slots whose PID is
+    dead — including same-numeric-PID-but-fresh-process via
+    ``starttime_ticks`` mismatch — are reclaimed and re-tried.
+    Cross-host stale slots are left to the dispatch coordinator's
+    ``TokenReaper``.
     """
     tokens_root = Path(tokens_root)
     tokens_root.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     while True:
+        # Bound EVERY iteration of the outer loop, not just the
+        # all-slots-pinned path.  A pathological reclaim cycle (e.g.,
+        # filesystem churn racing our rename) must also terminate.
+        if timeout_sec is not None and time.monotonic() - started > timeout_sec:
+            raise TokenAcquireTimeout(
+                f"could not acquire staging token under {tokens_root} "
+                f"in {timeout_sec}s"
+            )
         for i in range(n_slots):
             slot = tokens_root / str(i)
             try:
                 slot.mkdir()
             except FileExistsError:
-                continue
+                # Snapshot the generation fingerprint (pid +
+                # starttime_ticks) BEFORE the alive check.  Using both
+                # closes the PID-reuse race: a fresh holder with the
+                # same numeric PID will have a different start time.
+                fp_snapshot = _read_token_fingerprint(slot)
+                if not _token_holder_alive(slot):
+                    log.warning(
+                        "stale staging token at %s; reclaiming", slot,
+                    )
+                    _atomic_reclaim(
+                        slot,
+                        expected_fingerprint=fp_snapshot,
+                        read_fingerprint=_read_token_fingerprint,
+                        # Mirror dispatch._TOKEN_MALFORMED_GRACE_SEC for
+                        # the no-metadata window.
+                        malformed_grace_sec=60.0,
+                    )
+                    try:
+                        slot.mkdir()
+                    except FileExistsError:
+                        continue
+                else:
+                    continue
             try:
+                # Identity-bearing files written; ``starttime_ticks``
+                # last so consumers checking for its presence can
+                # safely fall back to PID-only on old slots.
                 (slot / "host").write_text(socket.gethostname())
                 (slot / "pid").write_text(str(os.getpid()))
                 (slot / "holder").write_text(holder_id)
                 (slot / "acquired_at").write_text(str(time.time()))
+                st = _read_proc_starttime(os.getpid())
+                if st is not None:
+                    (slot / "starttime_ticks").write_text(str(st))
             except OSError as exc:
-                # Couldn't write metadata — give up the slot
+                # Best-effort cleanup of OUR partial write; the slot
+                # path may belong to us (we just mkdir'd it) so a
+                # direct rmtree here is safe — no peer can have raced
+                # to write into a slot we own.
                 shutil.rmtree(slot, ignore_errors=True)
                 raise RuntimeError(f"failed to write token metadata: {exc}")
             return i
-        if timeout_sec is not None and time.monotonic() - started > timeout_sec:
-            raise TimeoutError(
-                f"could not acquire staging token under {tokens_root} "
-                f"in {timeout_sec}s"
-            )
         time.sleep(random.uniform(*poll_sleep))
 
 
@@ -251,7 +687,14 @@ def release_staging_token(tokens_root: Path, i: int) -> None:
 
 
 def list_held_tokens(tokens_root: Path) -> list[dict]:
-    """Return metadata for every held token under *tokens_root*."""
+    """Return metadata for every held token under *tokens_root*.
+
+    ``starttime_ticks`` is OPTIONAL — old tokens (pre-PID-reuse fix)
+    are reported with ``starttime_ticks: None`` and MUST NOT be
+    misclassified as malformed.  The dispatch ``TokenReaper`` reaps
+    malformed slots after a grace window; treating old-but-valid slots
+    as malformed would disrupt live cross-version dispatches.
+    """
     tokens_root = Path(tokens_root)
     if not tokens_root.exists():
         return []
@@ -263,14 +706,23 @@ def list_held_tokens(tokens_root: Path) -> list[dict]:
             host = (slot / "host").read_text().strip()
             pid = int((slot / "pid").read_text().strip())
             holder = (slot / "holder").read_text().strip() if (slot / "holder").exists() else ""
+            # starttime_ticks is back-compat optional — its own
+            # try/except so a corrupt-but-not-missing value still
+            # reports None instead of poisoning the slot record.
+            starttime_ticks: Optional[int] = None
+            st_file = slot / "starttime_ticks"
+            if st_file.exists():
+                try:
+                    starttime_ticks = int(st_file.read_text().strip())
+                except (OSError, ValueError):
+                    starttime_ticks = None
             out.append({
                 "slot": slot.name, "path": slot, "host": host, "pid": pid,
-                "holder": holder,
+                "holder": holder, "starttime_ticks": starttime_ticks,
             })
         except (OSError, ValueError):
-            # Partially-populated slot — treat as suspect
             out.append({"slot": slot.name, "path": slot, "host": None, "pid": None,
-                        "holder": ""})
+                        "holder": "", "starttime_ticks": None})
     return out
 
 
@@ -627,18 +1079,22 @@ def acquire_cache_populate(
 
     Raises ``TimeoutError`` if neither outcome occurs within
     ``timeout_sec`` (caller should fall back to NAS-direct staging).
+    Raises :class:`StaleLockTimeout` if the inner GC lock acquisition
+    exceeds its (capped) bound — this is NOT a ``TimeoutError`` /
+    ``OSError`` subclass, so callers' ``except OSError`` filesystem-race
+    handlers do not silently swallow it.
 
     Stale-lock recovery: if the populator's host matches ours and its PID
-    is dead, we ``rmtree`` and retry.  Cross-host stale recovery is left
-    to the coordinator's reaper (same as NAS staging tokens) — workers
-    must NEVER ssh to a peer to check liveness.
+    is dead (PID reuse defended via ``starttime_ticks``), we ``rmtree``
+    and retry.  Cross-host stale recovery is NOT implemented today; the
+    bounded GC-lock wait surfaces it as ``StaleLockTimeout`` to the
+    caller.
     """
     cache_root = Path(cache_root)
     src_path = Path(src_path)
     entry_dir = cache_root / _cache_key(src_path)
     populating = entry_dir / ".populating"
     deadline = time.monotonic() + timeout_sec
-    meta = {"host": socket.gethostname(), "pid": os.getpid(), **(holder_meta or {})}
     cache_root.mkdir(parents=True, exist_ok=True)
     gc_lock_path = cache_root / ".gc.lock.d"
 
@@ -651,23 +1107,38 @@ def acquire_cache_populate(
         if hit is not None:
             return ("hit", None)
 
+        # Inner GC-lock wait is capped by remaining outer budget so a
+        # caller passing a small ``timeout_sec`` does not get a 300s
+        # inner timeout overshoot.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"cache populate wait exceeded {timeout_sec:.0f}s for {src_path}"
+            )
+        inner_timeout = min(_MKDIR_LOCK_DEFAULT_WAIT_SEC, remaining)
+
         # Publish ``.populating`` *under the GC lock* so concurrent
         # ``cache_evict_until_free`` cannot rmtree our entry between
-        # our mkdir and our holder.json write — eviction's
-        # candidate-collection sweep and our publish are now mutually
-        # exclusive at the GC mutex.  Populate cost is dominated by the
-        # NAS read which happens AFTER the GC lock is released; the
-        # critical section here is just two filesystem ops.
+        # our mkdir and our holder.json write.
         try:
             with _MkdirLock(
                 dir_path=gc_lock_path,
                 holder_meta={"role": "publish_populate", **(holder_meta or {})},
+                wait_timeout_sec=inner_timeout,
             ):
                 try:
                     populating.mkdir(parents=True, exist_ok=False)
                 except FileExistsError:
                     publish_outcome = "exists"
                 else:
+                    # Identity fields LAST so caller-supplied
+                    # holder_meta cannot override host/pid/starttime.
+                    meta = {
+                        **(holder_meta or {}),
+                        "host": socket.gethostname(),
+                        "pid": os.getpid(),
+                        "starttime_ticks": _read_proc_starttime(os.getpid()),
+                    }
                     tmp = populating / ".holder.json.tmp"
                     tmp.write_text(json.dumps(meta))
                     os.replace(str(tmp), str(populating / "holder.json"))
@@ -699,10 +1170,16 @@ def acquire_cache_populate(
 
         # ``.populating`` already present — fall through to wait/stale/timeout.
 
-        # Same-host stale recovery (cross-host is the coordinator reaper's job).
+        # Same-host stale recovery (cross-host is left to the bounded
+        # outer ``timeout_sec`` — no coordinator reaper for lock dirs).
+        fp_snapshot = _read_blob(populating / "holder.json")
         if not _holder_alive_locally(populating):
             log.warning("stale cache populate lock at %s; reclaiming", populating)
-            shutil.rmtree(populating, ignore_errors=True)
+            _atomic_reclaim(
+                populating,
+                expected_fingerprint=fp_snapshot,
+                read_fingerprint=lambda d: _read_blob(d / "holder.json"),
+            )
             continue
 
         if time.monotonic() > deadline:
@@ -738,6 +1215,7 @@ def cache_evict_until_free(
     target_free_bytes: int,
     *,
     skip_keys: Optional[set[str]] = None,
+    wait_timeout_sec: float = _MKDIR_LOCK_DEFAULT_WAIT_SEC,
 ) -> int:
     """Evict oldest cache entries (by sidecar ``staged_at``) until at
     least *target_free_bytes* are free on the cache filesystem.
@@ -745,6 +1223,11 @@ def cache_evict_until_free(
     Returns the number of entries evicted.  Skips entries whose key is
     in *skip_keys* (the entry currently being populated by the caller),
     plus any entry with a ``.populating`` lock.
+
+    On GC-lock contention exceeding ``wait_timeout_sec``, logs a WARN
+    and returns 0 (no eviction performed; caller proceeds without
+    trimmed space).  This bounds the worst case when a peer worker's
+    eviction stalls under load.
 
     Concurrency: a per-host GC mutex (mkdir-based) serialises eviction
     so two workers cannot rmtree the same entry concurrently or race
@@ -757,7 +1240,20 @@ def cache_evict_until_free(
     gc_lock = cache_root / ".gc.lock.d"
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    with _MkdirLock(dir_path=gc_lock, holder_meta={"role": "cache_gc"}):
+    try:
+        gc_cm = _MkdirLock(
+            dir_path=gc_lock,
+            holder_meta={"role": "cache_gc"},
+            wait_timeout_sec=wait_timeout_sec,
+        )
+        gc_cm.__enter__()
+    except StaleLockTimeout as exc:
+        log.warning(
+            "cache_evict_until_free: GC lock timeout on %s after %.0fs: %s",
+            gc_lock, wait_timeout_sec, exc,
+        )
+        return 0
+    try:
         free = _du_free_bytes(cache_root)
         if free >= target_free_bytes:
             return 0
@@ -803,6 +1299,8 @@ def cache_evict_until_free(
             shutil.rmtree(entry_dir, ignore_errors=True)
             evicted += 1
         return evicted
+    finally:
+        gc_cm.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -829,10 +1327,12 @@ class TokenLease:
         n_slots: int,
         *,
         holder_id: str,
+        timeout_sec: float = _DEFAULT_TOKEN_WAIT_TIMEOUT_SEC,
     ) -> None:
         self.tokens_dir = Path(tokens_dir) if tokens_dir else None
         self.n_slots = int(n_slots)
         self.holder_id = holder_id
+        self.timeout_sec = float(timeout_sec)
         self._idx: Optional[int] = None
         self._wait_total_sec = 0.0
         self._acquires = 0
@@ -843,6 +1343,7 @@ class TokenLease:
         started = time.monotonic()
         self._idx = acquire_staging_token(
             self.tokens_dir, self.n_slots, holder_id=self.holder_id,
+            timeout_sec=self.timeout_sec,
         )
         waited = time.monotonic() - started
         self._wait_total_sec += waited
@@ -947,10 +1448,10 @@ def stage_one(
                 holder_meta={"role": "cache_populate"},
                 timeout_sec=cache_populate_timeout_sec,
             )
-        except TimeoutError:
+        except (TimeoutError, StaleLockTimeout) as exc:
             log.warning(
-                "cache populate timeout for %s; falling back to NAS-direct",
-                src_path.name,
+                "cache populate gave up for %s (%s); falling back to NAS-direct",
+                src_path.name, exc,
             )
             outcome, lock = "fallback", None
 
@@ -975,6 +1476,10 @@ def stage_one(
                 # ("hit", None) instead of ("populate", lock) in that
                 # case, so we only reach here when there is genuinely
                 # no valid entry to reuse.
+                # stage_one-level populate deadline: we already committed
+                # to bounded time when entering this branch, so cap any
+                # downstream eviction wait by the same budget.
+                populate_deadline = time.monotonic() + cache_populate_timeout_sec
                 entry_dir = Path(cache_root) / _cache_key(src_path)
                 entry_dir.mkdir(parents=True, exist_ok=True)
                 cache_partial = entry_dir / f".{src_path.name}.partial"
@@ -983,10 +1488,14 @@ def stage_one(
                 try:
                     fp = _compute_fingerprint(src_path)
                     if cache_min_free_bytes is not None:
+                        remaining = max(0.0, populate_deadline - time.monotonic())
                         cache_evict_until_free(
                             Path(cache_root),
                             cache_min_free_bytes + int(fp["size_bytes"]),
                             skip_keys={_cache_key(src_path)},
+                            wait_timeout_sec=min(
+                                _MKDIR_LOCK_DEFAULT_WAIT_SEC, remaining,
+                            ),
                         )
                     _wipe(cache_partial)
                     if cache_final.exists():
@@ -1003,6 +1512,11 @@ def stage_one(
                     # Sidecar LAST — this is the entry's commit marker.
                     _write_sidecar_atomic(entry_dir, src_path, fp)
                     populate_ok = True
+                except TokenAcquireTimeout:
+                    # Token gate exhausted: NAS read is gated, no gate =
+                    # no NAS read.  Surface as unit failure rather than
+                    # silent NAS-direct retry (which would also fail).
+                    raise
                 except Exception as exc:
                     log.warning(
                         "cache populate failed for %s: %s — NAS-direct",
