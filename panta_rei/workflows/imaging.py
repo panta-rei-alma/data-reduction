@@ -635,6 +635,9 @@ class JointImagingStep(Step):
                     finished_at=now_iso(),
                     duration_sec=dt_sec,
                     output_fits=output_fits,
+                    # Local in-process imaging ran to completion here, so this
+                    # is an observed terminal (no remote worker / token).
+                    terminal_source="worker_observed",
                 )
                 con.commit()
 

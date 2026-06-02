@@ -1077,13 +1077,21 @@ def test_release_stale_lock_missing_or_malformed_returns_false(tmp_path):
     assert bad.exists()  # malformed → leave alone
 
 
-def _make_token(tokens_dir: Path, slot: str, host: str, pid: int):
+def _make_token(
+    tokens_dir: Path, slot: str, host: str, pid: int,
+    *, holder: str | None = None, starttime_ticks: int = 123456,
+):
     d = tokens_dir / slot
     d.mkdir(parents=True, exist_ok=True)
     (d / "host").write_text(host)
     (d / "pid").write_text(str(pid))
-    (d / "holder").write_text(f"d_x/{slot}")
+    (d / "holder").write_text(holder if holder is not None else f"d_x/{slot}")
     (d / "acquired_at").write_text("2026-04-30T14:43:00")
+    # Write starttime_ticks so the generation fingerprint
+    # (pid|starttime_ticks) is well-formed and _atomic_reclaim's
+    # rename-then-verify matches (rather than falling back to mtime grace).
+    if starttime_ticks is not None:
+        (d / "starttime_ticks").write_text(str(starttime_ticks))
     return d
 
 
@@ -2942,3 +2950,343 @@ def test_run_dispatch_finally_does_not_mark_terminal_with_active_rows(
     assert not mark_terminal_calls, (
         f"mark_terminal called despite active rows: {mark_terminal_calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Token reaper hardening (DB-backed + generation-checked + resolver), 2026-06-02
+# ---------------------------------------------------------------------------
+
+
+def _seed_terminal_run(db, *, dispatch_id, status, terminal_source, hostname="alpha"):
+    """Insert a terminal imaging_runs row stamped with terminal_source."""
+    with db.connect() as con:
+        rid = ImagingRunsQueries.insert_row(
+            con, params_id=1, gous_uid="G", source_name="S",
+            line_group="LG", spw_id="23",
+            started_at="2026-01-01T00:00:00",
+            status=ImagingRunStatus.QUEUED,
+            dispatch_id=dispatch_id, hostname=hostname,
+        )
+        ImagingRunsQueries.mark_done(
+            con, rid, status=status, retcode=0 if status == "success" else 1,
+            finished_at="2026-01-01T01:00:00", duration_sec=1.0,
+            terminal_source=terminal_source,
+        )
+        con.commit()
+    return rid
+
+
+def test_reaper_trusted_terminal_reaped_without_ssh(tmp_path, monkeypatch):
+    """A token whose holder run is terminal via a TRUSTED source is reaped
+    with NO ssh probe — even when ssh would be unreachable."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_terminal_run(
+        db, dispatch_id="d_x", status="failed",
+        terminal_source=D.TS_VERIFIED_DEAD,
+    )
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}")
+
+    def _ssh_must_not_run(*a, **kw):
+        raise AssertionError("ssh_pid_alive must not be called for trusted terminal")
+
+    monkeypatch.setattr(D, "ssh_pid_alive", _ssh_must_not_run)
+    counters = D._SweepCounters()
+    reaped = D._sweep_tokens_once(
+        tokens, ["--dispatch-id d_x"], db_manager=db, counters=counters,
+    )
+    assert reaped == 1
+    assert not (tokens / "0").exists()
+    assert counters.snapshot()["tokens_reaped_db"] == 1
+
+
+def test_reaper_untrusted_terminal_inconclusive_kept(tmp_path, monkeypatch):
+    """Untrusted terminal (abandoned) + ssh inconclusive → token KEPT."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_terminal_run(
+        db, dispatch_id="d_x", status="failed",
+        terminal_source=D.TS_ABANDONED,
+    )
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}")
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (None, "ssh rc=255"))
+    counters = D._SweepCounters()
+    reaped = D._sweep_tokens_once(
+        tokens, ["--dispatch-id d_x"], db_manager=db, counters=counters,
+    )
+    assert reaped == 0
+    assert (tokens / "0").exists()
+    assert counters.snapshot()["tokens_skipped_inconclusive"] == 1
+
+
+def test_reaper_nonterminal_alive_run_id_match_kept(tmp_path, monkeypatch):
+    """Non-terminal holder + ssh alive (run_id matches cmdline) → KEPT."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_run(db, dispatch_id="d_x")  # RUNNING (non-terminal)
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}")
+
+    seen_tokens = []
+
+    def _ssh(host, pid, expected_tokens, timeout=10):
+        seen_tokens.append(list(expected_tokens))
+        return (True, "ok")
+
+    monkeypatch.setattr(D, "ssh_pid_alive", _ssh)
+    reaped = D._sweep_tokens_once(tokens, ["--dispatch-id d_x"], db_manager=db)
+    assert reaped == 0
+    assert (tokens / "0").exists()
+    # Both dispatch-id AND run-id must be in the expected tokens (Delta C).
+    assert seen_tokens
+    assert f"--run-id {rid}" in seen_tokens[0]
+    assert "--dispatch-id d_x" in seen_tokens[0]
+
+
+def test_reaper_nonterminal_ssh_dead_reaped(tmp_path, monkeypatch):
+    """Non-terminal holder + ssh __DEAD__ (False) → reaped."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_run(db, dispatch_id="d_x")
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}")
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (False, ""))
+    counters = D._SweepCounters()
+    reaped = D._sweep_tokens_once(
+        tokens, ["--dispatch-id d_x"], db_manager=db, counters=counters,
+    )
+    assert reaped == 1
+    assert not (tokens / "0").exists()
+    assert counters.snapshot()["tokens_reaped_ssh"] == 1
+
+
+def test_reaper_pid_reused_same_dispatch_reaped(tmp_path, monkeypatch):
+    """PID reused by a different worker of the SAME dispatch: ssh_pid_alive
+    returns False (token mismatch) → reaped (Delta C protects against the
+    coarse dispatch-id-only match)."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_run(db, dispatch_id="d_x")
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}")
+
+    def _ssh(host, pid, expected_tokens, timeout=10):
+        # Cmdline has the dispatch-id but NOT this run-id → mismatch → False.
+        cmdline = "python -m worker --dispatch-id d_x --run-id 99999"
+        return (False, cmdline) if not all(t in cmdline for t in expected_tokens) else (True, cmdline)
+
+    monkeypatch.setattr(D, "ssh_pid_alive", _ssh)
+    reaped = D._sweep_tokens_once(tokens, ["--dispatch-id d_x"], db_manager=db)
+    assert reaped == 1
+    assert not (tokens / "0").exists()
+
+
+def test_reaper_generation_race_puts_back_not_deleted(tmp_path, monkeypatch):
+    """If the slot is reacquired by a fresh holder (different fingerprint)
+    between snapshot and reclaim, _atomic_reclaim puts it back."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_terminal_run(
+        db, dispatch_id="d_x", status="failed",
+        terminal_source=D.TS_VERIFIED_DEAD,
+    )
+    tokens = tmp_path / "staging_tokens"
+    slot = _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}",
+                       starttime_ticks=111)
+
+    # The reaper's generation snapshot now comes from the SAME
+    # ``list_held_tokens`` read pass that produced the holder identity
+    # (pid=100, starttime_ticks=111 -> fingerprint b"100|111"), NOT a
+    # separate re-read. To simulate a release + reacquire race we make the
+    # POST-RENAME verify (the only remaining ``_read_token_fingerprint``
+    # call, inside ``_atomic_reclaim``) report a DIFFERENT, fresh
+    # generation -- so the snapshot (old) and the renamed dir (fresh)
+    # mismatch and the slot is put back rather than deleted.
+    def _fp(slot_dir):
+        return b"999|222"          # fresh holder won between snapshot+rename
+
+    monkeypatch.setattr(D, "_read_token_fingerprint", _fp)
+    reaped = D._sweep_tokens_once(tokens, ["--dispatch-id d_x"], db_manager=db)
+    assert reaped == 0
+    assert (tokens / "0").exists()  # put back, not deleted
+
+
+def test_reaper_bad_holder_ssh_coarse_keep_inconclusive(tmp_path, monkeypatch):
+    """Bad/empty holder + valid host/pid → NO DB fallback, ssh-coarse,
+    keep on inconclusive (NOT malformed-rmtree)."""
+    db = DatabaseManager(tmp_path / "x.db")
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder="")  # empty holder
+
+    seen = []
+
+    def _ssh(host, pid, expected_tokens, timeout=10):
+        seen.append(list(expected_tokens))
+        return (None, "ssh rc=255")
+
+    monkeypatch.setattr(D, "ssh_pid_alive", _ssh)
+    counters = D._SweepCounters()
+    reaped = D._sweep_tokens_once(
+        tokens, ["--dispatch-id d_x"], db_manager=db, counters=counters,
+    )
+    assert reaped == 0
+    assert (tokens / "0").exists()
+    # ssh-coarse: only the dispatch-id token (no run-id available).
+    assert seen == [["--dispatch-id d_x"]]
+    assert counters.snapshot()["tokens_skipped_inconclusive"] == 1
+
+
+def test_reaper_bad_holder_ssh_dead_reaped(tmp_path, monkeypatch):
+    """Bad holder + valid host/pid + ssh-dead → reaped (no DB)."""
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder="")
+    monkeypatch.setattr(D, "ssh_pid_alive", lambda *a, **kw: (False, ""))
+    reaped = D._sweep_tokens_once(tokens, ["--dispatch-id d_x"])
+    assert reaped == 1
+    assert not (tokens / "0").exists()
+
+
+def test_resolve_token_host_fqdn_to_short_unique():
+    machines = {"almap6": {"raid": "/raid"}, "almap8": {"raid": "/raid"}}
+    assert D._resolve_token_host("almap6.jb.man.ac.uk", machines) == "almap6"
+    assert D._resolve_token_host("almap6", machines) == "almap6"  # exact wins
+
+
+def test_resolve_token_host_ambiguous_keeps_recorded():
+    # Two keys share the same short name → ambiguous → keep recorded host.
+    machines = {"almap6": {"raid": "/r"}, "almap6.other": {"raid": "/r"}}
+    rec = "almap6.jb.man.ac.uk"
+    assert D._resolve_token_host(rec, machines) == rec
+
+
+def test_resolve_token_host_no_machines_keeps_recorded():
+    assert D._resolve_token_host("almap6.jb.man.ac.uk", None) == "almap6.jb.man.ac.uk"
+
+
+def test_reaper_prior_dispatch_uses_its_own_snapshot(tmp_path, monkeypatch):
+    """A prior dispatch's reaper resolves hostnames against THAT dispatch's
+    machines_json snapshot (verified via the resolved ssh host)."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_run(db, dispatch_id="d_prior")
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "almap6.jb.man.ac.uk", 100, holder=f"d_prior/{rid}")
+
+    seen_hosts = []
+    monkeypatch.setattr(
+        D, "ssh_pid_alive",
+        lambda host, *a, **kw: seen_hosts.append(host) or (None, "x"),
+    )
+    prior_machines = {"almap6": {"raid": "/raid"}}
+    D._sweep_tokens_once(
+        tokens, ["--dispatch-id d_prior"], db_manager=db,
+        machines=prior_machines,
+    )
+    assert seen_hosts == ["almap6"]  # FQDN resolved to the snapshot's short name
+
+
+def test_source_from_verify_mapping():
+    assert D._source_from_verify(D.VERIFY_DEAD) == D.TS_VERIFIED_DEAD
+    assert D._source_from_verify(D.VERIFY_KILLED) == D.TS_VERIFIED_KILLED
+    with pytest.raises(KeyError):
+        D._source_from_verify(D.VERIFY_INCONCLUSIVE)
+
+
+def test_poll_dead_pid_branch_stamps_verified_dead(tmp_path):
+    """poll_state_until_terminal's dead-pid branch returns
+    terminal_source=verified_dead, NOT worker_observed (Delta 1 guard)."""
+    nas_unit = tmp_path / "u"
+    nas_unit.mkdir()
+    (nas_unit / "state.json").write_text(json.dumps({
+        "run_id": 1, "phase": "running", "machine": "alpha", "worker_pid": 4242,
+    }))
+    # Stale heartbeat (old mtime) forces the liveness check.
+    hb = nas_unit / "heartbeat"
+    hb.touch()
+    old = time.time() - 10_000
+    os.utime(hb, (old, old))
+
+    g = D.GlobalCfg(
+        poll_interval_sec=0.01, state_appeared_timeout_sec=2,
+        heartbeat_stale_threshold_sec=1,
+    )
+    with mock.patch.object(D, "ssh_pid_alive", return_value=(False, "__DEAD__path")):
+        final = D.poll_state_until_terminal(
+            "alpha", nas_unit, g=g, expected_tokens=["--run-id 1"],
+        )
+    assert final["phase"] == "failed"
+    assert final["terminal_source"] == D.TS_VERIFIED_DEAD
+
+
+def test_poll_worker_terminal_stamps_worker_observed(tmp_path):
+    """A worker-written terminal state.json → terminal_source=worker_observed."""
+    nas_unit = tmp_path / "u"
+    nas_unit.mkdir()
+    (nas_unit / "state.json").write_text(json.dumps({
+        "run_id": 1, "phase": "done", "success": True,
+    }))
+    (nas_unit / "heartbeat").touch()
+    g = D.GlobalCfg(poll_interval_sec=0.01, state_appeared_timeout_sec=2)
+    final = D.poll_state_until_terminal(
+        "alpha", nas_unit, g=g, expected_tokens=["--run-id 1"],
+    )
+    assert final["phase"] == "done"
+    assert final["terminal_source"] == D.TS_WORKER_OBSERVED
+
+
+def test_dbwriter_mark_done_persists_terminal_source(tmp_path):
+    """A MARK_DONE event with terminal_source persists it; absent → unknown."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_run(db, dispatch_id="d_x")
+    writer = D.DBWriter(db, "d_x")
+    writer.start()
+    try:
+        writer.q.put({
+            "op": "MARK_DONE", "run_id": rid,
+            "status": ImagingRunStatus.FAILED, "retcode": 1,
+            "finished_at": "2026-01-01T02:00:00", "duration_sec": 1.0,
+            "error_message": "x", "terminal_source": D.TS_VERIFIED_KILLED,
+        })
+        writer.q.join()
+    finally:
+        writer.stop(); writer.join(timeout=5)
+    with db.connect() as con:
+        row = ImagingRunsQueries.get_by_id(con, rid)
+    assert row["terminal_source"] == D.TS_VERIFIED_KILLED
+
+
+def test_dbwriter_mark_done_defaults_unknown(tmp_path):
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_run(db, dispatch_id="d_x")
+    writer = D.DBWriter(db, "d_x")
+    writer.start()
+    try:
+        writer.q.put({
+            "op": "MARK_DONE", "run_id": rid,
+            "status": ImagingRunStatus.SUCCESS, "retcode": 0,
+            "finished_at": "2026-01-01T02:00:00", "duration_sec": 1.0,
+        })
+        writer.q.join()
+    finally:
+        writer.stop(); writer.join(timeout=5)
+    with db.connect() as con:
+        row = ImagingRunsQueries.get_by_id(con, rid)
+    assert row["terminal_source"] == D.TS_UNKNOWN
+
+
+def test_reaper_pre_launch_crash_unknown_not_db_reaped(tmp_path, monkeypatch):
+    """A run terminalized with source=unknown (e.g. pre-launch crash) is
+    UNTRUSTED → reaper does NOT DB-reap; it falls to ssh."""
+    db = DatabaseManager(tmp_path / "x.db")
+    rid = _seed_terminal_run(
+        db, dispatch_id="d_x", status="failed",
+        terminal_source=D.TS_UNKNOWN,
+    )
+    tokens = tmp_path / "staging_tokens"
+    _make_token(tokens, "0", "host_b", 100, holder=f"d_x/{rid}")
+    called = {"n": 0}
+
+    def _ssh(*a, **kw):
+        called["n"] += 1
+        return (None, "ssh rc=255")
+
+    monkeypatch.setattr(D, "ssh_pid_alive", _ssh)
+    reaped = D._sweep_tokens_once(tokens, ["--dispatch-id d_x"], db_manager=db)
+    assert reaped == 0
+    assert called["n"] == 1  # ssh fallback WAS used (not DB-reaped)
+    assert (tokens / "0").exists()
