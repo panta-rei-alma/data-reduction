@@ -363,6 +363,30 @@ def _read_blob(path: Path) -> Optional[bytes]:
         return None
 
 
+def token_fingerprint_from_fields(
+    pid: object, starttime_ticks: object,
+) -> Optional[bytes]:
+    """Canonical token generation fingerprint from already-read fields.
+
+    Returns ``<pid>|<starttime_ticks>`` bytes iff BOTH are non-negative
+    integers, else ``None``.  Used so a caller that already holds a
+    *coherent* identity snapshot (e.g. ``list_held_tokens``' single read
+    pass) can derive the matching fingerprint WITHOUT a second, possibly
+    racing, re-read of the slot files.  ``_read_token_fingerprint`` is
+    the file-reading wrapper around this.
+    """
+    if pid is None or starttime_ticks is None:
+        return None
+    try:
+        pid_i = int(pid)
+        st_i = int(starttime_ticks)
+    except (TypeError, ValueError):
+        return None
+    if pid_i < 0 or st_i < 0:
+        return None
+    return f"{pid_i}|{st_i}".encode()
+
+
 def _read_token_fingerprint(slot_dir: Path) -> Optional[bytes]:
     """Generation fingerprint for a staging token slot.
 
@@ -381,13 +405,11 @@ def _read_token_fingerprint(slot_dir: Path) -> Optional[bytes]:
     if pid_bytes is None or st_bytes is None:
         return None
     try:
-        pid = int(pid_bytes.strip())
-        st = int(st_bytes.strip())
+        return token_fingerprint_from_fields(
+            pid_bytes.strip(), st_bytes.strip(),
+        )
     except (ValueError, AttributeError):
         return None
-    if pid < 0 or st < 0:
-        return None
-    return f"{pid}|{st}".encode()
 
 
 # renameat2 + RENAME_NOREPLACE: atomic rename that REFUSES to clobber

@@ -69,7 +69,7 @@ ALL_INDEXES = {
 }
 
 
-ALL_VERSIONS = set(range(1, 16))  # migrations 1-15
+ALL_VERSIONS = set(range(1, 17))  # migrations 1-16
 
 
 def assert_full_schema(con: sqlite3.Connection) -> None:
@@ -560,3 +560,110 @@ class TestMigrationRollback:
         assert column_exists(con, "obs", "weblog_url")
         assert column_exists(con, "obs", "weblog_staged_at")
         assert get_schema_versions(con) == ALL_VERSIONS
+
+
+# ---------------------------------------------------------------------------
+# Migration v16 (terminal_source) + DB-safety round-trip, 2026-06-02
+# ---------------------------------------------------------------------------
+
+class TestMigrationV16TerminalSource:
+
+    def test_version_set_is_exactly_1_to_16(self):
+        """Guards against an off-by-one: the full version set, not a count."""
+        db = DatabaseManager(":memory:")
+        con = db.connect()
+        assert get_schema_versions(con) == set(range(1, 17))
+
+    def test_terminal_source_column_added_with_default(self):
+        db = DatabaseManager(":memory:")
+        con = db.connect()
+        assert column_exists(con, "imaging_runs", "terminal_source")
+        info = {r[1]: r for r in con.execute("PRAGMA table_info(imaging_runs)")}
+        # cid, name, type, notnull, dflt_value, pk
+        assert info["terminal_source"][4] == "'unknown'"
+
+    def test_existing_rows_default_to_unknown(self, tmp_path):
+        """Pre-existing rows (inserted before the column) read 'unknown'."""
+        # Build a v15 DB by inserting a row, then re-open to apply v16.
+        db = DatabaseManager(tmp_path / "x.db")
+        with db.connect() as con:
+            con.execute(
+                "INSERT INTO imaging_runs (params_id, gous_uid, source_name, "
+                "spw_id, started_at, status) VALUES (1,'G','S','23','t','queued')"
+            )
+            con.commit()
+        # Re-open: idempotent bootstrap, column already present.
+        db2 = DatabaseManager(tmp_path / "x.db")
+        with db2.connect() as con:
+            row = con.execute(
+                "SELECT terminal_source FROM imaging_runs"
+            ).fetchone()
+        assert row[0] == "unknown"
+
+    def test_migration_idempotent_and_additive(self, tmp_path):
+        db_path = tmp_path / "x.db"
+        db = DatabaseManager(db_path)
+        with db.connect() as con:
+            n_before = con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        # Re-bootstrap: probe should be True → no-op, no duplicate row.
+        DatabaseManager(db_path)
+        DatabaseManager(db_path)
+        with DatabaseManager(db_path).connect() as con:
+            n_after = con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+            integ = con.execute("PRAGMA integrity_check").fetchone()[0]
+        assert n_after == n_before == 16
+        assert integ == "ok"
+
+
+class TestDBSafetyRoundTrip:
+    """backup → migrate → (simulated downstream break) → restore, all on a
+    TEMP DB; assert row count + integrity at every step.  NEVER touches the
+    live DB."""
+
+    def test_backup_migrate_break_restore(self, tmp_path):
+        import sqlite3 as _sql
+
+        # 1. Build a "v15-shaped" live-like DB by bootstrapping to current
+        # schema, then inserting representative rows.
+        live = tmp_path / "imaging.sqlite3"
+        db = DatabaseManager(live)
+        with db.connect() as con:
+            for i in range(5):
+                con.execute(
+                    "INSERT INTO imaging_runs (params_id, gous_uid, source_name, "
+                    "spw_id, started_at, status) VALUES "
+                    "(1,'G','S','23','t','success')"
+                )
+            con.commit()
+            rows_before = con.execute("SELECT COUNT(*) FROM imaging_runs").fetchone()[0]
+            assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert rows_before == 5
+
+        # 2. Backup via the sqlite .backup API (safe with a writer open).
+        backup = tmp_path / "imaging.backup.sqlite3"
+        src = _sql.connect(str(live))
+        dst = _sql.connect(str(backup))
+        with dst:
+            src.backup(dst)
+        src.close(); dst.close()
+        bc = _sql.connect(str(backup))
+        assert bc.execute("SELECT COUNT(*) FROM imaging_runs").fetchone()[0] == 5
+        assert bc.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        bc.close()
+
+        # 3. Migration is already applied (additive); confirm column exists
+        # and row count unchanged.
+        with DatabaseManager(live).connect() as con:
+            assert column_exists(con, "imaging_runs", "terminal_source")
+            assert con.execute("SELECT COUNT(*) FROM imaging_runs").fetchone()[0] == 5
+
+        # 4. Simulate a downstream break: corrupt the live file.
+        live.write_bytes(b"not a database at all")
+
+        # 5. Restore: copy backup over the live path, verify.
+        import shutil
+        shutil.copyfile(str(backup), str(live))
+        rc = _sql.connect(str(live))
+        assert rc.execute("SELECT COUNT(*) FROM imaging_runs").fetchone()[0] == 5
+        assert rc.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        rc.close()

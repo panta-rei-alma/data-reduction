@@ -594,16 +594,24 @@ class ImagingRunsQueries:
         finished_at: str,
         duration_sec: float,
         output_fits: Optional[str] = None,
+        terminal_source: str = "unknown",
     ) -> None:
+        # ``terminal_source`` records HOW this row reached a terminal state so
+        # the cross-host TokenReaper can decide whether a terminal row PROVES
+        # its worker (and thus its staging token) is dead.  Trusted values
+        # (worker_observed / verified_dead / verified_killed) let the reaper
+        # reclaim without an ssh liveness probe; everything else (default
+        # 'unknown', abandoned, reconcile_no_host) stays ssh-gated.
         con.execute(
             """
             UPDATE imaging_runs
                SET status=?, retcode=?, finished_at=?, duration_sec=?,
-                   output_fits=COALESCE(?, output_fits)
+                   output_fits=COALESCE(?, output_fits),
+                   terminal_source=?
              WHERE id=?
             """,
             (status, int(retcode), finished_at, float(duration_sec),
-             output_fits, row_id),
+             output_fits, terminal_source, row_id),
         )
 
     @staticmethod

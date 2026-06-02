@@ -49,7 +49,12 @@ from panta_rei.db.models import (
     ImagingRunStatus,
 )
 from panta_rei.imaging.matching import ImagingUnit
-from panta_rei.imaging.staging import list_held_tokens
+from panta_rei.imaging.staging import (
+    _atomic_reclaim,
+    _read_token_fingerprint,
+    token_fingerprint_from_fields,
+    list_held_tokens,
+)
 from panta_rei.imaging.unit_selection import (
     SelectionFilters,
     SelectionResult,
@@ -277,6 +282,7 @@ class DBWriter(threading.Thread):
                 finished_at=ev.get("finished_at") or now_iso(),
                 duration_sec=float(ev.get("duration_sec", 0.0)),
                 output_fits=ev.get("output_fits"),
+                terminal_source=ev.get("terminal_source", TS_UNKNOWN),
             )
             ImagingRunsQueries.set_error_message(
                 con, ev["run_id"], ev.get("error_message"),
@@ -593,6 +599,46 @@ VERIFY_KILLED = "killed"            # alive but TERM/KILL confirmed it dead
 VERIFY_INCONCLUSIVE = "inconclusive"  # ssh-unreachable or kill didn't take
 
 
+# ---------------------------------------------------------------------------
+# terminal_source taxonomy (migration v16).  Set EXPLICITLY by each decision
+# site and carried through to mark_done — never inferred from
+# _is_observed_terminal/phase (the poll dead-pid branch sets phase="failed"
+# with no synthetic reason, which would otherwise mislabel a coordinator-
+# verified death as worker-observed).
+# ---------------------------------------------------------------------------
+
+# Worker wrote its own terminal state.json that we relay.
+TS_WORKER_OBSERVED = "worker_observed"
+# Coordinator proved the worker dead (dead pid / PID-reused / __DEAD__).
+TS_VERIFIED_DEAD = "verified_dead"
+# Coordinator killed an alive worker and confirmed death.
+TS_VERIFIED_KILLED = "verified_killed"
+# --abandon-prior force-fail; NOT death-proven.
+TS_ABANDONED = "abandoned"
+# reconcile failure with no host known; NOT death-proven.
+TS_RECONCILE_NO_HOST = "reconcile_no_host"
+# default / pre-launch crash / manual edits / legacy rows.
+TS_UNKNOWN = "unknown"
+
+# The reaper trusts ONLY these to reap a token without an ssh probe.
+TRUSTED_TERMINAL_SOURCES = frozenset(
+    {TS_WORKER_OBSERVED, TS_VERIFIED_DEAD, TS_VERIFIED_KILLED}
+)
+
+
+def _source_from_verify(outcome: str) -> str:
+    """Map a verify_and_kill_worker outcome to a trusted terminal_source.
+
+    VERIFY_INCONCLUSIVE never reaches here — its callers quarantine and
+    write NO terminal row.  A KeyError on an unexpected outcome is a
+    programming error we want to surface loudly.
+    """
+    return {
+        VERIFY_DEAD: TS_VERIFIED_DEAD,
+        VERIFY_KILLED: TS_VERIFIED_KILLED,
+    }[outcome]
+
+
 def verify_and_kill_worker(
     machine: str,
     wrapper_pid: Optional[int],
@@ -889,6 +935,10 @@ def poll_state_until_terminal(
                 log.exception("on_poll callback failed")
 
         if phase in ("done", "failed"):
+            # The worker wrote its own terminal state.json; relay it as
+            # worker-observed (v5 Delta 1) unless the worker already stamped
+            # a source itself.
+            state.setdefault("terminal_source", TS_WORKER_OBSERVED)
             return state
 
         # Liveness check on stale heartbeat
@@ -903,10 +953,15 @@ def poll_state_until_terminal(
                 machine, pid, expected_tokens, timeout=10,
             )
             if alive is False:
+                # Coordinator proved the worker dead/reused — this is a
+                # verified death, NOT a worker-observed terminal.  Carry the
+                # source explicitly (v5 Delta 1) so the enqueue site doesn't
+                # have to infer it from phase/reason.
                 return {
                     **state,
                     "phase": "failed",
                     "success": False,
+                    "terminal_source": TS_VERIFIED_DEAD,
                     "error_message": (
                         f"worker dead pid {pid} (cmdline now: {info!r})"
                     ),
@@ -1110,10 +1165,12 @@ def reconcile_prior(
                 continue
             if abandon:
                 # --abandon-prior overrides Delta 4 — operator has
-                # explicitly asked to drop the prior dispatch.
+                # explicitly asked to drop the prior dispatch.  Not
+                # death-proven → untrusted source.
                 _mark_failed(
                     db_manager, row["id"],
                     error="abandoned by --abandon-prior (no state.json)",
+                    terminal_source=TS_ABANDONED,
                 )
                 continue
             # F5 + Delta 4: no state.json may mean (a) launch never
@@ -1146,10 +1203,12 @@ def reconcile_prior(
                         machine, row["id"],
                     )
                 else:
+                    # verify_and_kill_worker proved the worker dead/killed.
                     _mark_failed(
                         db_manager, row["id"],
                         error=f"reconcile: no state.json; "
                               f"worker {outcome} ({detail})",
+                        terminal_source=_source_from_verify(outcome),
                     )
             else:
                 # No pidfile — Delta 4: still inconclusive.  Quarantine
@@ -1165,11 +1224,13 @@ def reconcile_prior(
                 else:
                     # No host known — fall back to MARK_DONE FAILED so
                     # the row doesn't pile up forever (we have no host
-                    # to quarantine and no evidence of liveness).
+                    # to quarantine and no evidence of liveness).  Not
+                    # death-proven → untrusted source.
                     _mark_failed(
                         db_manager, row["id"],
                         error="no state.json found at reconciliation "
                               "(no pidfile, no recorded host)",
+                        terminal_source=TS_RECONCILE_NO_HOST,
                     )
 
     # Mark prior dispatches done if they have no surviving non-terminal rows
@@ -1228,7 +1289,8 @@ def _reconcile_state_entry(
 
     if abandon:
         _mark_failed(db_manager, run_id,
-                     error=f"abandoned by --abandon-prior at phase={phase}")
+                     error=f"abandoned by --abandon-prior at phase={phase}",
+                     terminal_source=TS_ABANDONED)
         return
 
     # Heartbeat check
@@ -1262,9 +1324,11 @@ def _reconcile_state_entry(
         })
         return
     if alive is False:
+        # ssh proved the pid dead/reused — coordinator-verified death.
         _mark_failed(
             db_manager, run_id,
             error=f"abandoned (no heartbeat {hb_age:.0f}s, pid {pid} dead/reused: {info!r})",
+            terminal_source=TS_VERIFIED_DEAD,
         )
         return
     # alive is None — ssh-unreachable.  Same fail-closed treatment as the
@@ -1317,6 +1381,8 @@ def _apply_terminal_to_db(db_manager, run_id, state, unit_dir) -> None:
             finished_at=state.get("finished_at") or now_iso(),
             duration_sec=0.0,
             output_fits=state.get("output_fits"),
+            # Reconcile read the worker's own terminal state.json off NAS.
+            terminal_source=TS_WORKER_OBSERVED,
         )
         ImagingRunsQueries.set_error_message(
             con, run_id, state.get("error_message"),
@@ -1324,7 +1390,10 @@ def _apply_terminal_to_db(db_manager, run_id, state, unit_dir) -> None:
         con.commit()
 
 
-def _mark_failed(db_manager, run_id, *, error: str) -> None:
+def _mark_failed(db_manager, run_id, *, error: str, terminal_source: str) -> None:
+    # ``terminal_source`` is REQUIRED (v3 Delta 4 / v4): this helper is shared
+    # across trusted (verified) and untrusted (abandon / no-host) callers, so
+    # the source must be supplied explicitly by each caller — never defaulted.
     with db_manager.connect() as con:
         ImagingRunsQueries.mark_done(
             con, run_id,
@@ -1333,6 +1402,7 @@ def _mark_failed(db_manager, run_id, *, error: str) -> None:
             finished_at=now_iso(),
             duration_sec=0.0,
             output_fits=None,
+            terminal_source=terminal_source,
         )
         ImagingRunsQueries.set_error_message(con, run_id, error)
         con.commit()
@@ -1351,50 +1421,289 @@ def _mark_failed(db_manager, run_id, *, error: str) -> None:
 _TOKEN_MALFORMED_GRACE_SEC = 60.0
 
 
+# Per-reaper throttled-WARN interval for inconclusive skips (the silent
+# 20h skip in the incident is why this exists).
+_TOKEN_WARN_THROTTLE_SEC = 300.0
+
+
+@dataclass
+class _SweepCounters:
+    """Thread-safe sweep tallies, surfaced in the watchdog line."""
+    tokens_reaped_db: int = 0
+    tokens_reaped_ssh: int = 0
+    tokens_skipped_inconclusive: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    # (slot, reason) -> last monotonic time we WARNed about it.
+    _last_warn: dict = field(default_factory=dict)
+
+    def add(self, **kw) -> None:
+        with self.lock:
+            for k, v in kw.items():
+                setattr(self, k, getattr(self, k) + v)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "tokens_reaped_db": self.tokens_reaped_db,
+                "tokens_reaped_ssh": self.tokens_reaped_ssh,
+                "tokens_skipped_inconclusive": self.tokens_skipped_inconclusive,
+            }
+
+    def should_warn(self, slot: str, reason: str) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            key = (slot, reason)
+            last = self._last_warn.get(key)
+            if last is None or (now - last) >= _TOKEN_WARN_THROTTLE_SEC:
+                self._last_warn[key] = now
+                return True
+            return False
+
+
+def _parse_holder(holder: str) -> tuple[Optional[str], Optional[int]]:
+    """Parse a token ``holder`` (``<dispatch_id>/<run_id>``).
+
+    Returns ``(dispatch_id, run_id)`` or ``(None, None)`` when the holder
+    is empty/malformed.  ``dispatch_id`` itself may contain underscores
+    (``d_<ts>_<hex>``) but never a slash, so we split on the LAST slash.
+    """
+    if not holder:
+        return None, None
+    sep = holder.rfind("/")
+    if sep < 0:
+        return None, None
+    d_id = holder[:sep].strip()
+    rid_str = holder[sep + 1:].strip()
+    if not d_id or not rid_str:
+        return None, None
+    try:
+        return d_id, int(rid_str)
+    except ValueError:
+        return None, None
+
+
+def _resolve_token_host(
+    recorded_host: Optional[str],
+    machines: Optional[dict],
+) -> Optional[str]:
+    """Map a token's recorded ``host`` to a name we can ssh.
+
+    The worker records ``socket.gethostname()``, which on some hosts is the
+    FQDN — and the FQDN may carry a broken/changed known_hosts key while the
+    short name used in machines.json does not (the incident's trigger).
+
+    Resolution (never blind dot-split):
+    - exact match against a machines key → use it verbatim;
+    - else, if the short form (``host.split('.',1)[0]``) UNIQUELY matches one
+      machines key, use that key;
+    - else (ambiguous, or deployment intentionally uses an FQDN/alias not in
+      machines) → keep the recorded host.
+    """
+    if not recorded_host:
+        return recorded_host
+    keys = set(machines or {})
+    if recorded_host in keys:
+        return recorded_host
+    short = recorded_host.split(".", 1)[0]
+    matches = [k for k in keys if k.split(".", 1)[0] == short]
+    if len(matches) == 1:
+        return matches[0]
+    return recorded_host
+
+
+def _holder_terminal_source(
+    db_manager,
+    holder_dispatch_id: str,
+    run_id: int,
+) -> Optional[str]:
+    """Return the ``terminal_source`` of a terminal holder run, else None.
+
+    Opens a SHORT-LIVED connection (the reaper thread must not hold one).
+    Returns the source string only if the row exists, belongs to
+    ``holder_dispatch_id``, AND is in a terminal status; otherwise None
+    (non-terminal / missing / wrong dispatch / DB error → ssh fallback).
+    """
+    if db_manager is None:
+        return None
+    try:
+        with db_manager.connect() as con:
+            row = ImagingRunsQueries.get_by_id(con, run_id)
+    except Exception:
+        log.debug("reaper DB query failed for run_id=%s", run_id, exc_info=True)
+        return None
+    if not row:
+        return None
+    if row.get("dispatch_id") != holder_dispatch_id:
+        return None
+    if row.get("status") not in (
+        ImagingRunStatus.SUCCESS, ImagingRunStatus.FAILED,
+    ):
+        return None
+    return row.get("terminal_source") or TS_UNKNOWN
+
+
+def _reap_token(slot_dir: Path, fp_snapshot: Optional[bytes]) -> bool:
+    """Generation-checked reclaim of a token slot.  Returns True if reaped.
+
+    Uses ``_atomic_reclaim`` (rename-then-verify) so a slot released +
+    reacquired by a fresh holder between our decision and our delete is
+    put back rather than wiped — NOT a blind ``shutil.rmtree``.
+    """
+    return _atomic_reclaim(
+        Path(slot_dir),
+        expected_fingerprint=fp_snapshot,
+        read_fingerprint=_read_token_fingerprint,
+        malformed_grace_sec=_TOKEN_MALFORMED_GRACE_SEC,
+    )
+
+
 def _sweep_tokens_once(
     tokens_dir: Path,
     expected_tokens: list[str],
     *,
     malformed_grace_sec: float = _TOKEN_MALFORMED_GRACE_SEC,
     ssh_timeout: int = 8,
+    db_manager=None,
+    machines: Optional[dict] = None,
+    counters: Optional[_SweepCounters] = None,
 ) -> int:
     """Reap stale staging tokens under *tokens_dir*; return count reaped.
 
     Used by the running coordinator's :class:`TokenReaper` (every
     ``token_reaper_interval_sec``) and by ``reconcile_prior`` when
-    cleaning up an abandoned dispatch.  ``ssh_pid_alive(..., None)``
-    (ssh-unreachable) is treated as "do nothing" — never reap on an
-    inconclusive check.
+    cleaning up an abandoned dispatch.
+
+    Per-token decision is DB-FIRST (v3 Delta A): if the holder run is
+    terminal via a TRUSTED source (``worker_observed`` / ``verified_dead`` /
+    ``verified_killed``) the token is reaped WITHOUT any ssh probe — the
+    trusted terminal already proved the worker dead, so we never touch the
+    fragile ssh path that leaked the token for 20h in the incident.
+
+    Otherwise we fall back to ``ssh_pid_alive`` with expected tokens that
+    include BOTH ``--dispatch-id`` AND ``--run-id`` (so a PID reused by a
+    different worker of the same dispatch is not mistaken for the live
+    holder): True→keep, False→reap, None→keep + throttled WARN.
+
+    ``db_manager``/``machines`` default to None so the abandon-cleanup
+    caller can keep ssh-only behaviour (``abandoned`` rows are UNTRUSTED).
     """
-    import shutil
     reaped = 0
     if not Path(tokens_dir).exists():
         return 0
+
+    def _bump(**kw):
+        if counters is not None:
+            counters.add(**kw)
+
+    def _warn(slot, reason, msg, *args):
+        if counters is None or counters.should_warn(slot, reason):
+            log.warning(msg, *args)
+
     for t in list_held_tokens(tokens_dir):
+        slot = t["slot"]
         host = t.get("host")
         pid = t.get("pid")
+        slot_path = Path(t["path"])
+
+        # Generation fingerprint derived from the SAME ``list_held_tokens``
+        # read pass that produced host/pid/holder — NOT a second re-read of
+        # the slot files.  A coherent snapshot is essential: if the slot is
+        # released + reacquired by a fresh holder between reads, a re-read
+        # fingerprint would describe the NEW holder while our DB/ssh decision
+        # is about the OLD one, and ``_atomic_reclaim``'s post-rename verify
+        # would then match — and delete — the live new holder.  Sharing one
+        # snapshot makes identity and fingerprint describe the same
+        # generation, so a race instead yields a mismatch → safe put-back.
+        fp_snapshot = token_fingerprint_from_fields(
+            t.get("pid"), t.get("starttime_ticks"),
+        )
+
+        # Missing host/pid: malformed-grace path (unchanged).  Distinct from
+        # a bad/empty *holder* with valid host+pid (handled below).
         if not host or not pid:
             try:
-                age = time.time() - Path(t["path"]).stat().st_mtime
+                age = time.time() - slot_path.stat().st_mtime
             except OSError:
                 continue
             if age >= malformed_grace_sec:
-                shutil.rmtree(t["path"], ignore_errors=True)
+                if _reap_token(slot_path, fp_snapshot):
+                    reaped += 1
+                    _bump(tokens_reaped_ssh=1)
+                    log.info(
+                        "reaped malformed staging token %s "
+                        "(no holder metadata after %.0fs)",
+                        slot, age,
+                    )
+            continue
+
+        ssh_host = _resolve_token_host(host, machines)
+        holder = t.get("holder") or ""
+        holder_did, run_id = _parse_holder(holder)
+
+        if holder_did is None or run_id is None:
+            # Bad/empty holder but valid host+pid: NO DB fallback (we can't
+            # map to a run), NO malformed-rmtree.  ssh-coarse with just the
+            # dispatch-id; keep on inconclusive.
+            alive, info = ssh_pid_alive(
+                ssh_host, pid, expected_tokens, timeout=ssh_timeout,
+            )
+            if alive is False:
+                if _reap_token(slot_path, fp_snapshot):
+                    reaped += 1
+                    _bump(tokens_reaped_ssh=1)
+                    log.info(
+                        "reaped stale staging token %s "
+                        "(bad holder %r, host=%s pid=%s ssh-dead)",
+                        slot, holder, ssh_host, pid,
+                    )
+            elif alive is None:
+                _bump(tokens_skipped_inconclusive=1)
+                _warn(slot, "bad_holder_inconclusive",
+                      "token reaper: KEEP slot %s (bad holder %r, "
+                      "host=%s pid=%s) — ssh inconclusive: %s",
+                      slot, holder, ssh_host, pid, info)
+            continue
+
+        # DB-FIRST: trusted terminal → reap without ssh.
+        src = _holder_terminal_source(db_manager, holder_did, run_id)
+        if src in TRUSTED_TERMINAL_SOURCES:
+            if _reap_token(slot_path, fp_snapshot):
                 reaped += 1
+                _bump(tokens_reaped_db=1)
                 log.info(
-                    "reaped malformed staging token %s "
-                    "(no holder metadata after %.0fs)",
-                    t["slot"], age,
+                    "reaped staging token %s via DB (holder=%s source=%s, "
+                    "no ssh needed)",
+                    slot, holder, src,
                 )
             continue
-        alive, _ = ssh_pid_alive(host, pid, expected_tokens, timeout=ssh_timeout)
+
+        # Non-terminal / untrusted terminal / missing row → ssh fallback,
+        # matching BOTH dispatch-id and run-id.
+        per_token_tokens = [
+            f"--dispatch-id {holder_did}",
+            f"--run-id {run_id}",
+        ]
+        alive, info = ssh_pid_alive(
+            ssh_host, pid, per_token_tokens, timeout=ssh_timeout,
+        )
+        if alive is True:
+            continue
         if alive is False:
-            shutil.rmtree(t["path"], ignore_errors=True)
-            reaped += 1
-            log.info(
-                "reaped stale staging token %s (host=%s pid=%s)",
-                t["slot"], host, pid,
-            )
+            if _reap_token(slot_path, fp_snapshot):
+                reaped += 1
+                _bump(tokens_reaped_ssh=1)
+                log.info(
+                    "reaped stale staging token %s (holder=%s host=%s "
+                    "pid=%s ssh-dead)",
+                    slot, holder, ssh_host, pid,
+                )
+            continue
+        # alive is None — inconclusive.  Keep + throttled WARN.
+        _bump(tokens_skipped_inconclusive=1)
+        _warn(slot, "inconclusive",
+              "token reaper: KEEP slot %s (holder=%s host=%s pid=%s "
+              "db_source=%s) — ssh inconclusive: %s",
+              slot, holder, ssh_host, pid, src, info)
     return reaped
 
 
@@ -1536,11 +1845,25 @@ def _cleanup_abandoned_dispatch(
 # ---------------------------------------------------------------------------
 
 class TokenReaper(threading.Thread):
-    def __init__(self, tokens_dir: Path, g: GlobalCfg, expected_tokens: list[str]):
+    def __init__(
+        self,
+        tokens_dir: Path,
+        g: GlobalCfg,
+        expected_tokens: list[str],
+        *,
+        db_manager=None,
+        machines: Optional[dict] = None,
+    ):
         super().__init__(name="token-reaper", daemon=True)
         self.tokens_dir = Path(tokens_dir)
         self.g = g
         self.expected_tokens = list(expected_tokens)
+        # DB-backed reaping: a SHORT-LIVED connection is opened per query
+        # inside the sweep — the thread never holds a connection.
+        self.db_manager = db_manager
+        # machines.json snapshot for the hostname resolver (FQDN→short).
+        self.machines = machines
+        self.counters = _SweepCounters()
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -1565,6 +1888,10 @@ class TokenReaper(threading.Thread):
             self.tokens_dir,
             self.expected_tokens,
             malformed_grace_sec=self.MALFORMED_GRACE_SEC,
+            ssh_timeout=self.g.ssh_timeout_sec,
+            db_manager=self.db_manager,
+            machines=self.machines,
+            counters=self.counters,
         )
 
 
@@ -1837,7 +2164,12 @@ class MachineSlot(threading.Thread):
             f"--run-id {run_id}",
         ]
 
-        def _emit_mark_done_failed(error_message: str, retcode: int = 1) -> None:
+        def _emit_mark_done_failed(
+            error_message: str, *, terminal_source: str, retcode: int = 1,
+        ) -> None:
+            # ``terminal_source`` is REQUIRED: the three call sites differ
+            # (launch-failed verified → verified_dead; post-launch verified
+            # → by outcome; pre-launch crash → unknown, NOT death-proven).
             log.info(
                 "dispatch: MARK_DONE FAILED run_id=%d machine=%s reason=%s "
                 "error=%s",
@@ -1855,6 +2187,7 @@ class MachineSlot(threading.Thread):
                 "finished_at": now_iso(),
                 "duration_sec": 0.0,
                 "error_message": error_message,
+                "terminal_source": terminal_source,
             })
 
         def _quarantine_and_log(reason: str, detail: str) -> None:
@@ -1970,6 +2303,7 @@ class MachineSlot(threading.Thread):
                     # Verified dead/killed → safe to MARK_DONE FAILED.
                     _emit_mark_done_failed(
                         f"ssh launch failed: {msg}; cleanup={detail}",
+                        terminal_source=_source_from_verify(outcome),
                         retcode=255,
                     )
                     c.scheduler.mark_terminal(
@@ -2087,6 +2421,9 @@ class MachineSlot(threading.Thread):
                         return
                     final = {
                         **final,
+                        # Coordinator verified the worker dead/killed; carry
+                        # the source so the enqueue below stamps it (v5 D2).
+                        "terminal_source": _source_from_verify(outcome),
                         "error_message": (
                             (final.get("error_message") or "")
                             + f" — cleanup={detail}"
@@ -2126,6 +2463,9 @@ class MachineSlot(threading.Thread):
                                     if final.get("field_selection") else None),
                 "error_message": err,
                 "job_json_path": prov.get("job_json"),
+                # v5: source set explicitly by poll/verify paths, carried
+                # through; default unknown for anything that didn't stamp.
+                "terminal_source": final.get("terminal_source", TS_UNKNOWN),
             })
             empty = c.scheduler.mark_terminal(
                 machine, unit.gous_uid, run_id, success=success,
@@ -2161,8 +2501,11 @@ class MachineSlot(threading.Thread):
                     # and mark_inflight (e.g. manifest write failure).
                     if run_id:
                         try:
+                            # Pre-launch crash: the worker likely never
+                            # started, but we did NOT prove it dead → untrusted.
                             _emit_mark_done_failed(
                                 "MachineSlot crashed pre-launch",
+                                terminal_source=TS_UNKNOWN,
                             )
                         except Exception:
                             log.exception(
@@ -2202,6 +2545,7 @@ class MachineSlot(threading.Thread):
                                 _emit_mark_done_failed(
                                     f"MachineSlot crashed post-launch; "
                                     f"cleanup={detail}",
+                                    terminal_source=_source_from_verify(outcome),
                                 )
                             except Exception:
                                 log.exception(
@@ -2302,11 +2646,13 @@ class MachineSlot(threading.Thread):
         if outcome == VERIFY_INCONCLUSIVE:
             return None
         # Cleanup verified — synthesize a FAILED terminal so the normal
-        # MARK_DONE flow proceeds with the typed error_message.
+        # MARK_DONE flow proceeds with the typed error_message.  Carry the
+        # verify outcome as the source (v5 D2).
         return {
             "phase": "failed",
             "success": False,
             "reason": "state_missing_timeout",
+            "terminal_source": _source_from_verify(outcome),
             "error_message": (
                 f"state.json never appeared within "
                 f"{g.state_appeared_timeout_sec}s; cleanup={detail}"
@@ -2333,12 +2679,14 @@ class LiveCountWatchdog(threading.Thread):
         adoption_threads: list,
         slots: list,
         interval_sec: int = 300,
+        reapers: Optional[list] = None,
     ):
         super().__init__(name="watchdog", daemon=True)
         self.ctx = ctx
         self.adoption_threads = adoption_threads
         self.slots = slots
         self.interval_sec = int(interval_sec)
+        self.reapers = reapers or []
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -2353,9 +2701,19 @@ class LiveCountWatchdog(threading.Thread):
                     live_d = sum(1 for s in self.ctx.dynamic_slots if s.is_alive())
                 with self.ctx.scheduler.lock:
                     q_n = len(self.ctx.scheduler.quarantined_machines)
+                # Aggregate reaper counters across all reapers so the
+                # previously-silent inconclusive-skip path is observable.
+                r_db = r_ssh = r_skip = 0
+                for r in self.reapers:
+                    snap = r.counters.snapshot()
+                    r_db += snap["tokens_reaped_db"]
+                    r_ssh += snap["tokens_reaped_ssh"]
+                    r_skip += snap["tokens_skipped_inconclusive"]
                 log.info(
-                    "watchdog: adoption=%d slots=%d dynamic=%d quarantined=%d",
-                    live_a, live_s, live_d, q_n,
+                    "watchdog: adoption=%d slots=%d dynamic=%d quarantined=%d "
+                    "tokens_reaped_db=%d tokens_reaped_ssh=%d "
+                    "tokens_skipped_inconclusive=%d",
+                    live_a, live_s, live_d, q_n, r_db, r_ssh, r_skip,
                 )
             except Exception:
                 log.exception("watchdog tick failed")
@@ -2485,6 +2843,8 @@ class AdoptionPoller(threading.Thread):
                 else:
                     final = {
                         **final,
+                        # Coordinator-verified death (v4 map #6); carry source.
+                        "terminal_source": _source_from_verify(outcome),
                         "error_message": (
                             (final.get("error_message") or "")
                             + f" — cleanup={detail}"
@@ -2539,6 +2899,11 @@ class AdoptionPoller(threading.Thread):
                                         if (final or {}).get("field_selection") else None),
                     "error_message": err_msg,
                     "job_json_path": prov.get("job_json"),
+                    # Observed terminal → worker_observed (carried by poll);
+                    # synthetic-verified → mapped above; default unknown.
+                    "terminal_source": (final or {}).get(
+                        "terminal_source", TS_UNKNOWN,
+                    ),
                 })
                 if gous_uid:
                     c.scheduler.mark_terminal(
@@ -2880,10 +3245,17 @@ def run_dispatch(
         # *prior* dispatch we adopted from.  Without the prior reapers,
         # tokens held by crashed workers in old dispatches stay forever
         # and adopted live workers may starve waiting for them.
+        # Hostname-resolver snapshot for the current dispatch: the keys are
+        # exactly machines.json's short names, the form with valid host keys.
+        cur_machines_snapshot = {
+            name: {"raid": m.raid} for name, m in cfg.machines.items()
+        }
         reapers: list[TokenReaper] = []
         new_reaper = TokenReaper(
             tokens_dir, g,
             expected_tokens=[f"--dispatch-id {dispatch_id}"],
+            db_manager=db_manager,
+            machines=cur_machines_snapshot,
         )
         new_reaper.start()
         reapers.append(new_reaper)
@@ -2899,9 +3271,24 @@ def run_dispatch(
             )
             if not prior_tokens.exists():
                 continue
+            # Resolve hostnames against THAT dispatch's machines_json
+            # snapshot, not the current cfg (keys can differ between runs).
+            prior_machines = None
+            try:
+                with db_manager.connect() as con:
+                    prow = DispatchesQueries.get(con, prior_did)
+                if prow and prow.get("machines_json"):
+                    prior_machines = json.loads(prow["machines_json"])
+            except Exception:
+                log.debug(
+                    "could not load machines_json for prior dispatch %s",
+                    prior_did, exc_info=True,
+                )
             r = TokenReaper(
                 prior_tokens, g,
                 expected_tokens=[f"--dispatch-id {prior_did}"],
+                db_manager=db_manager,
+                machines=prior_machines,
             )
             r.start()
             reapers.append(r)
@@ -3031,7 +3418,7 @@ def run_dispatch(
 
         # 11b. Observability watchdog — periodic live-counts so a wedge
         # is visible in the dispatch log rather than silent.
-        watchdog = LiveCountWatchdog(ctx, adoption_threads, slots)
+        watchdog = LiveCountWatchdog(ctx, adoption_threads, slots, reapers=reapers)
         watchdog.start()
 
         # 12. Wait for original slots, then alternate-check adoption

@@ -437,4 +437,14 @@ CREATE TABLE IF NOT EXISTS dispatches (
             "ON imaging_runs(dispatch_id)",
         ],
     ),
+
+    # --- token-reap safety: how a run was terminalized ---
+    Migration(
+        version=16,
+        description="add terminal_source to imaging_runs for token-reap safety",
+        probe=lambda con: column_exists(con, "imaging_runs", "terminal_source"),
+        conditional_columns=[
+            ("imaging_runs", "terminal_source", "TEXT DEFAULT 'unknown'"),
+        ],
+    ),
 ]
