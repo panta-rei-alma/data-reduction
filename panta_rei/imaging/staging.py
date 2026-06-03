@@ -66,7 +66,17 @@ class TokenAcquireTimeout(TimeoutError):
 
 
 _MKDIR_LOCK_DEFAULT_WAIT_SEC = 300.0
-_DEFAULT_TOKEN_WAIT_TIMEOUT_SEC = 1800.0
+# 24h backstop, NOT a tight bound.  An earlier 1800s (30min) default
+# (commit 91fa5d9) regressed dispatch reliability: historically, cache-miss
+# units routinely waited 2-8h (observed max ~29,700s) for one of only 2
+# staging tokens and SUCCEEDED, because a held token implies a LIVE worker
+# making staging progress and a single unit can stage+image for hours.  The
+# 30min cap converted those long-but-successful waits into hard failures.
+# Dead holders are reclaimed by the DB-backed TokenReaper, so an effectively
+# unbounded wait is safe; this 24h value is only a final valve against an
+# unforeseen stuck-but-alive holder (which a cap cannot free anyway — it can
+# only fail innocent waiters).  See .tmp/REGRESSION_REPORT_token_timeout_2026-06-02.md.
+_DEFAULT_TOKEN_WAIT_TIMEOUT_SEC = 86400.0
 _MKDIR_LOCK_PROGRESS_LOG_SEC = 60.0
 
 
@@ -631,8 +641,9 @@ def acquire_staging_token(
     """Acquire one of *n_slots* tokens under *tokens_root*.
 
     Atomic primitive: ``os.mkdir(tokens_root/<i>)``.  Returns the index
-    of the slot acquired.  ``timeout_sec`` bounds the wait — defaults to
-    30 minutes; ``None`` opts out (legacy / test convenience).
+    of the slot acquired.  ``timeout_sec`` bounds the wait — defaults to a
+    24h backstop (see ``_DEFAULT_TOKEN_WAIT_TIMEOUT_SEC``); ``None`` opts out
+    entirely (truly unbounded).
 
     Raises :class:`TokenAcquireTimeout` (an alias of ``TimeoutError``)
     when the bound is exceeded.  Same-host stale slots whose PID is

@@ -73,6 +73,12 @@ WORKER_MODULE = "panta_rei.imaging.remote_worker"
 @dataclass
 class GlobalCfg:
     max_concurrent_staging: int = 4
+    # Worker staging-token acquire wait.  24h backstop (NOT a tight bound):
+    # token contention with a live holder must be waited out — a single unit
+    # can stage+image for hours, and historical cache-miss units waited 2-8h
+    # for a token and succeeded.  Forwarded to the worker as
+    # --token-wait-timeout-sec; see staging._DEFAULT_TOKEN_WAIT_TIMEOUT_SEC.
+    token_wait_timeout_sec: float = 86400.0
     heartbeat_interval_sec: int = 30
     heartbeat_stale_threshold_sec: int = 300
     max_stale_alive_sec: int = 3600
@@ -745,6 +751,7 @@ def write_launcher_script(
     tokens_dir: str,
     max_concurrent_staging: int,
     heartbeat_interval: int,
+    token_wait_timeout_sec: float,
     cache_root: Optional[str] = None,
     cache_min_free_gb: Optional[int] = None,
 ) -> Path:
@@ -782,6 +789,7 @@ def write_launcher_script(
         f"--publish-policy {shlex.quote(publish_policy)} "
         f"--tokens-dir {shlex.quote(tokens_dir)} "
         f"--max-concurrent-staging {int(max_concurrent_staging)} "
+        f"--token-wait-timeout-sec {float(token_wait_timeout_sec)} "
         f"--heartbeat-interval {int(heartbeat_interval)} "
         f"{cache_args}"
         f">{shlex.quote(str(launch_log))} 2>&1 "
@@ -2250,6 +2258,7 @@ class MachineSlot(threading.Thread):
                 publish_policy=c.publish_policy,
                 tokens_dir=str(c.tokens_dir),
                 max_concurrent_staging=c.cfg.global_cfg.max_concurrent_staging,
+                token_wait_timeout_sec=c.cfg.global_cfg.token_wait_timeout_sec,
                 heartbeat_interval=c.cfg.global_cfg.heartbeat_interval_sec,
                 cache_root=cache_root,
                 cache_min_free_gb=self.machine.cache_min_free_gb,

@@ -1807,13 +1807,17 @@ def test_token_acquire_timeout_is_timeout_error():
     assert issubclass(staging.TokenAcquireTimeout, TimeoutError)
 
 
-def test_token_acquire_timeout_default_changed_to_1800():
-    """T22: ``acquire_staging_token``'s default ``timeout_sec`` changed
-    from None to 1800s (the new bound)."""
+def test_token_acquire_timeout_default_is_24h_backstop():
+    """The 30min (1800s) token-acquire bound from commit 91fa5d9 regressed
+    dispatch reliability: it failed legitimate multi-hour staging waits that
+    historically succeeded (observed waits up to ~29,700s).  The default is
+    now a 24h backstop, not a tight bound — dead holders are reclaimed by the
+    DB-backed TokenReaper, so an effectively unbounded wait is safe.  See
+    .tmp/REGRESSION_REPORT_token_timeout_2026-06-02.md."""
     import inspect
     sig = inspect.signature(staging.acquire_staging_token)
-    assert sig.parameters["timeout_sec"].default == 1800.0
-    assert staging._DEFAULT_TOKEN_WAIT_TIMEOUT_SEC == 1800.0
+    assert sig.parameters["timeout_sec"].default == 86400.0
+    assert staging._DEFAULT_TOKEN_WAIT_TIMEOUT_SEC == 86400.0
 
 
 # Eviction --------------------------------------------------------------------
