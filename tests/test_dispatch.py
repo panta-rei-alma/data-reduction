@@ -62,6 +62,22 @@ def test_load_machines_config_happy(tmp_path):
     assert cfg.machines["beta"].slots == 2
 
 
+def test_global_cfg_token_wait_timeout_default_and_parse(tmp_path):
+    """token_wait_timeout_sec defaults to the 24h backstop and is parsed
+    from the machines.json ``global`` block when present."""
+    # Default when absent.
+    assert D.GlobalCfg().token_wait_timeout_sec == 86400.0
+    cfg = D.load_machines_config(_write_machines_json(tmp_path))
+    assert cfg.global_cfg.token_wait_timeout_sec == 86400.0
+    # Override honored.
+    p = _write_machines_json(
+        tmp_path, **{"global": {"max_concurrent_staging": 3,
+                                "token_wait_timeout_sec": 43200.0}},
+    )
+    cfg2 = D.load_machines_config(p)
+    assert cfg2.global_cfg.token_wait_timeout_sec == 43200.0
+
+
 def test_load_machines_config_missing_required(tmp_path):
     p = tmp_path / "m.json"
     p.write_text(json.dumps({"conda_env": "/x"}))
@@ -558,6 +574,7 @@ def test_write_launcher_script_quotes_paths(tmp_path):
         transfer_method="tar", publish_policy="fail_if_exists",
         tokens_dir="/nas/tokens",
         max_concurrent_staging=3,
+        token_wait_timeout_sec=86400.0,
         heartbeat_interval=30,
     )
     text = p.read_text()
@@ -566,6 +583,8 @@ def test_write_launcher_script_quotes_paths(tmp_path):
     assert "panta_rei.imaging.remote_worker" in text
     assert "--run-id 42" in text
     assert "--dispatch-id d_x" in text
+    # Token wait is forwarded so the worker doesn't fall back to a tight bound.
+    assert "--token-wait-timeout-sec 86400.0" in text
     assert os.access(p, os.X_OK)
     # Cache args ABSENT when not requested
     assert "--cache-root" not in text
@@ -583,6 +602,7 @@ def test_write_launcher_script_includes_cache_args(tmp_path):
         run_id=1, dispatch_id="d",
         transfer_method="tar", publish_policy="fail_if_exists",
         tokens_dir="/t", max_concurrent_staging=2,
+        token_wait_timeout_sec=86400.0,
         heartbeat_interval=30,
         cache_root="/raid/cache",
         cache_min_free_gb=512,
