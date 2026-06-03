@@ -65,7 +65,22 @@ class TokenAcquireTimeout(TimeoutError):
     """
 
 
+# Default _MkdirLock wait.  Used by the CACHE locks (GC + per-entry
+# populate), which DEGRADE on timeout (skip GC / fall back to NAS-direct) —
+# so a short 300s bound is fine and a premature give-up only costs a
+# redundant read, never a unit failure.
 _MKDIR_LOCK_DEFAULT_WAIT_SEC = 300.0
+# The per-(machine, GOUS) STAGE lock is different: on timeout it is NOT
+# caught (remote_worker._ensure_staged_inputs) and FAILS the unit.  The
+# stage lock is on local /raid, so its holder is ALWAYS same-host and
+# verifiable: a dead holder is reclaimed immediately (no wait), and a LIVE
+# holder is just slow-staging (90GB can take >30min) and must be waited out,
+# not failed.  The same 91fa5d9 commit that capped the token wait also
+# bounded this at 300s, which fails a waiter while a live sibling legitimately
+# stages.  Use a 24h backstop (parallel to _DEFAULT_TOKEN_WAIT_TIMEOUT_SEC):
+# high enough to never fail a live holder, finite only to guard a pathological
+# reclaim-churn loop.  See .tmp/REGRESSION_REPORT_token_timeout_2026-06-02.md.
+_STAGE_LOCK_DEFAULT_WAIT_SEC = 86400.0
 # 24h backstop, NOT a tight bound.  An earlier 1800s (30min) default
 # (commit 91fa5d9) regressed dispatch reliability: historically, cache-miss
 # units routinely waited 2-8h (observed max ~29,700s) for one of only 2
@@ -553,10 +568,21 @@ def acquire_stage_lock(gous_dir: Path, holder_meta: dict | None = None) -> _Mkdi
 
     >>> with acquire_stage_lock(gous_dir, {"run_id": 42}):
     ...     ensure_staged(...)
+
+    Unlike the cache locks, a stage-lock timeout FAILS the unit (the caller
+    does not catch ``StaleLockTimeout``).  The lock is on local /raid, so a
+    dead holder is reclaimed immediately and a live holder is just
+    slow-staging — which must be waited out, not failed.  Hence the long
+    ``_STAGE_LOCK_DEFAULT_WAIT_SEC`` backstop rather than the 300s cache-lock
+    default.  See the constant's comment.
     """
     lock_dir = Path(gous_dir) / ".stage.lock.d"
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    return _MkdirLock(dir_path=lock_dir, holder_meta=holder_meta or {})
+    return _MkdirLock(
+        dir_path=lock_dir,
+        holder_meta=holder_meta or {},
+        wait_timeout_sec=_STAGE_LOCK_DEFAULT_WAIT_SEC,
+    )
 
 
 # ---------------------------------------------------------------------------

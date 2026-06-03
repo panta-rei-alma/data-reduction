@@ -245,6 +245,22 @@ def test_stage_lock_blocks_concurrent_holder(tmp_path):
     ta.join(); tb.join()
 
 
+def test_stage_lock_uses_long_backstop_not_cache_lock_default(tmp_path):
+    """The stage lock fails the unit on timeout, so it must wait out a
+    live, slow-staging same-host holder (90GB can take >30min) rather than
+    give up at the 300s cache-lock default that 91fa5d9 imposed.  It uses a
+    24h backstop; the cache-lock default stays short (it degrades, not
+    fails).  See REGRESSION_REPORT_token_timeout_2026-06-02.md."""
+    gous_dir = tmp_path / "gous"
+    gous_dir.mkdir()
+    lock = staging.acquire_stage_lock(gous_dir, {"id": "x"})
+    assert lock.wait_timeout_sec == staging._STAGE_LOCK_DEFAULT_WAIT_SEC
+    assert staging._STAGE_LOCK_DEFAULT_WAIT_SEC == 86400.0
+    # Distinct from (and far longer than) the cache-lock default.
+    assert staging._STAGE_LOCK_DEFAULT_WAIT_SEC > staging._MKDIR_LOCK_DEFAULT_WAIT_SEC
+    assert staging._MKDIR_LOCK_DEFAULT_WAIT_SEC == 300.0
+
+
 # ---------------------------------------------------------------------------
 # Staging tokens
 # ---------------------------------------------------------------------------
