@@ -14,9 +14,8 @@ from panta_rei.github.project import (
     PROJECT_STATUS_DELIVERED,
     PROJECT_STATUS_DONE,
     PROJECT_STATUS_IN_PROGRESS,
+    PROJECT_STATUS_NEEDS_ATTENTION,
     PROJECT_STATUS_NEEDS_DISCUSSION,
-    PROJECT_STATUS_RECALIBRATION,
-    PROJECT_STATUS_REIMAGING,
     PROJECT_STATUS_WEBLOG_QA,
     GitHubProjectManager,
 )
@@ -32,8 +31,7 @@ def manager() -> GitHubProjectManager:
     [
         PROJECT_STATUS_WEBLOG_QA,
         PROJECT_STATUS_NEEDS_DISCUSSION,
-        PROJECT_STATUS_RECALIBRATION,
-        PROJECT_STATUS_REIMAGING,
+        PROJECT_STATUS_NEEDS_ATTENTION,
         PROJECT_STATUS_DONE,
     ],
 )
@@ -52,3 +50,8 @@ def test_auto_managed_states_are_not_protected(manager, status):
 def test_needs_discussion_constant_matches_board_label():
     # Must match the GitHub column name byte-for-byte or the guard never fires.
     assert PROJECT_STATUS_NEEDS_DISCUSSION == "Needs discussion"
+
+
+def test_needs_attention_constant_matches_board_label():
+    # Must match the GitHub column name byte-for-byte or the guard never fires.
+    assert PROJECT_STATUS_NEEDS_ATTENTION == "Needs attention"
