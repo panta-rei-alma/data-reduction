@@ -22,8 +22,7 @@ PROJECT_STATUS_IN_PROGRESS = "In progress"
 PROJECT_STATUS_DELIVERED = "Delivered"
 PROJECT_STATUS_WEBLOG_QA = "Weblog QA"
 PROJECT_STATUS_NEEDS_DISCUSSION = "Needs discussion"
-PROJECT_STATUS_RECALIBRATION = "Needs re-calibration"
-PROJECT_STATUS_REIMAGING = "Needs re-imaging"
+PROJECT_STATUS_NEEDS_ATTENTION = "Needs attention"
 PROJECT_STATUS_DONE = "Done"
 
 
@@ -303,8 +302,7 @@ class GitHubProjectManager:
         manual_states = {
             PROJECT_STATUS_WEBLOG_QA,
             PROJECT_STATUS_NEEDS_DISCUSSION,
-            PROJECT_STATUS_RECALIBRATION,
-            PROJECT_STATUS_REIMAGING,
+            PROJECT_STATUS_NEEDS_ATTENTION,
             PROJECT_STATUS_DONE,
         }
         return current_status in manual_states
