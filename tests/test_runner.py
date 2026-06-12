@@ -21,7 +21,6 @@ from panta_rei.imaging.runner import (
     build_tclean_params,
     cleanup_intermediates,
     get_casa_version,
-    resolve_continuum_spw_for_ms,
     run_continuum_trusted_preflight,
     run_sdintimaging,
     run_tclean_feather,
@@ -1055,20 +1054,25 @@ def cont_unit():
     )
 
 
-def _cont_casatools(spws, chanfreqs_map, has_corrected=True):
-    """Build a mock casatools with msmetadata + table for continuum tests."""
-    import numpy as np
+def _cont_casatools(has_corrected=True):
+    """Mock casatools for the per-EB preflight: only the datacolumn probe is
+    needed (spw selection comes from the recovered spw_by_eb map, not casa)."""
     mock = MagicMock()
-    msmd = MagicMock()
-    msmd.spwsforintent.return_value = np.array(spws)
-    msmd.chanfreqs.side_effect = lambda s: chanfreqs_map.get(s, np.array([]))
-    msmd.fieldsforname.return_value = [0]
-    mock.msmetadata.return_value = msmd
     tb = MagicMock()
-    cols = ["DATA", "FLAG"] + (["CORRECTED_DATA"] if has_corrected else [])
-    tb.colnames.return_value = cols
+    tb.colnames.return_value = ["DATA", "FLAG"] + (
+        ["CORRECTED_DATA"] if has_corrected else []
+    )
     mock.table.return_value = tb
     return mock
+
+
+# cont_unit fixture vis are /data/{tm1,tm2,sm1}.ms → eb uid is the basename
+# (no _targets suffix in the test names): "tm1.ms", "tm2.ms", "sm1.ms".
+_EB_MAP = {
+    "tm1.ms": "25:90.60~90.70GHz",
+    "tm2.ms": "25:90.61~90.71GHz",   # sibling EB, its own (offset) selection
+    "sm1.ms": "24:90.59~90.69GHz",   # 7m: its own spw id + frame
+}
 
 
 class TestBuildContParams:
@@ -1106,139 +1110,51 @@ class TestBuildContParams:
         )["scales"] == [0, 5, 10]
 
 
-class TestResolveContinuumSpwForMs:
-    def test_remaps_to_local_spw_ids(self):
-        import numpy as np
-        # MS spw 10 covers 86 GHz, spw 12 covers 87 GHz (different ids than
-        # the recovered 23/25).
-        casatools = _cont_casatools(
-            [10, 12],
-            {
-                10: np.linspace(85.9e9, 86.3e9, 960),
-                12: np.linspace(86.9e9, 87.3e9, 960),
-            },
-        )
-        selection = {"23": [(86.0e9, 86.2e9)], "25": [(87.0e9, 87.2e9)]}
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            spw_str, covered = resolve_continuum_spw_for_ms("/data/x.ms", selection)
-        assert spw_str.startswith("10:") and ",12:" in spw_str
-        assert sum(hi - lo for lo, hi in covered) == pytest.approx(0.4e9, rel=1e-3)
-
-    def test_overlapping_ranges_to_one_spw_merged_not_doublecounted(self):
-        import numpy as np
-        # Two overlapping recovered ranges both land in spw 10 → must merge to
-        # a single interval (no double-count of the overlap).
-        casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.5e9, 960)})
-        selection = {"23": [(86.0e9, 86.2e9), (86.1e9, 86.3e9)]}
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            spw_str, covered = resolve_continuum_spw_for_ms("/data/x.ms", selection)
-        assert spw_str.count(";") == 0  # merged into one range
-        assert sum(hi - lo for lo, hi in covered) == pytest.approx(0.3e9, rel=1e-3)
-
-    def test_no_coverage_returns_empty(self):
-        import numpy as np
-        casatools = _cont_casatools([10], {10: np.linspace(200e9, 200.4e9, 960)})
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            spw_str, covered = resolve_continuum_spw_for_ms(
-                "/data/x.ms", {"23": [(86.0e9, 86.2e9)]}
-            )
-        assert spw_str == "" and covered == []
-
-
-def _cont_casatools_paths(per_spws, per_freqs, has_corrected=True):
-    """Path-aware mock: each MS basename reports its own spws/chanfreqs."""
-    import numpy as np
-    mock = MagicMock()
-    msmd = MagicMock()
-    state = {"cur": None}
-    msmd.open.side_effect = lambda p: state.update(cur=Path(p).name)
-    msmd.spwsforintent.side_effect = lambda _: np.array(per_spws[state["cur"]])
-    msmd.chanfreqs.side_effect = lambda s: per_freqs[state["cur"]].get(s, np.array([]))
-    msmd.fieldsforname.return_value = [0]
-    mock.msmetadata.return_value = msmd
-    tb = MagicMock()
-    tb.colnames.return_value = ["DATA", "FLAG"] + (["CORRECTED_DATA"] if has_corrected else [])
-    mock.table.return_value = tb
-    return mock
-
-
 class TestRunContinuumTrustedPreflight:
-    def _full_coverage(self):
-        import numpy as np
-        return _cont_casatools(
-            [10, 12],
-            {
-                10: np.linspace(85.9e9, 86.3e9, 960),
-                12: np.linspace(86.9e9, 87.3e9, 960),
-            },
-        )
-
-    def test_populates_selections(self, cont_unit):
+    def test_assigns_each_eb_its_own_selection(self, cont_unit):
+        cont_unit.recovered_params["spw_by_eb"] = dict(_EB_MAP)
         with patch("panta_rei.imaging.runner._ensure_casatools",
-                   return_value=self._full_coverage()):
+                   return_value=_cont_casatools()):
             ok, msg = run_continuum_trusted_preflight(cont_unit)
         assert ok, msg
-        assert len(cont_unit.spw_selection) == 3   # 2 TM + 1 SM
-        assert len(cont_unit.field_selection) == 3
+        # parallel to vis_tm + vis_sm, each EB's OWN selection (no remap)
+        assert cont_unit.spw_selection == [
+            "25:90.60~90.70GHz", "25:90.61~90.71GHz", "24:90.59~90.69GHz",
+        ]
+        assert cont_unit.field_selection == ["SRC1", "SRC1", "SRC1"]
         assert cont_unit.datacolumn == "corrected"
 
     def test_datacolumn_falls_back_to_data(self, cont_unit):
-        import numpy as np
-        casatools = _cont_casatools(
-            [10, 12],
-            {10: np.linspace(85.9e9, 86.3e9, 960),
-             12: np.linspace(86.9e9, 87.3e9, 960)},
-            has_corrected=False,
-        )
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+        cont_unit.recovered_params["spw_by_eb"] = dict(_EB_MAP)
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools(has_corrected=False)):
             ok, msg = run_continuum_trusted_preflight(cont_unit)
         assert ok, msg
         assert cont_unit.datacolumn == "data"
 
-    def test_hard_fail_below_coverage_threshold(self, cont_unit):
-        import numpy as np
-        # MS covers only a thin sliver of one range (86.0-86.05 of the 0.4 GHz
-        # selection) → union ~0.125 < 0.5 threshold → hard fail.
-        casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.05e9, 960)})
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+    def test_drops_eb_without_selection(self, cont_unit):
+        # tm2 absent from the map (e.g. fully flagged) → dropped, tm1 remains.
+        m = dict(_EB_MAP)
+        del m["tm2.ms"]
+        cont_unit.recovered_params["spw_by_eb"] = m
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools()):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        assert cont_unit.vis_tm == ["/data/tm1.ms"]
+        assert len(cont_unit.spw_selection) == 2  # tm1 + sm1
+
+    def test_fails_when_no_sm_selection(self, cont_unit):
+        cont_unit.recovered_params["spw_by_eb"] = {
+            "tm1.ms": "25:90.60~90.70GHz", "tm2.ms": "25:90.61~90.71GHz",
+        }
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools()):
             ok, msg = run_continuum_trusted_preflight(cont_unit)
         assert not ok
-        assert "coverage" in msg
+        assert "SM" in msg
 
-    def test_edge_gap_range_warns_but_passes(self, cont_unit):
-        """A line-free range outside an array's bands (12m/7m epoch edge offset)
-        is imaged with the other array and only warned about — it must NOT fail
-        the unit, as long as overall union coverage stays above threshold."""
-        import numpy as np
-        cont_unit.recovered_params["spw"] = [
-            "23:86.0~86.19GHz,25:87.0~87.19GHz,27:88.0~88.005GHz"
-        ]
-        # spws cover 86 + 87 GHz but NOT the tiny 88 GHz range → ~98.7% union.
-        casatools = _cont_casatools(
-            [10, 12],
-            {10: np.linspace(85.9e9, 86.3e9, 960),
-             12: np.linspace(86.9e9, 87.3e9, 960)},
-        )
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            ok, msg = run_continuum_trusted_preflight(cont_unit)
-        assert ok, msg
-
-    def test_union_across_sibling_ebs_passes(self, cont_unit):
-        """Split coverage across sibling EBs must be recognised via the UNION
-        (the old best-EB metric falsely failed this)."""
-        import numpy as np
-        # tm1 covers only 86 GHz, tm2 only 87 GHz → TM union is full. sm1 full.
-        per_spws = {"tm1.ms": [10], "tm2.ms": [12], "sm1.ms": [10, 12]}
-        full10 = np.linspace(85.9e9, 86.3e9, 960)
-        full12 = np.linspace(86.9e9, 87.3e9, 960)
-        per_freqs = {
-            "tm1.ms": {10: full10},
-            "tm2.ms": {12: full12},
-            "sm1.ms": {10: full10, 12: full12},
-        }
-        casatools = _cont_casatools_paths(per_spws, per_freqs)
-        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            ok, msg = run_continuum_trusted_preflight(cont_unit)
-        assert ok, msg
-        # Both partial TM EBs are kept (each contributes its half).
-        assert len(cont_unit.vis_tm) == 2
+    def test_fails_when_no_map(self, cont_unit):
+        cont_unit.recovered_params.pop("spw_by_eb", None)
+        ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert not ok

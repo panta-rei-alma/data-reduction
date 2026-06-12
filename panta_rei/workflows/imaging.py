@@ -247,6 +247,16 @@ class RecoverParamsStep(Step):
                         skipped += 1
                         continue
 
+                    # Continuum: attach each EB's own line-free spw selection
+                    # (12m from the TM call(s), 7m recovered from the SM call(s))
+                    # so the joint image uses pipeline-prescribed channels per EB.
+                    if opts.product_type == "cont":
+                        canon_params = dict(canon_params)
+                        canon_params["spw_by_eb"] = _build_cont_spw_by_eb(
+                            all_mous_results, groups, field_name, lg,
+                            weblog_dir, ctx.data_dir,
+                        )
+
                     # Write JSON sidecar
                     safe_source = field_name.replace('"', "").replace("'", "")
                     json_name = (
@@ -699,11 +709,13 @@ _DIVERGENCE_KEYS = [
     "outframe", "veltype", "weighting", "robust", "niter", "threshold",
 ]
 
-# Continuum has no start/width/nchan (mfs); the load-bearing param is the
-# line-free ``spw`` selection (must match across the TM MOUSs being combined),
-# plus the continuum-specific weighting/masking knobs.
+# Continuum has no start/width/nchan (mfs).  The line-free spw selection is NOT
+# compared here: it is captured per-EB (each EB has its own, by design), so a
+# top-level spw mismatch across MOUSs is expected, not a divergence.  We compare
+# the imaging geometry + weighting/masking knobs that must agree across the TM
+# MOUSs being combined.
 _CONT_DIVERGENCE_KEYS = [
-    "spw", "imsize", "cell", "phasecenter", "weighting", "robust", "threshold",
+    "imsize", "cell", "phasecenter", "weighting", "robust", "threshold",
     "mosweight", "pblimit", "perchanweightdensity", "usemask",
     "sidelobethreshold", "noisethreshold", "lownoisethreshold",
     "negativethreshold", "minbeamfrac",
@@ -793,6 +805,53 @@ def _values_match(a, b) -> bool:
     if isinstance(a, str) and isinstance(b, str):
         return a.strip() == b.strip()
     return str(a) == str(b)
+
+
+def _build_cont_spw_by_eb(
+    all_mous_results: dict,
+    groups: list,
+    field_name: str,
+    lg: Optional[str],
+    weblog_dir: Path,
+    data_dir: Path,
+) -> dict[str, str]:
+    """Build the combined ``{eb_uid: spw_selection}`` map for a continuum unit.
+
+    Each EB — 12m and 7m — gets the exact line-free selection the ALMA pipeline
+    prescribed for it (its own spw ids and topocentric frame), so the joint
+    image needs no cross-array frequency remap.  The 12m EBs come from the
+    already-recovered TM call(s); the 7m EBs are recovered here from the SM
+    MOUS weblog(s).
+    """
+    from panta_rei.imaging.recovery import (
+        eb_spw_map_from_call,
+        recover_continuum_params_for_mous,
+    )
+
+    spw_by_eb: dict[str, str] = {}
+    # 12m EBs — from the TM calls already recovered for this (field, 'cont').
+    for results in all_mous_results.values():
+        call = results.get((field_name, "cont"))
+        if call:
+            spw_by_eb.update(eb_spw_map_from_call(call))
+    # 7m EBs — recover the SM aggregate-continuum call(s) for the same source.
+    sm_groups = [
+        g for g in groups
+        if g.array == "SM" and g.source_name == field_name
+        and (not lg or g.line_group == lg)
+    ]
+    for g in sm_groups:
+        for mous_id in g.mous_ids:
+            full = _ensure_full_uid(mous_id)
+            if (
+                not has_staged_weblog(weblog_dir, full)
+                and not find_member_dir(data_dir, mous_id)
+            ):
+                continue
+            raw = recover_continuum_params_for_mous(full, weblog_dir, data_dir)
+            if raw and field_name in raw:
+                spw_by_eb.update(eb_spw_map_from_call(raw[field_name]))
+    return spw_by_eb
 
 
 def _ensure_full_uid(mous_id: str) -> str:

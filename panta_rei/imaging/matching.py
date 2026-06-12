@@ -1034,6 +1034,18 @@ def _parse_freq_range_token(tok: str) -> Optional[tuple[float, float]]:
     return (min(lo, hi), max(lo, hi))
 
 
+def eb_uid_from_ms(ms_name_or_path) -> str:
+    """Extract the EB uid from an MS name/path: the basename up to the
+    ``_targets[_line].ms`` suffix (e.g.
+    ``/x/uid___A002_X12fb842_X987_targets.ms`` → ``uid___A002_X12fb842_X987``).
+
+    Used to key each EB to its own pipeline-prescribed continuum spw selection
+    — both the recovered call's ``vis`` entries and the staged MS files reduce
+    to the same uid.
+    """
+    return Path(ms_name_or_path).name.split("_targets")[0]
+
+
 def parse_continuum_spw_selection(
     spw_value,
 ) -> dict[str, list[tuple[float, float]]]:
@@ -1071,9 +1083,20 @@ def continuum_freq_bounds_hz(
 ) -> Optional[tuple[float, float]]:
     """Overall (min, max) selected continuum frequency in Hz, for the output
     filename label.  Derived from the recovered GHz-range spw selection — NOT
-    from cube ``start``/``width``/``nchan`` (which continuum mfs lacks)."""
-    sel = parse_continuum_spw_selection(recovered_params.get("spw"))
-    all_ranges = [r for rngs in sel.values() for r in rngs]
+    from cube ``start``/``width``/``nchan`` (which continuum mfs lacks).
+
+    Uses the union of the per-EB selections (``spw_by_eb``, covering both
+    arrays) when present, else the legacy top-level ``spw``.
+    """
+    spw_by_eb = recovered_params.get("spw_by_eb")
+    if spw_by_eb:
+        sel_strings = list(spw_by_eb.values())
+    else:
+        sel_strings = [recovered_params.get("spw")]
+    all_ranges: list[tuple[float, float]] = []
+    for s in sel_strings:
+        for rngs in parse_continuum_spw_selection(s).values():
+            all_ranges.extend(rngs)
     if not all_ranges:
         return None
     return (

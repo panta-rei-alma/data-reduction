@@ -276,219 +276,58 @@ def run_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Continuum trusted-mode preflight (per-MS GHz-range → spw-id remap)
+# Continuum trusted-mode preflight (per-EB pipeline-prescribed selection)
 # ---------------------------------------------------------------------------
 
-# Minimum fraction of the recovered (12m) line-free continuum bandwidth that an
-# array's UNION coverage must retain after remap onto its own spw ids.  This is
-# a sanity gate against a pathological 7m overlap, NOT a science-quality bar:
-# the CSV match already guarantees the correct 7m MS, and the empty-array check
-# catches a gross mismatch.  Real 12m/7m pairs lose ~5-25% of the 12m-defined
-# line-free bandwidth at the 7m band edges (the two arrays are observed at
-# different epochs, so their per-spw topocentric bands are offset by ~10 MHz),
-# so genuine pairs land around 0.75-0.95.  0.5 passes all of those with margin
-# while still failing a near-zero overlap.
-DEFAULT_CONT_COVERAGE_THRESHOLD = 0.5
+def run_continuum_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
+    """Trusted-mode preflight for continuum.
 
-
-def _merge_intervals(
-    intervals: list[tuple[float, float]],
-) -> list[tuple[float, float]]:
-    """Merge overlapping/adjacent (lo, hi) intervals into a disjoint set."""
-    if not intervals:
-        return []
-    ordered = sorted(intervals)
-    merged = [list(ordered[0])]
-    for lo, hi in ordered[1:]:
-        if lo <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], hi)
-        else:
-            merged.append([lo, hi])
-    return [(lo, hi) for lo, hi in merged]
-
-
-def _overlaps_any(
-    rng: tuple[float, float], intervals: list[tuple[float, float]]
-) -> bool:
-    lo, hi = rng
-    return any(min(hi, b) > max(lo, a) for a, b in intervals)
-
-
-def resolve_continuum_spw_for_ms(
-    ms_path: str,
-    selection: dict,
-    edge_tol_frac: float = 0.5,
-) -> tuple[str, list[tuple[float, float]]]:
-    """Remap a recovered continuum frequency selection onto *ms_path*'s spws.
-
-    ``selection`` is ``{src_spw_id: [(lo_hz, hi_hz), ...]}`` (the recovered
-    12m line-free ranges, from
-    :func:`panta_rei.imaging.matching.parse_continuum_spw_selection`).  Each
-    physical frequency range is matched to the ``OBSERVE_TARGET`` spw in this
-    MS that covers it (the 7m uses different spw *ids* for the same
-    frequencies), clipped to that spw's frequency extent, and **merged** per
-    output spw (overlapping recovered ranges that land in one spw collapse to
-    one, so nothing is double-selected or double-counted).
-
-    ``chanfreqs`` are channel *centres*, so the band extends ~half a channel
-    beyond the first/last centre; ``edge_tol_frac`` pads each spw's extent by
-    that fraction of a channel width to avoid silently shaving ranges that sit
-    right at a band edge.  Ascending or descending channel order is handled
-    via min/max.
-
-    Returns ``(spw_string, covered_intervals)`` where ``covered_intervals`` is
-    the merged set of physical frequency ranges this MS actually contributes
-    (used by the preflight to compute per-array *union* coverage).  Returns
-    ``("", [])`` when nothing maps.
-    """
-    casatools = _ensure_casatools()
-    msmd = casatools.msmetadata()
-    try:
-        msmd.open(ms_path)
-        target_spws = set(int(s) for s in msmd.spwsforintent("OBSERVE_TARGET*"))
-        spw_bounds: dict[int, tuple[float, float]] = {}
-        for s in target_spws:
-            freqs = msmd.chanfreqs(s)
-            if len(freqs) < 4:
-                continue  # skip single-channel / very narrow spws
-            fmin, fmax = float(min(freqs)), float(max(freqs))
-            chan_w = abs(float(freqs[1]) - float(freqs[0]))
-            pad = edge_tol_frac * chan_w
-            spw_bounds[s] = (fmin - pad, fmax + pad)
-    finally:
-        msmd.close()
-
-    local: dict[int, list[tuple[float, float]]] = {}
-    for ranges in selection.values():
-        for lo, hi in ranges:
-            best = None  # (overlap_bw, spw_id, clip_lo, clip_hi)
-            for s, (fmin, fmax) in spw_bounds.items():
-                ov_lo = max(lo, fmin)
-                ov_hi = min(hi, fmax)
-                if ov_hi > ov_lo:
-                    ov = ov_hi - ov_lo
-                    if best is None or ov > best[0]:
-                        best = (ov, s, ov_lo, ov_hi)
-            if best is not None:
-                _, s, clip_lo, clip_hi = best
-                local.setdefault(s, []).append((clip_lo, clip_hi))
-
-    if not local:
-        return "", []
-
-    parts = []
-    covered: list[tuple[float, float]] = []
-    for s in sorted(local):
-        merged = _merge_intervals(local[s])
-        covered.extend(merged)
-        rngs = ";".join(
-            f"{lo / 1e9:.10f}~{hi / 1e9:.10f}GHz" for lo, hi in merged
-        )
-        parts.append(f"{s}:{rngs}")
-    return ",".join(parts), _merge_intervals(covered)
-
-
-def run_continuum_trusted_preflight(
-    unit: ImagingUnit,
-    coverage_threshold: float = DEFAULT_CONT_COVERAGE_THRESHOLD,
-) -> tuple[bool, str]:
-    """Trusted-mode preflight for continuum: per-MS GHz-range → spw-id remap.
-
-    Populates ``unit.spw_selection`` / ``unit.field_selection`` /
+    Assigns each EB its OWN recovered line-free spw selection — 12m and 7m each
+    already in that EB's spw ids and topocentric frame (``recovered_params
+    ['spw_by_eb']``, built at recovery time from each array's own weblog).  No
+    cross-array frequency remap is needed, so band-edge / epoch-offset effects
+    cannot arise.  Populates ``unit.spw_selection`` / ``unit.field_selection`` /
     ``unit.datacolumn`` in-place (parallel to ``unit.vis_tm + unit.vis_sm``).
 
-    MSes lacking the target field, or contributing no continuum coverage, are
-    dropped (normal for multi-pointing GOUSs).  The unit FAILS if either array
-    ends up empty, or if an array's UNION coverage falls below
-    ``coverage_threshold`` of the recovered selected bandwidth.  Individual
-    line-free ranges that one array doesn't cover (a few MHz at band edges,
-    because the 12m/7m EBs are observed at different epochs) are imaged with
-    the other array's data and only WARNED about — that is expected for real
-    ALMA data, not an error.
+    EBs with no recovered selection (not in the pipeline's continuum image —
+    e.g. fully flagged) are dropped.  The unit FAILS if either array ends up
+    with no contributing EB.
     """
-    from panta_rei.imaging.matching import parse_continuum_spw_selection
+    from panta_rei.imaging.matching import eb_uid_from_ms
 
-    selection = parse_continuum_spw_selection(unit.recovered_params.get("spw"))
-    if not selection:
-        return False, "No continuum spw selection in recovered params"
-    requested = _merge_intervals(
-        [r for rngs in selection.values() for r in rngs]
-    )
-    requested_bw = sum(hi - lo for lo, hi in requested)
-    if requested_bw <= 0:
-        return False, "Continuum spw selection has zero bandwidth"
+    spw_by_eb = (unit.recovered_params or {}).get("spw_by_eb") or {}
+    if not spw_by_eb:
+        return False, "No per-EB continuum spw selections in recovered params"
 
     def process(vis_list):
-        # Keep every EB that contributes ANY of the line-free selection (each
-        # contributes its own covered channels via its per-MS spw string —
-        # correct uv-combination).  Coverage is judged on the per-array UNION
-        # of contributed frequency, not any single EB, so split coverage
-        # across sibling EBs is recognised and a partial EB cannot mask a
-        # genuinely missing range.
         kept, spw_sel, field_sel = [], [], []
         dcs: set[str] = set()
-        covered_all: list[tuple[float, float]] = []
         for ms_path in vis_list:
-            field = resolve_field_for_ms(ms_path, unit.source_name)
-            if field is None:
+            eb = eb_uid_from_ms(ms_path)
+            sel = spw_by_eb.get(eb)
+            if not sel:
                 log.info(
-                    "Field '%s' not in %s — skipping (different pointing)",
-                    unit.source_name, Path(ms_path).name,
-                )
-                continue
-            spw_str, covered = resolve_continuum_spw_for_ms(ms_path, selection)
-            if not spw_str:
-                log.info(
-                    "No continuum coverage in %s — skipping",
-                    Path(ms_path).name,
+                    "EB %s has no recovered continuum selection — skipping", eb,
                 )
                 continue
             kept.append(ms_path)
-            spw_sel.append(spw_str)
-            field_sel.append(field)
+            spw_sel.append(sel)
+            field_sel.append(unit.source_name)
             dcs.add(resolve_datacolumn(ms_path))
-            covered_all.extend(covered)
-        union = _merge_intervals(covered_all)
-        union_bw = sum(hi - lo for lo, hi in union)
-        frac = union_bw / requested_bw if requested_bw else 0.0
-        # Requested ranges with NO union overlap in this array.  For the 7m this
-        # is NORMAL: the 12m/7m EBs are observed at different epochs, so their
-        # per-spw topocentric band edges differ by ~10 MHz, and the 12m-defined
-        # line-free ranges that sit at a band edge can fall just outside the 7m
-        # band.  Those frequencies are simply imaged with that array's data
-        # only (correct uv-combination) — NOT a failure.  Surfaced as a warning;
-        # the per-array bandwidth-fraction gate below is the real safety net.
-        missing = [r for r in requested if not _overlaps_any(r, union)]
-        return kept, spw_sel, field_sel, dcs, frac, missing
+        return kept, spw_sel, field_sel, dcs
 
-    tm_keep, tm_spw, tm_field, tm_dc, tm_frac, tm_missing = process(unit.vis_tm)
-    sm_keep, sm_spw, sm_field, sm_dc, sm_frac, sm_missing = process(unit.vis_sm)
+    tm_keep, tm_spw, tm_field, tm_dc = process(unit.vis_tm)
+    sm_keep, sm_spw, sm_field, sm_dc = process(unit.vis_sm)
 
     if not tm_keep:
         return False, (
-            f"No TM EB has field '{unit.source_name}' with continuum coverage"
+            f"No TM EB has a recovered continuum selection for "
+            f"'{unit.source_name}'"
         )
     if not sm_keep:
         return False, (
-            f"No SM EB has field '{unit.source_name}' with continuum coverage"
-        )
-    for label, miss, frac in (("TM", tm_missing, tm_frac), ("SM", sm_missing, sm_frac)):
-        if miss:
-            log.warning(
-                "%s continuum: %d of %d recovered line-free range(s) fall "
-                "outside this array's bands (epoch/edge offset); imaged with "
-                "the other array there. %s union coverage=%.2f",
-                label, len(miss), len(requested), label, frac,
-            )
-    if tm_frac < coverage_threshold:
-        return False, (
-            f"TM continuum coverage {tm_frac:.2f} < threshold "
-            f"{coverage_threshold:.2f} of recovered selection"
-        )
-    if sm_frac < coverage_threshold:
-        return False, (
-            f"SM continuum coverage {sm_frac:.2f} < threshold "
-            f"{coverage_threshold:.2f} of recovered selection"
+            f"No SM EB has a recovered continuum selection for "
+            f"'{unit.source_name}'"
         )
 
     unit.vis_tm = tm_keep
@@ -496,16 +335,14 @@ def run_continuum_trusted_preflight(
     unit.spw_selection = tm_spw + sm_spw
     unit.field_selection = tm_field + sm_field
 
-    # Codex should-fix #1: decide datacolumn explicitly — 'corrected' iff any
-    # selected MS actually has CORRECTED_DATA, else 'data'.  Mixed sets still
-    # rely on CASA's per-MS fallback (a single tclean call has one global
-    # datacolumn).
+    # Datacolumn: 'corrected' iff any selected MS has CORRECTED_DATA, else
+    # 'data'.  Mixed sets rely on CASA's per-MS fallback (one global datacolumn).
     all_dc = tm_dc | sm_dc
     unit.datacolumn = "corrected" if "corrected" in all_dc else "data"
 
     log.info(
-        "continuum preflight OK: TM cov=%.2f SM cov=%.2f datacolumn=%s",
-        tm_frac, sm_frac, unit.datacolumn,
+        "continuum preflight OK: %d TM + %d SM EB(s), datacolumn=%s",
+        len(tm_keep), len(sm_keep), unit.datacolumn,
     )
     return True, "OK"
 
@@ -1845,12 +1682,12 @@ def run_tclean_cont_parallel(
     extra_env: Optional[dict] = None,
     aux_products: tuple[str, ...] = ("mask", "residual", "pb"),
     on_publish_start=lambda: None,
-    coverage_threshold: float = DEFAULT_CONT_COVERAGE_THRESHOLD,
 ) -> tuple[bool, str, Optional[str]]:
     """Execute 12m+7m continuum tclean (mtmfs) via mpicasa subprocess.
 
-    Continuum analogue of :func:`run_tclean_feather_parallel`: no TP / feather,
-    and the per-MS spw remap happens in :func:`run_continuum_trusted_preflight`.
+    Continuum analogue of :func:`run_tclean_feather_parallel`: no TP / feather.
+    Each EB's line-free spw selection is assigned in
+    :func:`run_continuum_trusted_preflight` (per-EB, from each array's weblog).
     The CASA work is delegated to ``panta_rei/casa/tclean_cont.py``.
 
     Returns ``(success, message, canonical_tt0_fits_path)`` — the tt0 pbcor
@@ -1878,7 +1715,7 @@ def run_tclean_cont_parallel(
         return False, f"casa not found at {casa}", None
 
     # 1. Trusted preflight (resolves per-MS spw remap, field, datacolumn)
-    ok, msg = run_continuum_trusted_preflight(unit, coverage_threshold)
+    ok, msg = run_continuum_trusted_preflight(unit)
     if not ok:
         return False, f"Continuum preflight failed: {msg}", None
 

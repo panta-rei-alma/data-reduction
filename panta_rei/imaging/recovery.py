@@ -332,6 +332,32 @@ def recover_params_for_mous(
     return result
 
 
+def eb_spw_map_from_call(call: dict) -> dict[str, str]:
+    """Build ``{eb_uid: spw_selection}`` from one aggregate-continuum call.
+
+    The ALMA continuum ``tclean`` call's ``vis`` and ``spw`` lists are parallel
+    — one line-free selection per EB, each already in that EB's own spw ids and
+    topocentric frame (verified across all weblogs).  So each EB carries the
+    exact selection the pipeline prescribed for it; no cross-array frequency
+    remapping is needed.  Keyed by EB uid (MS basename minus ``_targets*.ms``).
+    """
+    from panta_rei.imaging.matching import eb_uid_from_ms
+
+    vis = call.get("vis")
+    spw = call.get("spw")
+    vis = vis if isinstance(vis, list) else [vis]
+    spw = spw if isinstance(spw, list) else [spw]
+    # Defensive: a single shared selection applied to every EB.
+    if len(spw) == 1 and len(vis) > 1:
+        spw = spw * len(vis)
+    out: dict[str, str] = {}
+    for v, s in zip(vis, spw):
+        if not v or not s:
+            continue
+        out[eb_uid_from_ms(str(v))] = str(s)
+    return out
+
+
 def recover_continuum_params_for_mous(
     mous_uid: str,
     weblog_base: Path,

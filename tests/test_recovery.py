@@ -305,6 +305,29 @@ class TestExtractContinuumByField:
         assert by_field["AG345.0884+0.0818"]["datacolumn"] == "corrected"
 
 
+class TestEbSpwMapFromCall:
+    def test_parallel_vis_spw_per_eb(self):
+        from panta_rei.imaging.recovery import eb_spw_map_from_call
+        call = {
+            "vis": ["uid___A002_X1_Xa_targets.ms", "uid___A002_X2_Xb_targets.ms"],
+            "spw": ["24:86.0~86.1GHz", "24:86.01~86.11GHz"],
+        }
+        assert eb_spw_map_from_call(call) == {
+            "uid___A002_X1_Xa": "24:86.0~86.1GHz",
+            "uid___A002_X2_Xb": "24:86.01~86.11GHz",
+        }
+
+    def test_single_selection_applied_to_all_ebs(self):
+        from panta_rei.imaging.recovery import eb_spw_map_from_call
+        call = {
+            "vis": ["uid___A002_X1_Xa_targets.ms", "uid___A002_X2_Xb_targets.ms"],
+            "spw": ["24:86.0~86.1GHz"],
+        }
+        m = eb_spw_map_from_call(call)
+        assert set(m) == {"uid___A002_X1_Xa", "uid___A002_X2_Xb"}
+        assert all(v == "24:86.0~86.1GHz" for v in m.values())
+
+
 class TestRecoverContinuumParamsForMous:
     def test_full_recovery(self, tmp_path):
         weblog_base = tmp_path / "weblogs"
