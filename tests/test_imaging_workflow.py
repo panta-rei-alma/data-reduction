@@ -36,6 +36,12 @@ MOCK_CASA_COMMANDS = dedent("""\
     tclean(vis=['test.ms'], field='"SRC1"', spw=['25'], specmode='cube', nchan=100, start='87.0GHz', width='244.14kHz', imsize=[100, 100], cell=['0.5arcsec'], restoration=True, pbcor=True, niter=30000, threshold='0.1Jy', imagename='test.spw25.cube.I.iter1')
 """)
 
+# Aggregate-continuum iter1 call (one product per field, line-free GHz ranges).
+MOCK_CONTINUUM_COMMANDS = dedent("""\
+    # hif_makeimlist(specmode='cont')
+    tclean(vis=['test.ms'], field='"SRC1"', spw=['23:86.0~86.1GHz,25:87.0~87.1GHz'], datacolumn='data', specmode='mfs', deconvolver='hogbom', gridder='mosaic', mosweight=True, imsize=[100, 100], cell=['0.5arcsec'], restoration=True, pbcor=True, imagename='test.spw23_25.cont.I.iter1')
+""")
+
 
 @pytest.fixture
 def imaging_tree(tmp_path):
@@ -195,6 +201,41 @@ class TestRecoverParamsStep:
         result = step.run(imaging_ctx)
         assert result.success
         assert result.items_processed == 0
+
+    def test_recovers_continuum_isolated_from_line(self, imaging_ctx, imaging_tree):
+        """Continuum recovery stores spw_id='cont'/product_type='cont' rows, and
+        the default (line) selection never sees them (Codex line-isolation)."""
+        log = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_tm']}"
+            / "pipeline-20250101" / "html" / "casa_commands.log"
+        )
+        log.write_text(log.read_text() + MOCK_CONTINUUM_COMMANDS)
+
+        common = dict(
+            weblog_dir=imaging_tree["weblog_dir"],
+            obs_csv=imaging_tree["csv_path"],
+            step="recover",
+        )
+        RecoverParamsStep(ImagingOptions(**common)).run(imaging_ctx)  # line
+        res = RecoverParamsStep(
+            ImagingOptions(product_type="cont", **common)
+        ).run(imaging_ctx)
+        assert res.success
+
+        with imaging_ctx.db_manager.connect() as con:
+            line_rows = ImagingParamsQueries.get_all_recovered(con)  # default line
+            cont_rows = ImagingParamsQueries.get_all_recovered(
+                con, product_type="cont"
+            )
+
+        # Line selection is blind to continuum rows.
+        assert line_rows and all(r["product_type"] == "line" for r in line_rows)
+        # Exactly one aggregate continuum product for SRC1, keyed spw_id='cont'.
+        assert len(cont_rows) == 1
+        assert cont_rows[0]["source_name"] == "SRC1"
+        assert cont_rows[0]["spw_id"] == "cont"
+        assert cont_rows[0]["product_type"] == "cont"
 
 
 # ---------------------------------------------------------------------------

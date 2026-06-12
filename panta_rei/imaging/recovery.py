@@ -187,6 +187,58 @@ def filter_cube_iter1_calls(
     return iter1
 
 
+# Specmodes used by ALMA continuum (aggregate) imaging.  The aggregate
+# continuum product is never 'cube'.
+_CONT_SPECMODES = {"mfs", "cont"}
+
+
+def filter_continuum_iter1_calls(
+    calls: list[dict],
+    log_path: Optional[Path] = None,
+) -> list[dict]:
+    """Filter to only aggregate-continuum iter1 tclean calls.
+
+    A continuum iter1 call has ``restoration=True``, ``pbcor=True``,
+    ``specmode in {'mfs', 'cont'}`` and an ``imagename`` carrying the
+    dot-bounded ``.cont.`` token (e.g.
+    ``...spw24_26_..cont.regcal.I.iter1``).
+
+    This excludes cube calls (``.cube.`` / ``specmode='cube'``) and the
+    per-spw ``findcont`` calls (``...mfs.regcal.I.findcont`` — no ``.cont.``,
+    not iter1).  ``log_path`` is accepted for signature symmetry with
+    :func:`filter_cube_iter1_calls` but is not needed: the ``.cont.`` token
+    is an unambiguous discriminator.
+    """
+    out: list[dict] = []
+    for call in calls:
+        if call.get("restoration") is not True or call.get("pbcor") is not True:
+            continue
+        if call.get("specmode") not in _CONT_SPECMODES:
+            continue
+        if ".cont." not in str(call.get("imagename", "")):
+            continue
+        out.append(call)
+    return out
+
+
+def extract_continuum_by_field(calls: list[dict]) -> dict[str, dict]:
+    """Organize continuum iter1 calls by ``field`` name.
+
+    Continuum is aggregated across all spws, so there is exactly one
+    aggregate product per field.  Unlike the line path, the spw is **not**
+    part of the identity — the full line-free frequency-range selection
+    lives inside the params dict (``spw``).  Returns ``{field: params}``.
+    """
+    result: dict[str, dict] = {}
+    for call in calls:
+        call = _normalize_string_values(call)
+        field = _clean_field(call.get("field", ""))
+        if field in result:
+            log.debug("Duplicate continuum field %s; keeping last", field)
+        result[field] = call
+    return result
+
+
 def extract_by_field_spw(calls: list[dict]) -> dict[tuple[str, str], dict]:
     """Organize iter1 calls by ``(field, spw)`` key.
 
@@ -273,6 +325,47 @@ def recover_params_for_mous(
     result = extract_by_field_spw(iter1_calls)
     log.info(
         "Recovered %d cube iter1 parameter sets from %s: %s",
+        len(result),
+        log_path.name,
+        list(result.keys()),
+    )
+    return result
+
+
+def recover_continuum_params_for_mous(
+    mous_uid: str,
+    weblog_base: Path,
+    data_dir: Optional[Path] = None,
+) -> Optional[dict[str, dict]]:
+    """Recover aggregate-continuum tclean parameters from a TM MOUS weblog.
+
+    Returns a dict keyed by ``field_name`` mapping to the full tclean
+    parameter dict (including the line-free frequency-range ``spw``
+    selection, ``mosweight``, masking params, etc.), or *None* if no weblog
+    or no continuum calls are found.
+
+    Note: ``deconvolver``/``nterms`` are recovered for provenance but the
+    continuum runner overrides them to ``mtmfs``/``2`` (see the runner).
+    """
+    log_path = find_casa_commands_log(weblog_base, mous_uid, data_dir)
+    if log_path is None:
+        log.warning("No casa_commands.log found for %s", mous_uid)
+        return None
+
+    log.info("Parsing %s for MOUS %s (continuum)", log_path, mous_uid)
+    all_calls = parse_tclean_calls(log_path)
+    if not all_calls:
+        log.warning("No tclean calls found in %s", log_path)
+        return None
+
+    cont_calls = filter_continuum_iter1_calls(all_calls, log_path)
+    if not cont_calls:
+        log.warning("No continuum iter1 tclean calls found in %s", log_path)
+        return None
+
+    result = extract_continuum_by_field(cont_calls)
+    log.info(
+        "Recovered %d continuum iter1 parameter sets from %s: %s",
         len(result),
         log_path.name,
         list(result.keys()),

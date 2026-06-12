@@ -34,7 +34,11 @@ from panta_rei.imaging.matching import (
     find_member_dir,
     load_targets_csv,
 )
-from panta_rei.imaging.recovery import has_staged_weblog, recover_params_for_mous
+from panta_rei.imaging.recovery import (
+    has_staged_weblog,
+    recover_continuum_params_for_mous,
+    recover_params_for_mous,
+)
 from panta_rei.workflows.base import Step, StepResult, WorkflowContext
 
 log = logging.getLogger(__name__)
@@ -64,6 +68,7 @@ class ImagingOptions:
     keep_intermediates: bool = False
     parallel: bool = False          # use mpicasa for tclean
     nproc: int = 4                  # MPI processes (only with --parallel)
+    product_type: str = "line"      # 'line' (cube) or 'cont' (continuum)
 
 
 # ---------------------------------------------------------------------------
@@ -160,14 +165,27 @@ class RecoverParamsStep(Step):
                         continue
 
                     log.info(
-                        "Recovering params: GOUS=%s source=%s MOUS=%s",
-                        gous_uid, source, full_mous,
+                        "Recovering %s params: GOUS=%s source=%s MOUS=%s",
+                        opts.product_type, gous_uid, source, full_mous,
                     )
-                    result = recover_params_for_mous(
-                        full_mous,
-                        weblog_dir,
-                        ctx.data_dir,
-                    )
+                    if opts.product_type == "cont":
+                        # Continuum is aggregated over spws → one product per
+                        # field. Shape {field: params} into the same
+                        # {(field, spw): params} structure the rest of the loop
+                        # expects, with the sentinel spw_id 'cont'.
+                        raw = recover_continuum_params_for_mous(
+                            full_mous, weblog_dir, ctx.data_dir,
+                        )
+                        result = (
+                            {(f, "cont"): p for f, p in raw.items()}
+                            if raw else None
+                        )
+                    else:
+                        result = recover_params_for_mous(
+                            full_mous,
+                            weblog_dir,
+                            ctx.data_dir,
+                        )
                     if result is None:
                         log.warning(
                             "No params recovered for MOUS %s", mous_id
@@ -216,7 +234,8 @@ class RecoverParamsStep(Step):
                     # Check existing in DB
                     with ctx.db_manager.connect() as con:
                         existing = ImagingParamsQueries.get_by_key(
-                            con, gous_uid, field_name, lg, spw_id
+                            con, gous_uid, field_name, lg, spw_id,
+                            product_type=opts.product_type,
                         )
 
                     if existing and not opts.re_run:
@@ -294,6 +313,7 @@ class RecoverParamsStep(Step):
                                 nchan=int(nchan) if nchan is not None else None,
                                 phasecenter=phasecenter,
                                 robust=float(robust) if robust is not None else None,
+                                product_type=opts.product_type,
                             )
                             con.commit()
 
