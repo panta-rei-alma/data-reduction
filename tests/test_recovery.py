@@ -305,6 +305,30 @@ class TestExtractContinuumByField:
         assert by_field["AG345.0884+0.0818"]["datacolumn"] == "corrected"
 
 
+class TestParseCache:
+    def test_second_parse_served_from_cache(self, tmp_path):
+        from panta_rei.imaging.recovery import clear_parse_cache
+        clear_parse_cache()
+        p = tmp_path / "casa_commands.log"
+        p.write_text(ITER0_AND_ITER1)
+        first = parse_tclean_calls(p)
+        assert len(first) == 3
+        # Unchanged file → second call returns the SAME cached object (a
+        # re-parse would build a new, merely-equal list).
+        assert parse_tclean_calls(p) is first
+        clear_parse_cache()
+
+    def test_cache_invalidates_on_rewrite(self, tmp_path):
+        from panta_rei.imaging.recovery import clear_parse_cache
+        clear_parse_cache()
+        p = tmp_path / "casa_commands.log"
+        p.write_text(SINGLE_LINE_TCLEAN)
+        assert len(parse_tclean_calls(p)) == 1
+        p.write_text(ITER0_AND_ITER1)  # size + mtime change → re-parse
+        assert len(parse_tclean_calls(p)) == 3
+        clear_parse_cache()
+
+
 class TestEbSpwMapFromCall:
     def test_parallel_vis_spw_per_eb(self):
         from panta_rei.imaging.recovery import eb_spw_map_from_call

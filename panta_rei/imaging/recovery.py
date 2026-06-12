@@ -116,6 +116,21 @@ def has_staged_weblog(weblog_base: Path, mous_uid: str) -> bool:
     )
 
 
+# Per-process cache of parsed weblogs, keyed by (path, size, mtime_ns).  A full
+# continuum recovery re-parses the same large casa_commands.log many times (once
+# per source, plus the SM weblog per unit); parsing dominates the runtime, so
+# memoizing it makes a full --re-run ~10-20x faster.  Weblogs are immutable
+# during a recovery; the size+mtime key still invalidates if one is rewritten.
+# Callers never mutate the returned dicts (extract_* build fresh dicts), so
+# returning the cached list by reference is safe.
+_PARSE_CACHE: dict[tuple, list[dict]] = {}
+
+
+def clear_parse_cache() -> None:
+    """Drop the parsed-weblog cache (tests / long-lived processes)."""
+    _PARSE_CACHE.clear()
+
+
 def parse_tclean_calls(log_path: Path) -> list[dict]:
     """Parse all ``tclean(...)`` invocations from a ``casa_commands.log``.
 
@@ -123,8 +138,19 @@ def parse_tclean_calls(log_path: Path) -> list[dict]:
     ``tclean(`` until a line ending with ``)`` is found, joins them, and
     converts the parameter string to a dict via :func:`ast.literal_eval`.
 
+    Results are memoized per-process (see ``_PARSE_CACHE``) since recovery
+    re-parses the same weblogs repeatedly.
+
     Returns a list of parameter dicts, one per tclean call.
     """
+    try:
+        st = log_path.stat()
+        cache_key = (str(log_path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        cache_key = None
+    if cache_key is not None and cache_key in _PARSE_CACHE:
+        return _PARSE_CACHE[cache_key]
+
     text = log_path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
@@ -150,6 +176,8 @@ def parse_tclean_calls(log_path: Path) -> list[dict]:
                 in_call = False
                 accumulator = []
 
+    if cache_key is not None:
+        _PARSE_CACHE[cache_key] = calls
     return calls
 
 
