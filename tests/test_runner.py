@@ -1197,13 +1197,31 @@ class TestRunContinuumTrustedPreflight:
 
     def test_hard_fail_below_coverage_threshold(self, cont_unit):
         import numpy as np
-        # Each MS covers ONLY the 86 GHz range (spw 23), missing 87 GHz (spw
-        # 25) entirely → coverage gap → hard fail.
-        casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.3e9, 960)})
+        # MS covers only a thin sliver of one range (86.0-86.05 of the 0.4 GHz
+        # selection) → union ~0.125 < 0.5 threshold → hard fail.
+        casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.05e9, 960)})
         with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
             ok, msg = run_continuum_trusted_preflight(cont_unit)
         assert not ok
         assert "coverage" in msg
+
+    def test_edge_gap_range_warns_but_passes(self, cont_unit):
+        """A line-free range outside an array's bands (12m/7m epoch edge offset)
+        is imaged with the other array and only warned about — it must NOT fail
+        the unit, as long as overall union coverage stays above threshold."""
+        import numpy as np
+        cont_unit.recovered_params["spw"] = [
+            "23:86.0~86.19GHz,25:87.0~87.19GHz,27:88.0~88.005GHz"
+        ]
+        # spws cover 86 + 87 GHz but NOT the tiny 88 GHz range → ~98.7% union.
+        casatools = _cont_casatools(
+            [10, 12],
+            {10: np.linspace(85.9e9, 86.3e9, 960),
+             12: np.linspace(86.9e9, 87.3e9, 960)},
+        )
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
 
     def test_union_across_sibling_ebs_passes(self, cont_unit):
         """Split coverage across sibling EBs must be recognised via the UNION

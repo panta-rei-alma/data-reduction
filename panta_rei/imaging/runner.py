@@ -279,10 +279,16 @@ def run_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 # Continuum trusted-mode preflight (per-MS GHz-range → spw-id remap)
 # ---------------------------------------------------------------------------
 
-# Minimum fraction of the recovered (12m) line-free continuum bandwidth that
-# the best EB of EACH array must retain after remap onto its own spw ids.
-# Below this the unit fails rather than silently imaging a truncated band.
-DEFAULT_CONT_COVERAGE_THRESHOLD = 0.8
+# Minimum fraction of the recovered (12m) line-free continuum bandwidth that an
+# array's UNION coverage must retain after remap onto its own spw ids.  This is
+# a sanity gate against a pathological 7m overlap, NOT a science-quality bar:
+# the CSV match already guarantees the correct 7m MS, and the empty-array check
+# catches a gross mismatch.  Real 12m/7m pairs lose ~5-25% of the 12m-defined
+# line-free bandwidth at the 7m band edges (the two arrays are observed at
+# different epochs, so their per-spw topocentric bands are offset by ~10 MHz),
+# so genuine pairs land around 0.75-0.95.  0.5 passes all of those with margin
+# while still failing a near-zero overlap.
+DEFAULT_CONT_COVERAGE_THRESHOLD = 0.5
 
 
 def _merge_intervals(
@@ -393,9 +399,12 @@ def run_continuum_trusted_preflight(
 
     MSes lacking the target field, or contributing no continuum coverage, are
     dropped (normal for multi-pointing GOUSs).  The unit FAILS if either array
-    ends up empty, or if the best surviving EB of an array retains less than
-    ``coverage_threshold`` of the recovered selected bandwidth (Codex: hard
-    coverage gate, not a silent skip).
+    ends up empty, or if an array's UNION coverage falls below
+    ``coverage_threshold`` of the recovered selected bandwidth.  Individual
+    line-free ranges that one array doesn't cover (a few MHz at band edges,
+    because the 12m/7m EBs are observed at different epochs) are imaged with
+    the other array's data and only WARNED about — that is expected for real
+    ALMA data, not an error.
     """
     from panta_rei.imaging.matching import parse_continuum_spw_selection
 
@@ -442,8 +451,13 @@ def run_continuum_trusted_preflight(
         union = _merge_intervals(covered_all)
         union_bw = sum(hi - lo for lo, hi in union)
         frac = union_bw / requested_bw if requested_bw else 0.0
-        # Requested ranges with NO union overlap = entirely missing from this
-        # array → a hard fail regardless of the bandwidth fraction.
+        # Requested ranges with NO union overlap in this array.  For the 7m this
+        # is NORMAL: the 12m/7m EBs are observed at different epochs, so their
+        # per-spw topocentric band edges differ by ~10 MHz, and the 12m-defined
+        # line-free ranges that sit at a band edge can fall just outside the 7m
+        # band.  Those frequencies are simply imaged with that array's data
+        # only (correct uv-combination) — NOT a failure.  Surfaced as a warning;
+        # the per-array bandwidth-fraction gate below is the real safety net.
         missing = [r for r in requested if not _overlaps_any(r, union)]
         return kept, spw_sel, field_sel, dcs, frac, missing
 
@@ -458,16 +472,14 @@ def run_continuum_trusted_preflight(
         return False, (
             f"No SM EB has field '{unit.source_name}' with continuum coverage"
         )
-    if tm_missing:
-        return False, (
-            f"TM continuum coverage gap: {len(tm_missing)} recovered line-free "
-            f"range(s) covered by no TM EB"
-        )
-    if sm_missing:
-        return False, (
-            f"SM continuum coverage gap: {len(sm_missing)} recovered line-free "
-            f"range(s) covered by no SM EB"
-        )
+    for label, miss, frac in (("TM", tm_missing, tm_frac), ("SM", sm_missing, sm_frac)):
+        if miss:
+            log.warning(
+                "%s continuum: %d of %d recovered line-free range(s) fall "
+                "outside this array's bands (epoch/edge offset); imaged with "
+                "the other array there. %s union coverage=%.2f",
+                label, len(miss), len(requested), label, frac,
+            )
     if tm_frac < coverage_threshold:
         return False, (
             f"TM continuum coverage {tm_frac:.2f} < threshold "
