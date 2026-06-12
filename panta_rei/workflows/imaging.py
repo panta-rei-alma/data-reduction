@@ -840,6 +840,12 @@ def _build_cont_spw_by_eb(
         if g.array == "SM" and g.source_name == field_name
         and (not lg or g.line_group == lg)
     ]
+    if not sm_groups:
+        log.warning(
+            "continuum %s/%s: no SM group in CSV — no 7m EBs will contribute",
+            field_name, lg,
+        )
+    n_sm_before = len(spw_by_eb)
     for g in sm_groups:
         for mous_id in g.mous_ids:
             full = _ensure_full_uid(mous_id)
@@ -847,10 +853,24 @@ def _build_cont_spw_by_eb(
                 not has_staged_weblog(weblog_dir, full)
                 and not find_member_dir(data_dir, mous_id)
             ):
+                log.warning(
+                    "continuum %s: SM MOUS %s not on disk — its 7m EBs omitted",
+                    field_name, mous_id,
+                )
                 continue
             raw = recover_continuum_params_for_mous(full, weblog_dir, data_dir)
-            if raw and field_name in raw:
-                spw_by_eb.update(eb_spw_map_from_call(raw[field_name]))
+            if not raw or field_name not in raw:
+                log.warning(
+                    "continuum %s: no SM continuum call for this source in "
+                    "MOUS %s — its 7m EBs omitted", field_name, mous_id,
+                )
+                continue
+            spw_by_eb.update(eb_spw_map_from_call(raw[field_name]))
+    if sm_groups and len(spw_by_eb) == n_sm_before:
+        log.warning(
+            "continuum %s/%s: SM groups present but no 7m EB selection "
+            "recovered — preflight will fail this unit", field_name, lg,
+        )
     return spw_by_eb
 
 

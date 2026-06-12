@@ -1020,7 +1020,7 @@ class TestPublishPair:
 
 
 # ---------------------------------------------------------------------------
-# Continuum: params, per-MS spw remap, trusted preflight
+# Continuum: params + per-EB trusted preflight
 # ---------------------------------------------------------------------------
 
 @pytest.fixture

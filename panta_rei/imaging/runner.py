@@ -518,8 +518,8 @@ def build_tclean_cont_params(
     """Assemble the tclean() parameter dict for a 12m+7m continuum image.
 
     Seeds geometry / weighting / masking / threshold from the recovered 12m
-    continuum call, carries the per-MS remapped spw selection, and forces the
-    fixed continuum overrides (``specmode='mfs'``, ``gridder='mosaic'``,
+    continuum call, carries each EB's own spw selection (set by the preflight),
+    and forces the fixed continuum overrides (``specmode='mfs'``, ``gridder='mosaic'``,
     ``deconvolver='mtmfs'``, ``nterms=2``).  No TP / feather.
     """
     if scales is None:
@@ -1714,7 +1714,7 @@ def run_tclean_cont_parallel(
     if not casa.exists():
         return False, f"casa not found at {casa}", None
 
-    # 1. Trusted preflight (resolves per-MS spw remap, field, datacolumn)
+    # 1. Trusted preflight (assigns each EB its own spw selection + datacolumn)
     ok, msg = run_continuum_trusted_preflight(unit)
     if not ok:
         return False, f"Continuum preflight failed: {msg}", None

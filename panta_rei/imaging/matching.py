@@ -810,8 +810,9 @@ def build_continuum_units_advisory(
       * inputs are ``*_targets.ms`` (via :func:`find_continuum_ms`), not the
         contsub ``*_targets_line.ms``;
       * there is **no TP / feather** (``sdimage`` stays None);
-      * the recovered line-free GHz-range ``spw`` selection rides along in
-        ``recovered_params`` and is remapped per-MS in the trusted preflight.
+      * each EB's own line-free selection rides along in
+        ``recovered_params['spw_by_eb']`` and is assigned per-EB in the
+        trusted preflight (no cross-array remap).
 
     ``recovered_params`` must be continuum rows (``product_type='cont'``,
     ``spw_id='cont'``).  SPW/field/datacolumn are resolved later (casatasks).
@@ -900,8 +901,8 @@ def build_continuum_units_advisory(
             units.append(unit)
             continue
 
-        # No TP for continuum. SPW/field/datacolumn resolved in trusted
-        # preflight (per-MS GHz-range remap).
+        # No TP for continuum. Per-EB spw / field / datacolumn are assigned in
+        # the trusted preflight from the recovered spw_by_eb map.
         unit.ready = True
         units.append(unit)
 
