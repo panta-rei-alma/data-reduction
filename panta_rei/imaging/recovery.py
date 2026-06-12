@@ -53,6 +53,15 @@ _ITER0_MARKERS = {"restoration": False, "niter": 0}
 # Public API
 # ---------------------------------------------------------------------------
 
+# Per-process caches for the NFS directory globs below.  Across a full
+# recovery these helpers are called thousands of times for the same MOUSs, and
+# on NFS each glob costs 0.25-1.2s (metadata round-trips) — far more than the
+# parsing.  The filesystem layout is immutable during a recovery, so memoizing
+# the lookups is safe.  Cleared via clear_parse_cache() (tests / long processes).
+_LOGPATH_CACHE: dict[tuple, "Optional[Path]"] = {}
+_STAGED_CACHE: dict[tuple, bool] = {}
+
+
 def find_casa_commands_log(
     weblog_base: Path,
     mous_uid: str,
@@ -65,7 +74,7 @@ def find_casa_commands_log(
       2. Raw log dir: ``{data_dir}/.../member.uid___*/log/*.casa_commands.log``
       3. Raw working dir: ``{data_dir}/.../member.uid___*/calibrated/working/pipeline-*/html/casa_commands.log``
 
-    Returns the first existing path, or *None*.
+    Returns the first existing path, or *None*.  Memoized per-process.
     """
     from panta_rei.core.uid import sanitize_uid
 
@@ -73,47 +82,61 @@ def find_casa_commands_log(
     if not uid_dir:
         return None
 
+    cache_key = (str(weblog_base), uid_dir, str(data_dir) if data_dir else None)
+    if cache_key in _LOGPATH_CACHE:
+        return _LOGPATH_CACHE[cache_key]
+
+    result: Optional[Path] = None
     # 1. Staged weblog
     if weblog_base and weblog_base.is_dir():
         candidates = sorted(weblog_base.glob(
             f"{uid_dir}/pipeline-*/html/casa_commands.log"
         ))
         if candidates:
-            return candidates[-1]  # latest pipeline run
+            result = candidates[-1]  # latest pipeline run
 
     # 2-3. Raw extracted data (structured lookup, not recursive **)
-    if data_dir and data_dir.is_dir():
+    if result is None and data_dir and data_dir.is_dir():
         from panta_rei.imaging.matching import find_member_dir
 
         member_dir = find_member_dir(data_dir, uid_dir)
         if member_dir is not None:
-            # 2. log/ directory
             for p in sorted(member_dir.glob("log/*.casa_commands.log")):
-                return p
-            # 3. calibrated/working/pipeline-*/html/
-            candidates = sorted(member_dir.glob(
-                "calibrated/working/pipeline-*/html/casa_commands.log"
-            ))
-            if candidates:
-                return candidates[-1]
+                result = p
+                break
+            if result is None:
+                candidates = sorted(member_dir.glob(
+                    "calibrated/working/pipeline-*/html/casa_commands.log"
+                ))
+                if candidates:
+                    result = candidates[-1]
 
-    return None
+    _LOGPATH_CACHE[cache_key] = result
+    return result
 
 
 def has_staged_weblog(weblog_base: Path, mous_uid: str) -> bool:
-    """Check if a staged weblog exists for a MOUS (fast glob, no parsing)."""
+    """Check if a staged weblog exists for a MOUS (fast glob, no parsing).
+
+    Memoized per-process (the glob is a slow NFS metadata round-trip).
+    """
     from panta_rei.core.uid import sanitize_uid
 
     uid_dir = sanitize_uid(mous_uid) if mous_uid else None
     if not uid_dir or not weblog_base or not weblog_base.is_dir():
         return False
-    return (
+    cache_key = (str(weblog_base), uid_dir)
+    if cache_key in _STAGED_CACHE:
+        return _STAGED_CACHE[cache_key]
+    result = (
         next(
             weblog_base.glob(f"{uid_dir}/pipeline-*/html/casa_commands.log"),
             None,
         )
         is not None
     )
+    _STAGED_CACHE[cache_key] = result
+    return result
 
 
 # Per-process cache of parsed weblogs, keyed by (path, size, mtime_ns).  A full
@@ -127,8 +150,15 @@ _PARSE_CACHE: dict[tuple, list[dict]] = {}
 
 
 def clear_parse_cache() -> None:
-    """Drop the parsed-weblog cache (tests / long-lived processes)."""
+    """Drop the recovery per-process caches (parsed weblogs + glob lookups).
+
+    For tests and any long-lived process that must re-see filesystem changes.
+    """
     _PARSE_CACHE.clear()
+    _LOGPATH_CACHE.clear()
+    _STAGED_CACHE.clear()
+    from panta_rei.imaging.matching import clear_member_dir_cache
+    clear_member_dir_cache()
 
 
 def parse_tclean_calls(log_path: Path) -> list[dict]:

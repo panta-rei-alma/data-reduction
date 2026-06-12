@@ -228,6 +228,18 @@ def targets_by_array(
 # MS file discovery
 # ---------------------------------------------------------------------------
 
+# Per-process cache for the member-dir glob: on NFS each lookup is ~1s (it
+# walks ~250 science_goal dirs), and recovery/selection call it repeatedly for
+# the same MOUSs.  Member dirs are not created mid-run, so caching the result
+# (including a None miss) is safe.  Cleared via clear_member_dir_cache().
+_MEMBER_DIR_CACHE: dict[tuple, "Optional[Path]"] = {}
+
+
+def clear_member_dir_cache() -> None:
+    """Drop the member-dir lookup cache (tests / long-lived processes)."""
+    _MEMBER_DIR_CACHE.clear()
+
+
 def find_member_dir(data_dir: Path, mous_id: str) -> Optional[Path]:
     """Locate the member directory for a MOUS using the known hierarchy.
 
@@ -237,14 +249,19 @@ def find_member_dir(data_dir: Path, mous_id: str) -> Optional[Path]:
 
     Uses the structured path ``science_goal.*/group.*/member.uid___A001_{mous_id}``
     instead of a ``**`` recursive glob (which is prohibitively slow on large
-    data trees because it descends into MS directories).
+    data trees because it descends into MS directories).  Memoized per-process.
     """
     compact = mous_id
     if compact.lower().startswith("uid___a001_"):
         compact = compact[len("uid___A001_"):]
+    cache_key = (str(data_dir), compact)
+    if cache_key in _MEMBER_DIR_CACHE:
+        return _MEMBER_DIR_CACHE[cache_key]
     pattern = f"science_goal.*/group.*/member.uid___A001_{compact}"
     candidates = sorted(data_dir.glob(pattern))
-    return candidates[0] if candidates else None
+    result = candidates[0] if candidates else None
+    _MEMBER_DIR_CACHE[cache_key] = result
+    return result
 
 
 class MSSearchResult:
