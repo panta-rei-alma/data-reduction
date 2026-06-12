@@ -276,6 +276,169 @@ def run_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Continuum trusted-mode preflight (per-MS GHz-range → spw-id remap)
+# ---------------------------------------------------------------------------
+
+# Minimum fraction of the recovered (12m) line-free continuum bandwidth that
+# the best EB of EACH array must retain after remap onto its own spw ids.
+# Below this the unit fails rather than silently imaging a truncated band.
+DEFAULT_CONT_COVERAGE_THRESHOLD = 0.8
+
+
+def resolve_continuum_spw_for_ms(
+    ms_path: str,
+    selection: dict,
+) -> tuple[str, float]:
+    """Remap a recovered continuum frequency selection onto *ms_path*'s spws.
+
+    ``selection`` is ``{src_spw_id: [(lo_hz, hi_hz), ...]}`` (the recovered
+    12m line-free ranges, as produced by
+    :func:`panta_rei.imaging.matching.parse_continuum_spw_selection`).  Each
+    physical frequency range is matched to the ``OBSERVE_TARGET`` spw in this
+    MS that covers it (the 7m uses different spw *ids* for the same
+    frequencies), clipped to that spw's frequency extent, and merged per
+    output spw.
+
+    Channel frequencies may be ascending or descending — extents use min/max,
+    so ordering is handled.  Returns ``(spw_string, retained_bandwidth_hz)``;
+    ``("", 0.0)`` when nothing maps (the MS contributes no continuum here).
+    """
+    casatools = _ensure_casatools()
+    msmd = casatools.msmetadata()
+    try:
+        msmd.open(ms_path)
+        target_spws = set(int(s) for s in msmd.spwsforintent("OBSERVE_TARGET*"))
+        spw_bounds: dict[int, tuple[float, float]] = {}
+        for s in target_spws:
+            freqs = msmd.chanfreqs(s)
+            if len(freqs) < 4:
+                continue  # skip single-channel / very narrow spws
+            spw_bounds[s] = (float(min(freqs)), float(max(freqs)))
+    finally:
+        msmd.close()
+
+    local: dict[int, list[tuple[float, float]]] = {}
+    retained = 0.0
+    for ranges in selection.values():
+        for lo, hi in ranges:
+            best = None  # (overlap_bw, spw_id, clip_lo, clip_hi)
+            for s, (fmin, fmax) in spw_bounds.items():
+                ov_lo = max(lo, fmin)
+                ov_hi = min(hi, fmax)
+                if ov_hi > ov_lo:
+                    ov = ov_hi - ov_lo
+                    if best is None or ov > best[0]:
+                        best = (ov, s, ov_lo, ov_hi)
+            if best is not None:
+                _, s, clip_lo, clip_hi = best
+                local.setdefault(s, []).append((clip_lo, clip_hi))
+                retained += clip_hi - clip_lo
+
+    if not local:
+        return "", 0.0
+
+    parts = []
+    for s in sorted(local):
+        rngs = ";".join(
+            f"{lo / 1e9:.10f}~{hi / 1e9:.10f}GHz"
+            for lo, hi in sorted(local[s])
+        )
+        parts.append(f"{s}:{rngs}")
+    return ",".join(parts), retained
+
+
+def run_continuum_trusted_preflight(
+    unit: ImagingUnit,
+    coverage_threshold: float = DEFAULT_CONT_COVERAGE_THRESHOLD,
+) -> tuple[bool, str]:
+    """Trusted-mode preflight for continuum: per-MS GHz-range → spw-id remap.
+
+    Populates ``unit.spw_selection`` / ``unit.field_selection`` /
+    ``unit.datacolumn`` in-place (parallel to ``unit.vis_tm + unit.vis_sm``).
+
+    MSes lacking the target field, or contributing no continuum coverage, are
+    dropped (normal for multi-pointing GOUSs).  The unit FAILS if either array
+    ends up empty, or if the best surviving EB of an array retains less than
+    ``coverage_threshold`` of the recovered selected bandwidth (Codex: hard
+    coverage gate, not a silent skip).
+    """
+    from panta_rei.imaging.matching import parse_continuum_spw_selection
+
+    selection = parse_continuum_spw_selection(unit.recovered_params.get("spw"))
+    if not selection:
+        return False, "No continuum spw selection in recovered params"
+    requested_bw = sum(hi - lo for rngs in selection.values() for lo, hi in rngs)
+    if requested_bw <= 0:
+        return False, "Continuum spw selection has zero bandwidth"
+
+    def process(vis_list):
+        kept, spw_sel, field_sel = [], [], []
+        dcs: set[str] = set()
+        best_frac = 0.0
+        for ms_path in vis_list:
+            field = resolve_field_for_ms(ms_path, unit.source_name)
+            if field is None:
+                log.info(
+                    "Field '%s' not in %s — skipping (different pointing)",
+                    unit.source_name, Path(ms_path).name,
+                )
+                continue
+            spw_str, retained = resolve_continuum_spw_for_ms(ms_path, selection)
+            if not spw_str or retained <= 0:
+                log.info(
+                    "No continuum coverage in %s — skipping",
+                    Path(ms_path).name,
+                )
+                continue
+            kept.append(ms_path)
+            spw_sel.append(spw_str)
+            field_sel.append(field)
+            dcs.add(resolve_datacolumn(ms_path))
+            best_frac = max(best_frac, retained / requested_bw)
+        return kept, spw_sel, field_sel, dcs, best_frac
+
+    tm_keep, tm_spw, tm_field, tm_dc, tm_frac = process(unit.vis_tm)
+    sm_keep, sm_spw, sm_field, sm_dc, sm_frac = process(unit.vis_sm)
+
+    if not tm_keep:
+        return False, (
+            f"No TM EB has field '{unit.source_name}' with continuum coverage"
+        )
+    if not sm_keep:
+        return False, (
+            f"No SM EB has field '{unit.source_name}' with continuum coverage"
+        )
+    if tm_frac < coverage_threshold:
+        return False, (
+            f"TM continuum coverage {tm_frac:.2f} < threshold "
+            f"{coverage_threshold:.2f} of recovered selection"
+        )
+    if sm_frac < coverage_threshold:
+        return False, (
+            f"SM continuum coverage {sm_frac:.2f} < threshold "
+            f"{coverage_threshold:.2f} of recovered selection"
+        )
+
+    unit.vis_tm = tm_keep
+    unit.vis_sm = sm_keep
+    unit.spw_selection = tm_spw + sm_spw
+    unit.field_selection = tm_field + sm_field
+
+    # Codex should-fix #1: decide datacolumn explicitly — 'corrected' iff any
+    # selected MS actually has CORRECTED_DATA, else 'data'.  Mixed sets still
+    # rely on CASA's per-MS fallback (a single tclean call has one global
+    # datacolumn).
+    all_dc = tm_dc | sm_dc
+    unit.datacolumn = "corrected" if "corrected" in all_dc else "data"
+
+    log.info(
+        "continuum preflight OK: TM cov=%.2f SM cov=%.2f datacolumn=%s",
+        tm_frac, sm_frac, unit.datacolumn,
+    )
+    return True, "OK"
+
+
+# ---------------------------------------------------------------------------
 # Parameter assembly
 # ---------------------------------------------------------------------------
 
@@ -419,6 +582,82 @@ def build_tclean_params(
 
     # Apply fixed params (always override)
     params.update(FIXED_TCLEAN_PARAMS)
+
+    return params
+
+
+# Fixed parameters for continuum tclean.  mtmfs/nterms=2 is a deliberate
+# override applied to EVERY continuum image (regardless of what the recovered
+# 12m call used) so we always get the tt0/tt1/alpha spectral terms.
+FIXED_TCLEAN_CONT_PARAMS = {
+    "gridder": "mosaic",
+    "pbcor": True,
+    "stokes": "I",
+    "restoringbeam": "common",
+    "specmode": "mfs",
+    "deconvolver": "mtmfs",
+    "nterms": 2,
+}
+
+
+def build_tclean_cont_params(
+    unit: ImagingUnit,
+    imagename: str,
+    scales: Optional[list[int]] = None,
+    parallel: bool = False,
+) -> dict:
+    """Assemble the tclean() parameter dict for a 12m+7m continuum image.
+
+    Seeds geometry / weighting / masking / threshold from the recovered 12m
+    continuum call, carries the per-MS remapped spw selection, and forces the
+    fixed continuum overrides (``specmode='mfs'``, ``gridder='mosaic'``,
+    ``deconvolver='mtmfs'``, ``nterms=2``).  No TP / feather.
+    """
+    if scales is None:
+        scales = [0]  # standard mtmfs point-deconvolution (matches ALMA cont)
+
+    recovered = unit.recovered_params
+
+    params = {
+        # Vis inputs (parallel to spw/field selections)
+        "vis": unit.vis_tm + unit.vis_sm,
+        "spw": unit.spw_selection,
+        "field": unit.field_selection,
+        "datacolumn": unit.datacolumn,
+        # From recovery (geometry + weighting + masking + threshold)
+        "imagename": imagename,
+        "imsize": recovered.get("imsize", [160, 160]),
+        "cell": recovered.get("cell", ["1.0arcsec"]),
+        "phasecenter": recovered.get("phasecenter", ""),
+        "weighting": recovered.get("weighting", "briggs"),
+        "robust": float(recovered.get("robust", 0.5)),
+        "niter": int(recovered.get("niter", 20000)),
+        "threshold": recovered.get("threshold", "0.0Jy"),
+        "pblimit": float(recovered.get("pblimit", 0.2)),
+        "mosweight": bool(recovered.get("mosweight", True)),
+        "perchanweightdensity": bool(
+            recovered.get("perchanweightdensity", False)
+        ),
+        "usemask": recovered.get("usemask", "auto-multithresh"),
+        "sidelobethreshold": float(recovered.get("sidelobethreshold", 1.25)),
+        "noisethreshold": float(recovered.get("noisethreshold", 5.0)),
+        "lownoisethreshold": float(recovered.get("lownoisethreshold", 2.0)),
+        "negativethreshold": float(recovered.get("negativethreshold", 0.0)),
+        "minbeamfrac": float(recovered.get("minbeamfrac", 0.1)),
+        "growiterations": int(recovered.get("growiterations", 75)),
+        # Overridable
+        "scales": scales,
+        "parallel": parallel,
+    }
+
+    # Preserve a recovered reference frequency if present (helps the mtmfs
+    # spectral-index fit); otherwise tclean picks the band centre.
+    reffreq = recovered.get("reffreq")
+    if reffreq:
+        params["reffreq"] = reffreq
+
+    # Apply fixed continuum overrides (always win)
+    params.update(FIXED_TCLEAN_CONT_PARAMS)
 
     return params
 
@@ -1513,3 +1752,214 @@ def run_tclean_feather_parallel(
 
     log.info("SUCCESS (parallel): %s", canonical_feathered.name)
     return True, "success", str(canonical_feathered)
+
+
+# ---------------------------------------------------------------------------
+# Parallel 12m+7m continuum tclean via mpicasa subprocess
+# ---------------------------------------------------------------------------
+
+def run_tclean_cont_parallel(
+    unit: ImagingUnit,
+    output_dir: Path,
+    row_id: int,
+    nproc: int = 4,
+    casa_path: Optional[str] = None,
+    scales: Optional[list[int]] = None,
+    dry_run: bool = False,
+    *,
+    work_dir: Optional[Path] = None,
+    publish_policy: str = "overwrite",
+    log_path: Optional[Path] = None,
+    extra_env: Optional[dict] = None,
+    aux_products: tuple[str, ...] = ("mask", "residual", "pb"),
+    on_publish_start=lambda: None,
+    coverage_threshold: float = DEFAULT_CONT_COVERAGE_THRESHOLD,
+) -> tuple[bool, str, Optional[str]]:
+    """Execute 12m+7m continuum tclean (mtmfs) via mpicasa subprocess.
+
+    Continuum analogue of :func:`run_tclean_feather_parallel`: no TP / feather,
+    and the per-MS spw remap happens in :func:`run_continuum_trusted_preflight`.
+    The CASA work is delegated to ``panta_rei/casa/tclean_cont.py``.
+
+    Returns ``(success, message, canonical_tt0_fits_path)`` — the tt0 pbcor
+    image is the continuum science product.
+    """
+    import subprocess
+
+    from panta_rei.imaging.matching import (
+        build_cont_output_path,
+        continuum_freq_bounds_hz,
+    )
+
+    if scales is None:
+        scales = [0]
+
+    if not casa_path:
+        return False, "CASA_PATH not configured — required for --parallel", None
+
+    casa_bin = Path(casa_path) / "bin"
+    mpicasa = casa_bin / "mpicasa"
+    casa = casa_bin / "casa"
+    if not mpicasa.exists():
+        return False, f"mpicasa not found at {mpicasa}", None
+    if not casa.exists():
+        return False, f"casa not found at {casa}", None
+
+    # 1. Trusted preflight (resolves per-MS spw remap, field, datacolumn)
+    ok, msg = run_continuum_trusted_preflight(unit, coverage_threshold)
+    if not ok:
+        return False, f"Continuum preflight failed: {msg}", None
+
+    # 2. Output frequency label from the recovered selected GHz ranges
+    bounds = continuum_freq_bounds_hz(unit.recovered_params)
+    if bounds is None:
+        return False, "Cannot derive continuum frequency bounds from selection", None
+    freq_min, freq_max = bounds
+
+    # 3. Canonical output paths (.cont. infix; tt0/tt1/alpha + aux)
+    canonical_tt0 = build_cont_output_path(
+        output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max, "tt0",
+    )
+    canonical_tt1 = build_cont_output_path(
+        output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max, "tt1",
+    )
+    canonical_alpha = build_cont_output_path(
+        output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max, "alpha",
+    )
+    canonical_aux: dict[str, str] = {
+        kind: str(build_cont_output_path(
+            output_dir, unit.gous_uid, unit.source_name,
+            freq_min, freq_max, kind,
+        ))
+        for kind in aux_products
+    }
+
+    if dry_run:
+        log.info("[DRY] Would run parallel continuum tclean → %s", canonical_tt0.name)
+        return True, "dry-run", str(canonical_tt0)
+
+    # 4. Per-run work directory (CASA scratch on /raid/, publish to NAS)
+    work_root = Path(work_dir) if work_dir is not None else output_dir
+    run_dir = work_root / "runs" / str(row_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    imagename = str(run_dir / canonical_tt0.stem.replace(".pbcor", ""))
+
+    # 5. Build continuum tclean params (parallel set by the CASA script)
+    params = build_tclean_cont_params(
+        unit, imagename=imagename, scales=scales, parallel=True,
+    )
+
+    # 6. Write job spec JSON
+    job_json_path = run_dir / "job.json"
+    job_spec = {
+        "method": "tclean_cont",
+        "params": {k: (str(v) if isinstance(v, Path) else v) for k, v in params.items()},
+        "unit": {
+            "gous_uid": unit.gous_uid,
+            "source_name": unit.source_name,
+            "line_group": unit.line_group,
+            "spw_id": unit.spw_id,
+            "params_id": unit.params_id,
+            "product_type": unit.product_type,
+            "vis_tm": unit.vis_tm,
+            "vis_sm": unit.vis_sm,
+            "mous_uids_tm": unit.mous_uids_tm,
+            "mous_uids_sm": unit.mous_uids_sm,
+        },
+        "overrides": {
+            "scales": scales,
+            "parallel": True,
+            "nproc": nproc,
+        },
+        "canonical_paths": {
+            "tt0": str(canonical_tt0),
+            "tt1": str(canonical_tt1),
+            "alpha": str(canonical_alpha),
+            "aux": canonical_aux,
+        },
+        "aux_products": list(aux_products),
+        "run_dir": str(run_dir),
+        "casa_version": "unknown",
+    }
+    job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
+    log.info("Wrote job spec: %s", job_json_path)
+
+    # 7. Locate the checked-in continuum CASA script
+    script_path = Path(__file__).resolve().parent.parent / "casa" / "tclean_cont.py"
+    if not script_path.exists():
+        return False, f"CASA script not found: {script_path}", None
+
+    # 8. Launch via mpicasa
+    cmd = [
+        str(mpicasa), "-n", str(nproc),
+        str(casa), "--nologger", "--nogui",
+        "-c", str(script_path), str(job_json_path),
+    ]
+    log.info("Launching: %s", " ".join(cmd))
+
+    merged_env = os.environ.copy()
+    merged_env.setdefault("OMP_NUM_THREADS", "1")
+    merged_env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    merged_env.setdefault("MKL_NUM_THREADS", "1")
+    if extra_env:
+        merged_env.update({k: str(v) for k, v in extra_env.items()})
+
+    if log_path is not None:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as logfp:
+            result = subprocess.run(
+                cmd, stdout=logfp, stderr=subprocess.STDOUT,
+                cwd=str(run_dir), env=merged_env,
+            )
+        tail_str = _tail_text(log_path, max_lines=200)
+    else:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=str(run_dir), env=merged_env,
+        )
+        tail_str = (result.stderr or "")[-2000:]
+
+    if result.returncode != 0:
+        log.error("mpicasa output tail:\n%s", tail_str[-2000:])
+        return False, f"mpicasa exited with code {result.returncode}: {tail_str[-500:]}", None
+
+    # 9. Parse result JSON
+    result_json_path = run_dir / "result.json"
+    if not result_json_path.exists():
+        return False, "CASA script did not write result.json", None
+    casa_result = json.loads(result_json_path.read_text())
+    if not casa_result.get("success"):
+        return False, casa_result.get("error_message", "unknown error"), None
+
+    # 10. Atomic publish — tt0 (science) is mandatory; tt1/alpha/aux are
+    # best-effort but published in the same transaction for coherent rollback.
+    local_tt0 = casa_result.get("tt0_fits")
+    if not (local_tt0 and Path(local_tt0).exists()):
+        return False, "Continuum tt0 FITS not produced by CASA script", None
+
+    pair = [(local_tt0, str(canonical_tt0))]
+    for key, canonical in (
+        ("tt1_fits", str(canonical_tt1)),
+        ("alpha_fits", str(canonical_alpha)),
+    ):
+        local = casa_result.get(key)
+        if local and Path(local).exists():
+            pair.append((local, canonical))
+    for kind, local_aux in (casa_result.get("aux_fits") or {}).items():
+        if not local_aux or not Path(local_aux).exists():
+            log.warning("aux %s: missing local FITS, skipping publish", kind)
+            continue
+        canonical = canonical_aux.get(kind)
+        if canonical:
+            pair.append((local_aux, canonical))
+
+    on_publish_start()
+
+    ok, msg = _publish_pair(pair, policy=publish_policy)
+    if not ok:
+        return False, msg, None
+
+    log.info("SUCCESS (continuum): %s", canonical_tt0.name)
+    return True, "success", str(canonical_tt0)

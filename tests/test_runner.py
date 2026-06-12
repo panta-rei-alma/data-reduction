@@ -12,13 +12,17 @@ import pytest
 from panta_rei.imaging.matching import ImagingUnit
 from panta_rei.imaging.runner import (
     FIXED_PARAMS,
+    FIXED_TCLEAN_CONT_PARAMS,
     FIXED_TCLEAN_PARAMS,
     _publish,
     _publish_pair,
     build_sdintimaging_params,
+    build_tclean_cont_params,
     build_tclean_params,
     cleanup_intermediates,
     get_casa_version,
+    resolve_continuum_spw_for_ms,
+    run_continuum_trusted_preflight,
     run_sdintimaging,
     run_tclean_feather,
     run_tclean_feather_parallel,
@@ -1014,3 +1018,161 @@ class TestPublishPair:
         assert a_dst.read_text() == "A_NEW"
         assert b_dst.read_text() == "B_NEW"
         assert not list(a_dst.parent.glob("*.bak.*"))
+
+
+# ---------------------------------------------------------------------------
+# Continuum: params, per-MS spw remap, trusted preflight
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def cont_unit():
+    """A minimal continuum ImagingUnit (product_type='cont')."""
+    return ImagingUnit(
+        gous_uid="X3833_X64b9",
+        source_name="SRC1",
+        line_group="N2H+",
+        spw_id="cont",
+        params_id=1,
+        product_type="cont",
+        recovered_params={
+            "spw": ["23:86.0~86.2GHz,25:87.0~87.2GHz"],
+            "imsize": [160, 160],
+            "cell": ["1.9arcsec"],
+            "phasecenter": "ICRS 17:01:55.4 -041.09.30",
+            "weighting": "briggs",
+            "robust": 0.5,
+            "niter": 20000,
+            "threshold": "0.00311Jy",
+            "mosweight": True,
+            "perchanweightdensity": False,
+            "usemask": "auto-multithresh",
+        },
+        vis_tm=["/data/tm1.ms", "/data/tm2.ms"],
+        vis_sm=["/data/sm1.ms"],
+        mous_uids_tm=["m1"],
+        mous_uids_sm=["m2"],
+        ready=True,
+    )
+
+
+def _cont_casatools(spws, chanfreqs_map, has_corrected=True):
+    """Build a mock casatools with msmetadata + table for continuum tests."""
+    import numpy as np
+    mock = MagicMock()
+    msmd = MagicMock()
+    msmd.spwsforintent.return_value = np.array(spws)
+    msmd.chanfreqs.side_effect = lambda s: chanfreqs_map.get(s, np.array([]))
+    msmd.fieldsforname.return_value = [0]
+    mock.msmetadata.return_value = msmd
+    tb = MagicMock()
+    cols = ["DATA", "FLAG"] + (["CORRECTED_DATA"] if has_corrected else [])
+    tb.colnames.return_value = cols
+    mock.table.return_value = tb
+    return mock
+
+
+class TestBuildContParams:
+    def test_fixed_continuum_overrides(self, cont_unit):
+        cont_unit.spw_selection = ["10:86.0~86.2GHz", "10:86.0~86.2GHz", "5:..."]
+        cont_unit.field_selection = ["SRC1", "SRC1", "SRC1"]
+        cont_unit.datacolumn = "corrected"
+        p = build_tclean_cont_params(cont_unit, imagename="/out/test")
+        assert p["specmode"] == "mfs"
+        assert p["gridder"] == "mosaic"
+        assert p["deconvolver"] == "mtmfs"
+        assert p["nterms"] == 2
+        assert p["pbcor"] is True
+        assert p["stokes"] == "I"
+        assert p["restoringbeam"] == "common"
+
+    def test_vis_and_recovered_geometry(self, cont_unit):
+        p = build_tclean_cont_params(cont_unit, imagename="/out/test")
+        assert p["vis"] == ["/data/tm1.ms", "/data/tm2.ms", "/data/sm1.ms"]
+        assert p["imsize"] == [160, 160]
+        assert p["cell"] == ["1.9arcsec"]
+        assert p["mosweight"] is True
+
+    def test_overrides_cannot_beat_fixed(self, cont_unit):
+        cont_unit.recovered_params["deconvolver"] = "hogbom"
+        cont_unit.recovered_params["specmode"] = "cube"
+        p = build_tclean_cont_params(cont_unit, imagename="/out/test")
+        assert p["deconvolver"] == "mtmfs"
+        assert p["specmode"] == "mfs"
+
+    def test_scales_default_and_override(self, cont_unit):
+        assert build_tclean_cont_params(cont_unit, "/o")["scales"] == [0]
+        assert build_tclean_cont_params(
+            cont_unit, "/o", scales=[0, 5, 10]
+        )["scales"] == [0, 5, 10]
+
+
+class TestResolveContinuumSpwForMs:
+    def test_remaps_to_local_spw_ids(self):
+        import numpy as np
+        # MS spw 10 covers 86 GHz, spw 12 covers 87 GHz (different ids than
+        # the recovered 23/25).
+        casatools = _cont_casatools(
+            [10, 12],
+            {
+                10: np.linspace(85.9e9, 86.3e9, 960),
+                12: np.linspace(86.9e9, 87.3e9, 960),
+            },
+        )
+        selection = {"23": [(86.0e9, 86.2e9)], "25": [(87.0e9, 87.2e9)]}
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            spw_str, retained = resolve_continuum_spw_for_ms("/data/x.ms", selection)
+        assert spw_str.startswith("10:") and ",12:" in spw_str
+        assert retained == pytest.approx(0.4e9, rel=1e-3)
+
+    def test_no_coverage_returns_empty(self):
+        import numpy as np
+        casatools = _cont_casatools([10], {10: np.linspace(200e9, 200.4e9, 960)})
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            spw_str, retained = resolve_continuum_spw_for_ms(
+                "/data/x.ms", {"23": [(86.0e9, 86.2e9)]}
+            )
+        assert spw_str == "" and retained == 0.0
+
+
+class TestRunContinuumTrustedPreflight:
+    def _full_coverage(self):
+        import numpy as np
+        return _cont_casatools(
+            [10, 12],
+            {
+                10: np.linspace(85.9e9, 86.3e9, 960),
+                12: np.linspace(86.9e9, 87.3e9, 960),
+            },
+        )
+
+    def test_populates_selections(self, cont_unit):
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=self._full_coverage()):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        assert len(cont_unit.spw_selection) == 3   # 2 TM + 1 SM
+        assert len(cont_unit.field_selection) == 3
+        assert cont_unit.datacolumn == "corrected"
+
+    def test_datacolumn_falls_back_to_data(self, cont_unit):
+        import numpy as np
+        casatools = _cont_casatools(
+            [10, 12],
+            {10: np.linspace(85.9e9, 86.3e9, 960),
+             12: np.linspace(86.9e9, 87.3e9, 960)},
+            has_corrected=False,
+        )
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        assert cont_unit.datacolumn == "data"
+
+    def test_hard_fail_below_coverage_threshold(self, cont_unit):
+        import numpy as np
+        # Each MS covers ONLY the 86 GHz range (spw 23), missing 87 GHz (spw
+        # 25) → retains 0.2/0.4 = 0.5 < 0.8 threshold.
+        casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.3e9, 960)})
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert not ok
+        assert "coverage" in msg
