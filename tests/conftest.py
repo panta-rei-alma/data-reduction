@@ -114,6 +114,8 @@ def imaging_tree(tmp_path):
     tm_working = tm_member / "calibrated" / "working"
     tm_working.mkdir(parents=True)
     (tm_working / "uid___A001_X3833_X64bc_targets_line.ms").mkdir()
+    # Continuum (non-contsub) split lives alongside the line split.
+    (tm_working / "uid___A001_X3833_X64bc_targets.ms").mkdir()
 
     # SM member with calibrated MS
     sm_member = (
@@ -124,6 +126,7 @@ def imaging_tree(tmp_path):
     sm_working = sm_member / "calibrated" / "working"
     sm_working.mkdir(parents=True)
     (sm_working / "uid___A001_X3833_X64bd_targets_line.ms").mkdir()
+    (sm_working / "uid___A001_X3833_X64bd_targets.ms").mkdir()
 
     # TP member with product cube
     tp_member = (

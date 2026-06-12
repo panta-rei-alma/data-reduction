@@ -11,10 +11,15 @@ from panta_rei.imaging.matching import (
     TargetGroup,
     _compute_tm_freq_range,
     _parse_freq_quantity,
+    build_continuum_units_advisory,
+    build_cont_output_path,
     build_output_path,
+    continuum_freq_bounds_hz,
+    find_continuum_ms,
     get_freq_range_string,
     load_targets_csv,
     match_cubes_by_frequency,
+    parse_continuum_spw_selection,
     sanitize_source_name,
     sanitize_source_name_for_glob,
     targets_by_array,
@@ -435,3 +440,121 @@ class TestFindMsFilesDiagnostic:
         result = find_ms_files(imaging_tree["data_dir"], "X9999_X9999")
         assert not result
         assert "not available on disk" in result.missing_reason
+
+
+# ---------------------------------------------------------------------------
+# Continuum: MS discovery, spw parsing, freq bounds, output paths, units
+# ---------------------------------------------------------------------------
+
+class TestFindContinuumMS:
+    def test_finds_targets_ms_not_line(self, imaging_tree):
+        result = find_continuum_ms(imaging_tree["data_dir"], "X3833_X64bc")
+        assert result
+        names = [p.name for p in result.ms_files]
+        assert names == ["uid___A001_X3833_X64bc_targets.ms"]
+        # never returns the contsub line split
+        assert all(not n.endswith("_targets_line.ms") for n in names)
+
+    def test_member_missing(self, imaging_tree):
+        result = find_continuum_ms(imaging_tree["data_dir"], "X9999_X9999")
+        assert not result
+        assert "not available on disk" in result.missing_reason
+
+
+class TestParseContinuumSpwSelection:
+    def test_parses_list_with_multiple_spws_and_ranges(self):
+        sel = parse_continuum_spw_selection(
+            ["24:86.0~86.1GHz;86.2~86.3GHz,26:90.0~90.2GHz"]
+        )
+        assert set(sel) == {"24", "26"}
+        assert sel["24"] == [(86.0e9, 86.1e9), (86.2e9, 86.3e9)]
+        assert sel["26"] == [(90.0e9, 90.2e9)]
+
+    def test_bare_string_and_whitespace_tolerant(self):
+        sel = parse_continuum_spw_selection("24:86.0~86.1GHz ,  26:90.0~90.2GHz")
+        assert set(sel) == {"24", "26"}
+
+    def test_empty(self):
+        assert parse_continuum_spw_selection([]) == {}
+        assert parse_continuum_spw_selection("") == {}
+
+
+class TestContinuumFreqBounds:
+    def test_min_max_across_ranges(self):
+        params = {"spw": ["24:86.0~86.1GHz;86.2~86.35GHz,26:90.0~90.2GHz"]}
+        lo, hi = continuum_freq_bounds_hz(params)
+        assert lo == 86.0e9
+        assert hi == 90.2e9
+
+    def test_none_when_no_selection(self):
+        assert continuum_freq_bounds_hz({"spw": []}) is None
+
+
+class TestBuildContOutputPath:
+    def test_science_tt0_in_canonical_dir(self):
+        p = build_cont_output_path(
+            Path("/out"), "X3833_X64b9", "SRC1", 86.0e9, 90.2e9, "tt0"
+        )
+        assert "/aux/" not in str(p)
+        assert p.name == (
+            "group.uid___A001_X3833_X64b9.lp_nperetto.SRC1.12m7m."
+            "86.0-90.2GHz.cont.pbcor.fits"
+        )
+
+    def test_tt1_and_alpha_in_canonical_dir(self):
+        tt1 = build_cont_output_path(
+            Path("/out"), "X3833_X64b9", "SRC1", 86.0e9, 90.2e9, "tt1"
+        )
+        alpha = build_cont_output_path(
+            Path("/out"), "X3833_X64b9", "SRC1", 86.0e9, 90.2e9, "alpha"
+        )
+        assert tt1.name.endswith(".cont.tt1.pbcor.fits")
+        assert alpha.name.endswith(".cont.alpha.fits")
+        assert "/aux/" not in str(tt1) and "/aux/" not in str(alpha)
+
+    def test_aux_products_under_aux_dir(self):
+        for kind in ("mask", "residual", "pb"):
+            p = build_cont_output_path(
+                Path("/out"), "X3833_X64b9", "SRC1", 86.0e9, 90.2e9, kind
+            )
+            assert "/aux/" in str(p)
+            assert p.name.endswith(f".cont.{kind}.fits")
+
+    def test_unknown_product_raises(self):
+        with pytest.raises(ValueError):
+            build_cont_output_path(
+                Path("/out"), "G", "SRC1", 86.0e9, 90.2e9, "bogus"
+            )
+
+
+class TestBuildContinuumUnitsAdvisory:
+    def test_builds_ready_unit_no_tp(self, imaging_tree, tmp_path):
+        import json
+
+        json_path = tmp_path / "cont.json"
+        json_path.write_text(json.dumps({
+            "spw": ["23:86.0~86.1GHz,25:87.0~87.1GHz"],
+            "imsize": [100, 100], "cell": ["0.5arcsec"],
+            "specmode": "mfs", "gridder": "mosaic", "datacolumn": "data",
+        }))
+        row = {
+            "id": 1,
+            "gous_uid": imaging_tree["gous_id"],
+            "source_name": "SRC1",
+            "line_group": "N2H+",
+            "spw_id": "cont",
+            "mous_uids_tm": json.dumps([imaging_tree["mous_id_tm"]]),
+            "params_json_path": str(json_path),
+        }
+        targets = load_targets_csv(imaging_tree["csv_path"])
+        units = build_continuum_units_advisory(
+            [row], targets, imaging_tree["data_dir"]
+        )
+        assert len(units) == 1
+        u = units[0]
+        assert u.ready, u.skip_reason
+        assert u.product_type == "cont"
+        assert u.spw_id == "cont"
+        assert u.sdimage is None  # no TP / feather
+        assert len(u.vis_tm) == 1 and u.vis_tm[0].endswith("_targets.ms")
+        assert len(u.vis_sm) == 1 and u.vis_sm[0].endswith("_targets.ms")
