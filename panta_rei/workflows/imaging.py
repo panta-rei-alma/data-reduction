@@ -218,7 +218,8 @@ class RecoverParamsStep(Step):
                     divergence = keyset_error
                     if divergence is None:
                         divergence = _check_param_divergence(
-                            field_name, spw_id, all_mous_results
+                            field_name, spw_id, all_mous_results,
+                            product_type=opts.product_type,
                         )
 
                     # Get params from canonical if available, else first MOUS that has it
@@ -698,6 +699,16 @@ _DIVERGENCE_KEYS = [
     "outframe", "veltype", "weighting", "robust", "niter", "threshold",
 ]
 
+# Continuum has no start/width/nchan (mfs); the load-bearing param is the
+# line-free ``spw`` selection (must match across the TM MOUSs being combined),
+# plus the continuum-specific weighting/masking knobs.
+_CONT_DIVERGENCE_KEYS = [
+    "spw", "imsize", "cell", "phasecenter", "weighting", "robust", "threshold",
+    "mosweight", "pblimit", "perchanweightdensity", "usemask",
+    "sidelobethreshold", "noisethreshold", "lownoisethreshold",
+    "negativethreshold", "minbeamfrac",
+]
+
 # Relative tolerance for float comparisons
 _FLOAT_RTOL = 1e-6
 
@@ -731,10 +742,13 @@ def _check_param_divergence(
     field_name: str,
     spw_id: str,
     all_mous_results: dict[str, dict[tuple[str, str], dict]],
+    product_type: str = "line",
 ) -> Optional[str]:
     """Compare recovered params for (field, spw) across TM MOUSs.
 
     Returns an error message describing the divergence, or None if they match.
+    Continuum compares the line-free ``spw`` selection + continuum knobs
+    instead of the cube start/width/nchan grid.
     """
     key = (field_name, spw_id)
     mous_params: list[tuple[str, dict]] = []
@@ -745,9 +759,10 @@ def _check_param_divergence(
     if len(mous_params) <= 1:
         return None  # Only one MOUS — no divergence possible
 
+    keys = _CONT_DIVERGENCE_KEYS if product_type == "cont" else _DIVERGENCE_KEYS
     _, reference = mous_params[0]
     for mous_id, params in mous_params[1:]:
-        for k in _DIVERGENCE_KEYS:
+        for k in keys:
             ref_val = reference.get(k)
             cur_val = params.get(k)
             if not _values_match(ref_val, cur_val):

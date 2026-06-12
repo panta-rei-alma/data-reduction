@@ -138,6 +138,17 @@ def main() -> int:
     setup_logging()
     args = _build_parser().parse_args()
 
+    # Continuum imaging runs only through the distributed dispatcher
+    # (panta-rei-continuum-dispatch); this single-host CLI supports continuum
+    # for the recover step only.  Guard against a silently-wrong run rather
+    # than imaging line rows / doing nothing.
+    if args.product_type == "cont" and args.step not in ("recover",):
+        log.error(
+            "--product-type cont is only supported with --step recover here; "
+            "run continuum imaging via panta-rei-continuum-dispatch."
+        )
+        return 2
+
     base_dir = Path(args.base_dir).resolve()
 
     # DB resolution: --db flag > IMAGING_DB from .env > <base-dir>/imaging.sqlite3

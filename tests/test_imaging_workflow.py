@@ -202,6 +202,22 @@ class TestRecoverParamsStep:
         assert result.success
         assert result.items_processed == 0
 
+    def test_continuum_divergence_on_differing_spw_selection(self):
+        from panta_rei.workflows.imaging import _check_param_divergence
+        # Two TM MOUSs with DIFFERENT line-free spw selections for the same
+        # (field, 'cont') → continuum recovery must flag divergence.
+        results = {
+            "m1": {("SRC1", "cont"): {"spw": ["23:86.0~86.2GHz"], "imsize": [160, 160]}},
+            "m2": {("SRC1", "cont"): {"spw": ["23:86.0~86.1GHz"], "imsize": [160, 160]}},
+        }
+        msg = _check_param_divergence("SRC1", "cont", results, product_type="cont")
+        assert msg is not None and "spw" in msg
+        # The same selections do NOT diverge.
+        results["m2"]["SRC1", "cont"]["spw"] = ["23:86.0~86.2GHz"]
+        assert _check_param_divergence(
+            "SRC1", "cont", results, product_type="cont"
+        ) is None
+
     def test_recovers_continuum_isolated_from_line(self, imaging_ctx, imaging_tree):
         """Continuum recovery stores spw_id='cont'/product_type='cont' rows, and
         the default (line) selection never sees them (Codex line-isolation)."""

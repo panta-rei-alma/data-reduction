@@ -268,6 +268,21 @@ and all should-fix (#1 explicit datacolumn, #2 mtmfs-branch, #3 recovery fidelit
 Nice-to-haves adopted: thin continuum CLI (§4.10), dry-run remap report (§4.11),
 cont.dat audit (§4.5).
 
+## 9. Codex post-implementation review — incorporated 2026-06-12
+Reviewed the committed Phase-1 diff. Confirmed correct: CASA mtmfs product names
++ job/result contract, datacolumn logic, parallel vis/spw/field ordering, migration
+v17 id-preservation, .cont. output naming. Fixes applied:
+- BLOCKING (coverage): replaced best-EB coverage with per-array UNION coverage +
+  per-range zero-coverage hard-fail (the best-EB metric falsely failed valid
+  split-coverage across sibling EBs); kept partial EBs (correct uv-combination).
+- should-fix: merge ranges landing in one local spw (no double-count); half-channel
+  edge tolerance on spw bounds; product_type-aware divergence keys (continuum
+  compares the line-free `spw` selection); guard `panta-rei-imaging --product-type
+  cont` to the recover step only (continuum imaging is distributed-only).
+- DEFERRED nice-to-have: the standalone dry-run remap report (dispatch.py) — the
+  remap needs casatools which the coordinator dry-run doesn't load; the worker-side
+  preflight already logs per-MS remap + coverage and hard-fails. Revisit if needed.
+
 ## 7. Decisions (user-confirmed 2026-06-12)
 1. **Scope: both, phased.** Phase 1 per-setup, Phase 2 combined (cross-GOUS). ✅
 2. **Naming: `.cont.` infix** on the `12m7m` token

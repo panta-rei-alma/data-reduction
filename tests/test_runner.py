@@ -1120,18 +1120,46 @@ class TestResolveContinuumSpwForMs:
         )
         selection = {"23": [(86.0e9, 86.2e9)], "25": [(87.0e9, 87.2e9)]}
         with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            spw_str, retained = resolve_continuum_spw_for_ms("/data/x.ms", selection)
+            spw_str, covered = resolve_continuum_spw_for_ms("/data/x.ms", selection)
         assert spw_str.startswith("10:") and ",12:" in spw_str
-        assert retained == pytest.approx(0.4e9, rel=1e-3)
+        assert sum(hi - lo for lo, hi in covered) == pytest.approx(0.4e9, rel=1e-3)
+
+    def test_overlapping_ranges_to_one_spw_merged_not_doublecounted(self):
+        import numpy as np
+        # Two overlapping recovered ranges both land in spw 10 → must merge to
+        # a single interval (no double-count of the overlap).
+        casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.5e9, 960)})
+        selection = {"23": [(86.0e9, 86.2e9), (86.1e9, 86.3e9)]}
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            spw_str, covered = resolve_continuum_spw_for_ms("/data/x.ms", selection)
+        assert spw_str.count(";") == 0  # merged into one range
+        assert sum(hi - lo for lo, hi in covered) == pytest.approx(0.3e9, rel=1e-3)
 
     def test_no_coverage_returns_empty(self):
         import numpy as np
         casatools = _cont_casatools([10], {10: np.linspace(200e9, 200.4e9, 960)})
         with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
-            spw_str, retained = resolve_continuum_spw_for_ms(
+            spw_str, covered = resolve_continuum_spw_for_ms(
                 "/data/x.ms", {"23": [(86.0e9, 86.2e9)]}
             )
-        assert spw_str == "" and retained == 0.0
+        assert spw_str == "" and covered == []
+
+
+def _cont_casatools_paths(per_spws, per_freqs, has_corrected=True):
+    """Path-aware mock: each MS basename reports its own spws/chanfreqs."""
+    import numpy as np
+    mock = MagicMock()
+    msmd = MagicMock()
+    state = {"cur": None}
+    msmd.open.side_effect = lambda p: state.update(cur=Path(p).name)
+    msmd.spwsforintent.side_effect = lambda _: np.array(per_spws[state["cur"]])
+    msmd.chanfreqs.side_effect = lambda s: per_freqs[state["cur"]].get(s, np.array([]))
+    msmd.fieldsforname.return_value = [0]
+    mock.msmetadata.return_value = msmd
+    tb = MagicMock()
+    tb.colnames.return_value = ["DATA", "FLAG"] + (["CORRECTED_DATA"] if has_corrected else [])
+    mock.table.return_value = tb
+    return mock
 
 
 class TestRunContinuumTrustedPreflight:
@@ -1170,9 +1198,29 @@ class TestRunContinuumTrustedPreflight:
     def test_hard_fail_below_coverage_threshold(self, cont_unit):
         import numpy as np
         # Each MS covers ONLY the 86 GHz range (spw 23), missing 87 GHz (spw
-        # 25) → retains 0.2/0.4 = 0.5 < 0.8 threshold.
+        # 25) entirely → coverage gap → hard fail.
         casatools = _cont_casatools([10], {10: np.linspace(85.9e9, 86.3e9, 960)})
         with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
             ok, msg = run_continuum_trusted_preflight(cont_unit)
         assert not ok
         assert "coverage" in msg
+
+    def test_union_across_sibling_ebs_passes(self, cont_unit):
+        """Split coverage across sibling EBs must be recognised via the UNION
+        (the old best-EB metric falsely failed this)."""
+        import numpy as np
+        # tm1 covers only 86 GHz, tm2 only 87 GHz → TM union is full. sm1 full.
+        per_spws = {"tm1.ms": [10], "tm2.ms": [12], "sm1.ms": [10, 12]}
+        full10 = np.linspace(85.9e9, 86.3e9, 960)
+        full12 = np.linspace(86.9e9, 87.3e9, 960)
+        per_freqs = {
+            "tm1.ms": {10: full10},
+            "tm2.ms": {12: full12},
+            "sm1.ms": {10: full10, 12: full12},
+        }
+        casatools = _cont_casatools_paths(per_spws, per_freqs)
+        with patch("panta_rei.imaging.runner._ensure_casatools", return_value=casatools):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        # Both partial TM EBs are kept (each contributes its half).
+        assert len(cont_unit.vis_tm) == 2
