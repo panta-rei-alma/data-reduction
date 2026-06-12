@@ -508,6 +508,17 @@ def test_serialise_unit_round_trip():
     assert d["vis_tm"] == ["/nas/a.ms"]
     assert d["sdimage"] == "/nas/tp.fits"
     assert d["spw_selection"] == ["23"]
+    # product_type defaults to 'line' and round-trips through the manifest.
+    assert d["product_type"] == "line"
+
+
+def test_serialise_unit_carries_continuum_product_type():
+    u = ImagingUnit(
+        gous_uid="G", source_name="S", line_group="LG", spw_id="cont",
+        params_id=7, product_type="cont", vis_tm=["/nas/a.ms"],
+        vis_sm=["/nas/b.ms"], ready=True,
+    )
+    assert D.serialise_unit(u)["product_type"] == "cont"
 
 
 def test_union_inputs_for_gous_dedups():

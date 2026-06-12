@@ -29,6 +29,7 @@ from panta_rei.db.models import (
 )
 from panta_rei.imaging.matching import (
     ImagingUnit,
+    build_continuum_units_advisory,
     build_imaging_units_advisory,
     load_targets_csv,
 )
@@ -50,6 +51,7 @@ class SelectionFilters:
     scales: list[int] = None  # type: ignore[assignment]
     re_run: bool = False
     exclude_active: bool = False
+    product_type: str = "line"  # 'line' (cube) or 'cont' (continuum)
 
 
 @dataclass
@@ -87,7 +89,9 @@ def select_units_to_image(
     targets = load_targets_csv(targets_csv)
 
     with db_manager.connect() as con:
-        all_params = ImagingParamsQueries.get_all_recovered(con)
+        all_params = ImagingParamsQueries.get_all_recovered(
+            con, product_type=filters.product_type
+        )
 
     if not all_params:
         return SelectionResult(
@@ -119,7 +123,10 @@ def select_units_to_image(
             continue
         filtered.append(row)
 
-    units = build_imaging_units_advisory(filtered, targets, data_dir)
+    if filters.product_type == "cont":
+        units = build_continuum_units_advisory(filtered, targets, data_dir)
+    else:
+        units = build_imaging_units_advisory(filtered, targets, data_dir)
     ready_units = [u for u in units if u.ready]
     not_ready = [u for u in units if not u.ready]
 

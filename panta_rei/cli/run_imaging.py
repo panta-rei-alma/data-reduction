@@ -115,6 +115,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Imaging method (default: tclean_feather)",
     )
     ap.add_argument(
+        "--product-type",
+        choices=["line", "cont"],
+        default="line",
+        help="'line' = spectral-line cube params (default); 'cont' = "
+             "aggregate-continuum params. Mainly used with --step recover; "
+             "continuum imaging itself runs via panta-rei-continuum-dispatch.",
+    )
+    ap.add_argument(
         "--parallel", action="store_true",
         help="Enable MPI parallelization for tclean via mpicasa (requires CASA_PATH)",
     )
@@ -196,6 +204,7 @@ def main() -> int:
         keep_intermediates=args.keep_intermediates,
         parallel=args.parallel,
         nproc=args.nproc,
+        product_type=args.product_type,
     )
 
     ctx = WorkflowContext(

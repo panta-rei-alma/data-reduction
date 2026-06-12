@@ -1010,6 +1010,7 @@ def serialise_unit(u: ImagingUnit) -> dict:
         "line_group": u.line_group,
         "spw_id": u.spw_id,
         "params_id": u.params_id,
+        "product_type": u.product_type,
         "recovered_params": u.recovered_params,
         "vis_tm": list(u.vis_tm),
         "vis_sm": list(u.vis_sm),
@@ -2078,22 +2079,39 @@ class MachineSlot(threading.Thread):
         c = self.ctx
         machine = self.machine.name
 
-        # 1. Allocate run_id (insert QUEUED row)
+        # 1. Allocate run_id (insert QUEUED row).  Continuum and line derive
+        #    the canonical FITS path / method differently (Codex: branch the
+        #    output-path calc on product_type, do not assume the line path).
         from panta_rei.imaging.runner import get_casa_version
-        from panta_rei.imaging.matching import (
-            _compute_tm_freq_range, build_output_path,
-        )
+
         recovered = unit.recovered_params or {}
-        tm_freq = _compute_tm_freq_range(
-            recovered.get("start", ""),
-            recovered.get("width", ""),
-            recovered.get("nchan"),
-        )
-        freq_min = tm_freq[0] if tm_freq else (unit.tp_freq_min or 0)
-        freq_max = tm_freq[1] if tm_freq else (unit.tp_freq_max or 0)
-        canonical_fits = build_output_path(
-            c.publish_dir, unit.gous_uid, unit.source_name, freq_min, freq_max,
-        )
+        if unit.product_type == "cont":
+            from panta_rei.imaging.matching import (
+                build_cont_output_path, continuum_freq_bounds_hz,
+            )
+            bounds = continuum_freq_bounds_hz(recovered)
+            freq_min, freq_max = bounds if bounds else (0, 0)
+            canonical_fits = build_cont_output_path(
+                c.publish_dir, unit.gous_uid, unit.source_name,
+                freq_min, freq_max, "tt0",
+            )
+            method = "tclean_cont"
+        else:
+            from panta_rei.imaging.matching import (
+                _compute_tm_freq_range, build_output_path,
+            )
+            tm_freq = _compute_tm_freq_range(
+                recovered.get("start", ""),
+                recovered.get("width", ""),
+                recovered.get("nchan"),
+            )
+            freq_min = tm_freq[0] if tm_freq else (unit.tp_freq_min or 0)
+            freq_max = tm_freq[1] if tm_freq else (unit.tp_freq_max or 0)
+            canonical_fits = build_output_path(
+                c.publish_dir, unit.gous_uid, unit.source_name,
+                freq_min, freq_max,
+            )
+            method = "tclean_feather"
         imagename_stem = str(canonical_fits).replace(".pbcor.fits", "")
         scales_str = json.dumps(c.scales)
 
@@ -2120,7 +2138,8 @@ class MachineSlot(threading.Thread):
                 "started_at": now_iso(),
                 "status": ImagingRunStatus.QUEUED,
                 "hostname": machine,
-                "method": "tclean_feather",
+                "method": method,
+                "product_type": unit.product_type,
                 "parallel": 1,
                 "dispatch_id": c.dispatch_id,
             },

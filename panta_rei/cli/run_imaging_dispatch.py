@@ -58,9 +58,15 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Subset of machines.json entries to use")
 
     # Imaging knobs
+    ap.add_argument("--product-type", default="line",
+                    choices=["line", "cont"],
+                    help="'line' = 12m7mTP cube (default); 'cont' = 12m7m "
+                         "continuum (mtmfs). Usually set via the dedicated "
+                         "panta-rei-continuum-dispatch entry point.")
     ap.add_argument("--method", default="tclean_feather",
                     choices=["tclean_feather"],
-                    help="MVP supports tclean_feather only")
+                    help="MVP supports tclean_feather only (continuum forces "
+                         "tclean_cont automatically)")
     ap.add_argument("--deconvolver", default="multiscale")
     ap.add_argument("--scales", default=None,
                     help="JSON list, e.g. '[0,5,10,15,20]'")
@@ -163,17 +169,30 @@ def main(argv=None) -> int:
 
     obs_csv = (Path(args.obs_csv).resolve() if args.obs_csv
                else base_dir / "targets_by_array.csv")
-    scales = json.loads(args.scales) if args.scales else [0, 5, 10, 15, 20]
+
+    # Continuum forces its own method/deconvolver/scale defaults; the runner
+    # always images mtmfs, but these keep the DB record + idempotency key
+    # coherent. Line behaviour is byte-for-byte unchanged.
+    if args.product_type == "cont":
+        method = "tclean_cont"
+        deconvolver = "mtmfs"
+        scales = json.loads(args.scales) if args.scales else [0]
+    else:
+        method = args.method
+        deconvolver = args.deconvolver
+        scales = json.loads(args.scales) if args.scales else [0, 5, 10, 15, 20]
+
     filters = SelectionFilters(
         match=args.match,
         include_sources=args.include_sources,
         include_line_groups=args.include_line_groups,
         limit=args.limit,
-        method=args.method,
-        deconvolver=args.deconvolver,
+        method=method,
+        deconvolver=deconvolver,
         scales=scales,
         re_run=args.re_run,
         exclude_active=True,
+        product_type=args.product_type,
     )
 
     publish_policy = "overwrite" if args.overwrite else "fail_if_exists"
@@ -189,7 +208,7 @@ def main(argv=None) -> int:
         data_dir=data_dir,
         transfer_method=args.transfer_method,
         publish_policy=publish_policy,
-        deconvolver=args.deconvolver,
+        deconvolver=deconvolver,
         scales=scales,
         cli_args=cli_args,
         abandon_prior=args.abandon_prior,

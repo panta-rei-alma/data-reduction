@@ -52,6 +52,43 @@ def _seed_recovered_param(db, **kwargs):
         return ImagingParamsQueries.upsert(con, **defaults)
 
 
+def test_selection_isolates_by_product_type(tmp_path):
+    """Line selection sees only line rows; continuum selection only cont rows,
+    and each feeds the matching builder (Codex line/continuum isolation)."""
+    db = DatabaseManager(":memory:")
+    csv = tmp_path / "targets.csv"
+    csv.write_text("source_name,array,sb_name,sgous_id,gous_id,mous_ids,Line group\n")
+    _seed_recovered_param(db, spw_id="23", product_type="line")
+    _seed_recovered_param(db, spw_id="cont", product_type="cont")
+
+    captured: dict[str, list] = {}
+
+    def fake_cont(rows, targets, data_dir):
+        captured["cont"] = rows
+        return []
+
+    def fake_line(rows, targets, data_dir):
+        captured["line"] = rows
+        return []
+
+    with mock.patch(
+        "panta_rei.imaging.unit_selection.build_continuum_units_advisory", fake_cont
+    ), mock.patch(
+        "panta_rei.imaging.unit_selection.build_imaging_units_advisory", fake_line
+    ):
+        select_units_to_image(
+            db, csv, tmp_path,
+            SelectionFilters(scales=[0], product_type="cont"),
+        )
+        select_units_to_image(
+            db, csv, tmp_path,
+            SelectionFilters(scales=[0, 5], product_type="line"),
+        )
+
+    assert [r["spw_id"] for r in captured["cont"]] == ["cont"]
+    assert [r["spw_id"] for r in captured["line"]] == ["23"]
+
+
 def test_selection_returns_empty_when_no_recovered(tmp_path):
     db = DatabaseManager(":memory:")
     csv = tmp_path / "targets.csv"
