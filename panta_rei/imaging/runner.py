@@ -1680,7 +1680,9 @@ def run_tclean_cont_parallel(
     publish_policy: str = "overwrite",
     log_path: Optional[Path] = None,
     extra_env: Optional[dict] = None,
-    aux_products: tuple[str, ...] = ("mask", "residual", "pb"),
+    aux_products: tuple[str, ...] = (
+        "tt0_image", "tt1_image", "mask", "residual", "pb", "psf",
+    ),
     on_publish_start=lambda: None,
 ) -> tuple[bool, str, Optional[str]]:
     """Execute 12m+7m continuum tclean (mtmfs) via mpicasa subprocess.
@@ -1752,7 +1754,9 @@ def run_tclean_cont_parallel(
     run_dir = work_root / "runs" / str(row_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    imagename = str(run_dir / canonical_tt0.stem.replace(".pbcor", ""))
+    # Base CASA imagename = the canonical name minus the product suffix; tclean
+    # appends .image.tt0.pbcor etc. itself, so it must NOT carry a term token.
+    imagename = str(run_dir / canonical_tt0.name.replace(".tt0.pbcor.fits", ""))
 
     # 5. Build continuum tclean params (parallel set by the CASA script)
     params = build_tclean_cont_params(

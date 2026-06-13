@@ -564,11 +564,39 @@ def build_aux_output_path(
 
 
 # Continuum products.  The joint 12m+7m mtmfs tclean image IS the science
-# product (no feather), so the tt0 pbcor and the spectral-term maps (tt1,
-# alpha) publish to the canonical dir; QA aux (mask/residual/pb) under aux/.
-# The ``.cont.`` infix distinguishes these from the line ``.cube.`` aux.
+# product (no feather), so the pb-corrected term images (tt0, tt1) and the
+# spectral-index map (alpha) publish to the canonical dir; the QA / diagnostic
+# products (flat non-pbcor term images, mask, residual, pb, psf) go under aux/.
+# The ``.cont.`` infix distinguishes these from the line ``.cube.`` products.
+#
+# Filename map (suffix after ``...12m7m.{freq}GHz.cont``):
+#   science (canonical dir):
+#     tt0        -> .tt0.pbcor.fits   (primary continuum science image)
+#     tt1        -> .tt1.pbcor.fits
+#     alpha      -> .alpha.fits
+#   diagnostics (aux/ dir):
+#     tt0_image  -> .tt0.image.fits   (non-pbcor / flat)
+#     tt1_image  -> .tt1.image.fits
+#     mask       -> .mask.fits
+#     residual   -> .residual.fits    (tt0 residual)
+#     pb         -> .pb.fits
+#     psf        -> .psf.fits          (tt0 psf)
 CONT_SCIENCE_PRODUCTS: tuple[str, ...] = ("tt0", "tt1", "alpha")
-CONT_AUX_PRODUCTS: tuple[str, ...] = ("mask", "residual", "pb")
+CONT_AUX_PRODUCTS: tuple[str, ...] = (
+    "tt0_image", "tt1_image", "mask", "residual", "pb", "psf",
+)
+
+_CONT_FILE_SUFFIX: dict[str, str] = {
+    "tt0": "tt0.pbcor.fits",
+    "tt1": "tt1.pbcor.fits",
+    "alpha": "alpha.fits",
+    "tt0_image": "tt0.image.fits",
+    "tt1_image": "tt1.image.fits",
+    "mask": "mask.fits",
+    "residual": "residual.fits",
+    "pb": "pb.fits",
+    "psf": "psf.fits",
+}
 
 
 def build_cont_output_path(
@@ -581,31 +609,26 @@ def build_cont_output_path(
 ) -> Path:
     """Build the output FITS path for a 12m+7m continuum product.
 
-    ``product`` is one of:
-      * ``tt0``   → ``{source}.12m7m.{freq}GHz.cont.pbcor.fits`` (science, canonical dir)
-      * ``tt1``   → ``...cont.tt1.pbcor.fits`` (canonical dir)
-      * ``alpha`` → ``...cont.alpha.fits``     (canonical dir)
-      * ``mask`` | ``residual`` | ``pb`` → ``...cont.{product}.fits`` (aux/ dir)
+    Science products (``tt0``, ``tt1``, ``alpha``) go in the canonical group
+    dir; diagnostics (``tt0_image``, ``tt1_image``, ``mask``, ``residual``,
+    ``pb``, ``psf``) go under ``aux/``.  See ``_CONT_FILE_SUFFIX``.
     """
+    suffix = _CONT_FILE_SUFFIX.get(product)
+    if suffix is None:
+        raise ValueError(
+            f"unknown continuum product: {product!r}; expected one of "
+            f"{CONT_SCIENCE_PRODUCTS + CONT_AUX_PRODUCTS}"
+        )
     sanitized = sanitize_source_name(source_name)
     freq_range = get_freq_range_string(freq_min_hz, freq_max_hz)
     subdir = f"group.uid___A001_{gous_id}.lp_nperetto"
-    base = (
+    fname = (
         f"group.uid___A001_{gous_id}.lp_nperetto."
-        f"{sanitized}.12m7m.{freq_range}GHz.cont"
+        f"{sanitized}.12m7m.{freq_range}GHz.cont.{suffix}"
     )
-    if product == "tt0":
-        return output_dir / subdir / f"{base}.pbcor.fits"
-    if product == "tt1":
-        return output_dir / subdir / f"{base}.tt1.pbcor.fits"
-    if product == "alpha":
-        return output_dir / subdir / f"{base}.alpha.fits"
-    if product in CONT_AUX_PRODUCTS:
-        return output_dir / AUX_SUBDIR / subdir / f"{base}.{product}.fits"
-    raise ValueError(
-        f"unknown continuum product: {product!r}; expected one of "
-        f"{CONT_SCIENCE_PRODUCTS + CONT_AUX_PRODUCTS}"
-    )
+    if product in CONT_SCIENCE_PRODUCTS:
+        return output_dir / subdir / fname
+    return output_dir / AUX_SUBDIR / subdir / fname
 
 
 # ---------------------------------------------------------------------------

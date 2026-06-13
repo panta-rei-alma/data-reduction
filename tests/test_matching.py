@@ -491,14 +491,15 @@ class TestContinuumFreqBounds:
 
 
 class TestBuildContOutputPath:
-    def test_science_tt0_in_canonical_dir(self):
+    def test_science_tt0_named_tt0_in_canonical_dir(self):
         p = build_cont_output_path(
             Path("/out"), "X3833_X64b9", "SRC1", 86.0e9, 90.2e9, "tt0"
         )
         assert "/aux/" not in str(p)
+        # tt0 is explicitly labelled (parallel to tt1), in the canonical dir
         assert p.name == (
             "group.uid___A001_X3833_X64b9.lp_nperetto.SRC1.12m7m."
-            "86.0-90.2GHz.cont.pbcor.fits"
+            "86.0-90.2GHz.cont.tt0.pbcor.fits"
         )
 
     def test_tt1_and_alpha_in_canonical_dir(self):
@@ -512,13 +513,21 @@ class TestBuildContOutputPath:
         assert alpha.name.endswith(".cont.alpha.fits")
         assert "/aux/" not in str(tt1) and "/aux/" not in str(alpha)
 
-    def test_aux_products_under_aux_dir(self):
-        for kind in ("mask", "residual", "pb"):
+    def test_diagnostic_products_under_aux_dir(self):
+        expected = {
+            "tt0_image": ".cont.tt0.image.fits",
+            "tt1_image": ".cont.tt1.image.fits",
+            "mask": ".cont.mask.fits",
+            "residual": ".cont.residual.fits",
+            "pb": ".cont.pb.fits",
+            "psf": ".cont.psf.fits",
+        }
+        for kind, suffix in expected.items():
             p = build_cont_output_path(
                 Path("/out"), "X3833_X64b9", "SRC1", 86.0e9, 90.2e9, kind
             )
-            assert "/aux/" in str(p)
-            assert p.name.endswith(f".cont.{kind}.fits")
+            assert "/aux/" in str(p), kind
+            assert p.name.endswith(suffix), kind
 
     def test_unknown_product_raises(self):
         with pytest.raises(ValueError):

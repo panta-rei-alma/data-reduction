@@ -44,12 +44,17 @@ logging.basicConfig(
 log = logging.getLogger("tclean_cont")
 
 
-# CASA image suffix (relative to imagename) for each QA aux product under
-# multi-term MFS.  ``mask`` is not term-split; ``residual``/``pb`` are.
+# CASA image suffix (relative to imagename) for each aux/diagnostic product
+# under multi-term MFS.  ``mask`` is not term-split; the others are (we keep
+# the tt0 term for residual/pb/psf).  ``tt0_image``/``tt1_image`` are the flat,
+# non-pb-corrected term images.
 AUX_SUFFIX = {
+    "tt0_image": ".image.tt0",
+    "tt1_image": ".image.tt1",
     "mask": ".mask",
     "residual": ".residual.tt0",
     "pb": ".pb.tt0",
+    "psf": ".psf.tt0",
 }
 
 

@@ -2112,7 +2112,14 @@ class MachineSlot(threading.Thread):
                 freq_min, freq_max,
             )
             method = "tclean_feather"
-        imagename_stem = str(canonical_fits).replace(".pbcor.fits", "")
+        # Base imagename for the DB record (informational; the worker recomputes
+        # the real one). Strip the product suffix for both line (.cube.pbcor.fits)
+        # and continuum (.cont.tt0.pbcor.fits).
+        imagename_stem = (
+            str(canonical_fits)
+            .replace(".tt0.pbcor.fits", "")
+            .replace(".pbcor.fits", "")
+        )
         scales_str = json.dumps(c.scales)
 
         row_id_holder: dict = {}
