@@ -56,6 +56,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          "to actually publish over existing FITS")
     ap.add_argument("--machines", nargs="+", default=None,
                     help="Subset of machines.json entries to use")
+    ap.add_argument("--slots", type=int, default=None,
+                    help="Override slots-per-machine from machines.json for "
+                         "this run only (e.g. 2 = two concurrent jobs/host). "
+                         "Continuum is CPU-bound and low-RAM so 2+ is safe; "
+                         "line cubes are RAM-heavier — use with care.")
 
     # Imaging knobs
     ap.add_argument("--product-type", default="line",
@@ -139,6 +144,16 @@ def main(argv=None) -> int:
     if not cfg.machines:
         log.error("no machines selected")
         return 2
+
+    # Per-run slots override (machines.json left untouched, so line dispatches
+    # keep their configured slots).
+    if args.slots is not None:
+        if args.slots < 1:
+            log.error("--slots must be >= 1")
+            return 2
+        for m in cfg.machines.values():
+            m.slots = args.slots
+        log.info("slots overridden to %d/machine for this run", args.slots)
 
     # Reconcile-only mode
     if args.reconcile_only:

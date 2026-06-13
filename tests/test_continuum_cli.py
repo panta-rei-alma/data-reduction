@@ -22,6 +22,35 @@ def test_injects_product_type_cont():
     assert "--base-dir" in captured["argv"] and "5" in captured["argv"]
 
 
+def test_slots_override_mutates_each_machine(tmp_path, monkeypatch):
+    """--slots overrides slots-per-machine without touching machines.json."""
+    import json as _json
+    from panta_rei.cli import run_imaging_dispatch as rid
+
+    mj = tmp_path / "machines.json"
+    mj.write_text(_json.dumps({
+        "conda_env": "/e", "repo_path": "/r", "casa_path": "/c",
+        "global": {}, "machines": {
+            "m1": {"raid": "/raid", "slots": 1, "nproc": 4},
+            "m2": {"raid": "/raid", "slots": 1, "nproc": 4},
+        },
+    }))
+    captured = {}
+
+    def fake_run_dispatch(**kw):
+        captured["slots"] = {n: m.slots for n, m in kw["cfg"].machines.items()}
+        return {"to_run": 0}
+
+    monkeypatch.setattr(rid, "run_dispatch", fake_run_dispatch)
+    monkeypatch.setattr(rid.DatabaseManager, "__init__", lambda self, *a, **k: None)
+    rid.main([
+        "--base-dir", str(tmp_path), "--output-dir", str(tmp_path),
+        "--machines-config", str(mj), "--db", str(tmp_path / "x.db"),
+        "--slots", "2",
+    ])
+    assert captured["slots"] == {"m1": 2, "m2": 2}
+
+
 def test_does_not_double_inject_when_already_present():
     captured = {}
 
