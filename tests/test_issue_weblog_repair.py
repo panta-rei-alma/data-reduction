@@ -236,6 +236,27 @@ class TestRepairWeblogLink:
         body = _body_with_weblog_line("* [ ] Weblog available")
         assert mgr._repair_weblog_link(sb, body, 21) is None
 
+    def test_traversal_url_never_repaired(self, tmp_path, staged):
+        """A URL using dot segments to lexically sit under the weblog dir
+        while pointing outside it must be rejected, not repaired."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        traversal = f"{URL_PREFIX}/weblogs/../outside/html/index.html"
+        mgr = _make_manager(tmp_path, staged["weblog_dir"])
+        sb = _sb(weblog_url=staged["good_url"])
+        body = _body_with_weblog_line(f"* [x] [Weblog]({traversal}) available")
+        assert mgr._repair_weblog_link(sb, body, 21) is None
+
+    def test_symlink_escape_not_contained(self, tmp_path, staged):
+        """A symlink under the weblog dir pointing outside must not count
+        as contained once paths are resolved."""
+        outside = tmp_path / "outside-tree"
+        outside.mkdir()
+        link = staged["weblog_dir"] / "escape"
+        link.symlink_to(outside)
+        mgr = _make_manager(tmp_path, staged["weblog_dir"])
+        assert mgr._under_weblog_dir(link / "html" / "index.html") is False
+
     def test_http_https_scheme_mismatch_still_repairs(self, tmp_path, staged):
         """Bodies use http:// while mappings declare https:// (or vice
         versa); scheme differences must not block the repair."""

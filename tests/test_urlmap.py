@@ -62,3 +62,17 @@ class TestUrlToPath:
     def test_roundtrip(self):
         original = Path("/scratch/almanas/dwalker2/panta-rei/weblogs/u/html/index.html")
         assert url_to_path(path_to_url(original, MAPPINGS), MAPPINGS) == original
+
+    def test_dot_segment_traversal_rejected(self):
+        assert url_to_path(
+            "https://www.alma.ac.uk/nas/weblogs/../../etc/passwd", MAPPINGS
+        ) is None
+        assert url_to_path(
+            "https://www.alma.ac.uk/nas/weblogs/./x/index.html", MAPPINGS
+        ) is None
+
+    def test_percent_encoded_traversal_rejected(self):
+        assert url_to_path(
+            "https://www.alma.ac.uk/nas/weblogs/%2e%2e/%2e%2e/etc/passwd",
+            MAPPINGS,
+        ) is None

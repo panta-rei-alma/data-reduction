@@ -217,7 +217,9 @@ class GitHubIssueManager:
         self.dry_run = dry_run
         self.limit = limit
         self.weblog_dir = Path(weblog_dir) if weblog_dir else None
-        self.url_mappings = url_mappings or dict(DEFAULT_URL_MAPPINGS)
+        self.url_mappings = (
+            dict(DEFAULT_URL_MAPPINGS) if url_mappings is None else url_mappings
+        )
         self.gh_project_number = gh_project_number
         self.update_project_status = update_project_status
         self.update_targets = update_targets
@@ -715,13 +717,17 @@ class GitHubIssueManager:
         return True
 
     def _under_weblog_dir(self, path: Path) -> bool:
-        """Check whether a path lies under the configured weblog directory."""
+        """Check whether a path lies under the configured weblog directory.
+
+        Both sides are resolved so symlinks and dot segments cannot make
+        an outside path appear contained (or vice versa).
+        """
         if not self.weblog_dir:
             return False
         try:
-            path.relative_to(self.weblog_dir)
+            path.resolve().relative_to(self.weblog_dir.resolve())
             return True
-        except ValueError:
+        except (ValueError, OSError):
             return False
 
     def _repair_weblog_link(

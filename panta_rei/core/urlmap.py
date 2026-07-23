@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 from typing import Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 # Default mapping used across the pipeline (see PipelineConfig.url_mappings).
 DEFAULT_URL_MAPPINGS: Dict[str, str] = {
@@ -44,13 +44,18 @@ def url_to_path(url: str, url_mappings: Dict[str, str]) -> Optional[Path]:
     """Convert a public URL back to its filesystem path.
 
     Scheme-insensitive (http/https treated as equivalent) and
-    component-boundary safe on the URL path. Returns None if the URL
-    does not match any configured mapping.
+    component-boundary safe on the URL path. URLs containing dot
+    segments (``.`` or ``..``, plain or percent-encoded) are rejected
+    outright so a mapped path can never escape its prefix. Returns None
+    if the URL does not match any configured mapping.
     """
     if not url:
         return None
     target = urlsplit(url)
     if target.scheme not in ("http", "https") or not target.netloc:
+        return None
+    target_path = unquote(target.path)
+    if any(part in (".", "..") for part in target_path.split("/")):
         return None
     for fs_prefix, url_prefix in url_mappings.items():
         base = urlsplit(url_prefix)
@@ -58,7 +63,7 @@ def url_to_path(url: str, url_mappings: Dict[str, str]) -> Optional[Path]:
             continue
         base_path = PurePosixPath(base.path or "/")
         try:
-            rel = PurePosixPath(target.path).relative_to(base_path)
+            rel = PurePosixPath(target_path).relative_to(base_path)
         except ValueError:
             continue
         return Path(fs_prefix) / Path(*rel.parts)
