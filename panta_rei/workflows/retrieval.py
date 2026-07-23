@@ -235,6 +235,7 @@ class UpdateIssuesStep(Step):
                 gh_project_number=ctx.config.gh_project_number,
                 update_project_status=True,
                 update_targets=True,
+                url_mappings=ctx.config.url_mappings,
             )
             created, updated = manager.run()
 
