@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from panta_rei.core.uid import canonical_uid
+from panta_rei.core.urlmap import DEFAULT_URL_MAPPINGS, url_to_path
 from panta_rei.github.project import (
     PROJECT_STATUS_DELIVERED,
     PROJECT_STATUS_IN_PROGRESS,
@@ -23,8 +25,11 @@ from panta_rei.github.project import (
 
 log = logging.getLogger(__name__)
 
-# Default weblog URL base (matches stage_weblogs.py configuration)
-DEFAULT_WEBLOG_BASE_URL = "http://www.alma.ac.uk/nas/dwalker2/panta-rei/weblogs"
+# Matches the checked weblog line in an issue body, capturing the URL.
+WEBLOG_LINK_LINE_RE = re.compile(
+    r"^\* \[x\] \[Weblog\]\((?P<url>[^)\s]+)\) available[ \t]*$",
+    re.MULTILINE,
+)
 
 # Label colors
 LABEL_COLORS = {
@@ -121,16 +126,17 @@ def normalize_weblog_url(url: Optional[str]) -> Optional[str]:
     return url
 
 
-def build_sb_issue_body(
-    sb: SchedulingBlock,
-    weblog_base_url: Optional[str] = None,
-    weblog_dir: Optional[Path] = None,
-    base_dir: Optional[Path] = None,
-) -> str:
+def build_sb_issue_body(sb: SchedulingBlock) -> str:
     """Build the full GitHub issue body for a scheduling block.
 
     This is a standalone pure function so it can be used by both the live
     issue manager and the zero-API GH_DRY_RUN path.
+
+    The weblog link comes exclusively from ``sb.weblog_url`` (recorded by
+    weblog staging). URLs are deliberately never fabricated from local
+    filesystem paths: mapping a local data-tree path onto the public
+    weblog base produced a URL that never existed on the webserver
+    (issue #21, Dec 2025).
     """
     targets_sorted = sorted(sb.targets)
     targets_text = "\n".join(f"  - `{t}`" for t in targets_sorted)
@@ -146,21 +152,7 @@ def build_sb_issue_body(
     if sb.weblog_url:
         weblog_line = f"* [x] [Weblog]({sb.weblog_url}) available"
     elif sb.weblog_path:
-        if weblog_base_url:
-            try:
-                if weblog_dir:
-                    rel_path = sb.weblog_path.relative_to(weblog_dir)
-                elif base_dir:
-                    rel_path = sb.weblog_path.relative_to(base_dir)
-                else:
-                    raise ValueError("no base for relative path")
-                weblog_url = f"{weblog_base_url.rstrip('/')}/{rel_path}/index.html"
-                weblog_url = normalize_weblog_url(weblog_url)
-                weblog_line = f"* [x] [Weblog]({weblog_url}) available"
-            except ValueError:
-                weblog_line = f"* [x] Weblog available at: `{sb.weblog_path}`"
-        else:
-            weblog_line = f"* [x] Weblog available at: `{sb.weblog_path}`"
+        weblog_line = f"* [x] Weblog available at: `{sb.weblog_path}`"
     else:
         weblog_line = "* [ ] Weblog available"
 
@@ -208,7 +200,6 @@ class GitHubIssueManager:
         gh_owner: str,
         gh_repo: str,
         gh_token: Optional[str] = None,
-        weblog_base_url: Optional[str] = None,
         weblog_dir: Optional[Path] = None,
         csv_path: Optional[Path] = None,
         dry_run: bool = False,
@@ -216,6 +207,7 @@ class GitHubIssueManager:
         gh_project_number: Optional[int] = None,
         update_project_status: bool = False,
         update_targets: bool = False,
+        url_mappings: Optional[Dict[str, str]] = None,
     ):
         self.project_code = project_code
         self.base_dir = Path(base_dir)
@@ -224,8 +216,10 @@ class GitHubIssueManager:
         self.csv_path = Path(csv_path) if csv_path else None
         self.dry_run = dry_run
         self.limit = limit
-        self.weblog_base_url = weblog_base_url or DEFAULT_WEBLOG_BASE_URL
         self.weblog_dir = Path(weblog_dir) if weblog_dir else None
+        self.url_mappings = (
+            dict(DEFAULT_URL_MAPPINGS) if url_mappings is None else url_mappings
+        )
         self.gh_project_number = gh_project_number
         self.update_project_status = update_project_status
         self.update_targets = update_targets
@@ -370,8 +364,10 @@ class GitHubIssueManager:
     ) -> Tuple[Optional[Path], Optional[str]]:
         """Find weblog directory and URL for a scheduling block.
 
-        Looks up staged weblogs from the database. Weblogs must be staged via
-        stage_weblogs.py to appear here.
+        Looks up staged weblogs from the database by exact canonical UID
+        match (compact MOUS IDs like ``X3833_X64d8`` expand to
+        ``uid://A001/<...>``). Weblogs must be staged via stage_weblogs.py
+        to appear here.
 
         Returns:
             Tuple of (weblog_path, weblog_url) - either or both may be None
@@ -379,15 +375,22 @@ class GitHubIssueManager:
         if not weblog_info:
             return (None, None)
 
+        by_canonical = {
+            canonical_uid(db_uid): entry
+            for db_uid, entry in weblog_info.items()
+        }
         for mous_id in sb.mous_ids_list:
-            # Convert compact MOUS ID to canonical form for lookup
-            mous_lower = mous_id.lower()
-            for db_uid, (path, url) in weblog_info.items():
-                if mous_lower in db_uid.lower() or mous_id.replace("_", "") in db_uid:
-                    weblog_path = Path(path) if path else None
-                    # Normalize the URL to ensure correct format
-                    weblog_url = normalize_weblog_url(url)
-                    return (weblog_path, weblog_url)
+            # MOUS IDs may be compact (X3833_X64d8) or full uid forms
+            key = canonical_uid(mous_id) or canonical_uid(
+                f"uid://A001/{mous_id.replace('_', '/')}"
+            )
+            entry = by_canonical.get(key) if key else None
+            if entry:
+                path, url = entry
+                weblog_path = Path(path) if path else None
+                # Normalize the URL to ensure correct format
+                weblog_url = normalize_weblog_url(url)
+                return (weblog_path, weblog_url)
 
         return (None, None)
 
@@ -484,12 +487,7 @@ class GitHubIssueManager:
 
     def build_issue_body(self, sb: SchedulingBlock) -> str:
         """Build the issue body with status checkboxes."""
-        return build_sb_issue_body(
-            sb,
-            weblog_base_url=self.weblog_base_url,
-            weblog_dir=self.weblog_dir,
-            base_dir=self.base_dir,
-        )
+        return build_sb_issue_body(sb)
 
     def create_issue(self, sb: SchedulingBlock) -> Optional[dict]:
         """Create a GitHub issue for a scheduling block."""
@@ -676,25 +674,19 @@ class GitHubIssueManager:
             self.ensure_label("Extracted")
             needs_update = True
 
-        # Update weblog link - prefer weblog_url from staging (already normalized)
+        # Update weblog link - the URL comes exclusively from staging (DB).
+        # URLs are never fabricated from local filesystem paths (issue #21).
         if (sb.weblog_url or sb.weblog_path) and "[ ] Weblog available" in body:
             if sb.weblog_url:
                 body = body.replace("[ ] Weblog available", f"[x] [Weblog]({sb.weblog_url}) available")
-            elif sb.weblog_path:
-                if self.weblog_base_url:
-                    try:
-                        if self.weblog_dir:
-                            rel_path = sb.weblog_path.relative_to(self.weblog_dir)
-                        else:
-                            rel_path = sb.weblog_path.relative_to(self.base_dir)
-                        weblog_url = f"{self.weblog_base_url.rstrip('/')}/{rel_path}/index.html"
-                        weblog_url = normalize_weblog_url(weblog_url)
-                        body = body.replace("[ ] Weblog available", f"[x] [Weblog]({weblog_url}) available")
-                    except ValueError:
-                        body = body.replace("[ ] Weblog available", f"[x] Weblog available at: `{sb.weblog_path}`")
-                else:
-                    body = body.replace("[ ] Weblog available", f"[x] Weblog available at: `{sb.weblog_path}`")
+            else:
+                body = body.replace("[ ] Weblog available", f"[x] Weblog available at: `{sb.weblog_path}`")
             needs_update = True
+        else:
+            repaired = self._repair_weblog_link(sb, body, existing.number)
+            if repaired is not None:
+                body = repaired
+                needs_update = True
 
         # Update project board status if enabled
         project_status_updated = False
@@ -723,6 +715,94 @@ class GitHubIssueManager:
                 return False
 
         return True
+
+    def _under_weblog_dir(self, path: Path) -> bool:
+        """Check whether a path lies under the configured weblog directory.
+
+        Both sides are resolved so symlinks and dot segments cannot make
+        an outside path appear contained (or vice versa).
+        """
+        if not self.weblog_dir:
+            return False
+        try:
+            path.resolve().relative_to(self.weblog_dir.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _repair_weblog_link(
+        self, sb: SchedulingBlock, body: str, issue_number: Any
+    ) -> Optional[str]:
+        """Replace a demonstrably broken weblog link with the staged URL.
+
+        Returns the updated body, or None if no repair is needed or safe.
+        A repair only fires when ALL of the following hold:
+
+        * the SB has a DB-derived staged URL (``sb.weblog_url``),
+        * the body contains exactly one checked weblog link line,
+        * the linked URL differs from the staged URL,
+        * the staged weblog directory is configured, mounted and non-empty,
+        * the linked URL maps to a path under the weblog directory that
+          does NOT exist (genuinely broken -- external or working links
+          are never touched),
+        * the staged URL maps to a path under the weblog directory that
+          DOES exist on disk.
+        """
+        if not sb.weblog_url:
+            return None
+        matches = WEBLOG_LINK_LINE_RE.findall(body)
+        if len(matches) != 1:
+            if len(matches) > 1:
+                log.warning(
+                    "Issue #%s has %d weblog link lines; not repairing",
+                    issue_number, len(matches),
+                )
+            return None
+        current_url = matches[0]
+        if current_url == sb.weblog_url:
+            return None
+
+        # The weblog dir must be configured and look mounted (non-empty).
+        if not self.weblog_dir or not self.weblog_dir.is_dir():
+            return None
+        try:
+            if not any(self.weblog_dir.iterdir()):
+                return None
+        except OSError:
+            return None
+
+        current_path = url_to_path(current_url, self.url_mappings)
+        if current_path is None or not self._under_weblog_dir(current_path):
+            log.info(
+                "Issue #%s weblog link is external/unmapped (%s); leaving as-is",
+                issue_number, current_url,
+            )
+            return None
+        if current_path.exists():
+            return None  # link target exists on disk; nothing to repair
+
+        new_path = url_to_path(sb.weblog_url, self.url_mappings)
+        if (
+            new_path is None
+            or not self._under_weblog_dir(new_path)
+            or not new_path.exists()
+        ):
+            log.warning(
+                "Issue #%s weblog link is broken (%s) but staged URL %s "
+                "is not verifiable on disk; not repairing",
+                issue_number, current_url, sb.weblog_url,
+            )
+            return None
+
+        log.info(
+            "Repairing broken weblog link on issue #%s: %s -> %s",
+            issue_number, current_url, sb.weblog_url,
+        )
+        return WEBLOG_LINK_LINE_RE.sub(
+            lambda m: f"* [x] [Weblog]({sb.weblog_url}) available",
+            body,
+            count=1,
+        )
 
     def _update_project_status(self, issue: Any, sb: SchedulingBlock) -> bool:
         """Update the project board status for an existing issue.

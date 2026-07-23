@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 from panta_rei.core.text import now_iso
 from panta_rei.core.uid import UID_CORE_RE, canonical_uid, sanitize_uid
+from panta_rei.core.urlmap import path_to_url as _path_to_url
 
 log = logging.getLogger(__name__)
 
@@ -48,13 +49,12 @@ def find_mous_directory(archive_path: Path) -> Optional[Path]:
 
 
 def path_to_url(path: Path, url_mappings: Dict[str, str]) -> Optional[str]:
-    """Convert a filesystem path to a public URL via configured mappings."""
-    path_str = str(path.resolve())
-    for fs_prefix, url_prefix in url_mappings.items():
-        if path_str.startswith(fs_prefix):
-            rel_path = path_str[len(fs_prefix):].lstrip("/")
-            return f"{url_prefix.rstrip('/')}/{rel_path}"
-    return None
+    """Convert a filesystem path to a public URL via configured mappings.
+
+    Delegates to the shared component-boundary-safe implementation in
+    :mod:`panta_rei.core.urlmap`.
+    """
+    return _path_to_url(path, url_mappings)
 
 
 def make_world_readable(path: Path) -> None:
