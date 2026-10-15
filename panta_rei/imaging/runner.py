@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -367,24 +368,59 @@ def run_continuum_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 # Parameter assembly
 # ---------------------------------------------------------------------------
 
-def _clean_budget(recovered: dict, fallback: int) -> int:
-    """Recovered ``niter``, or *fallback* when it is absent or zero.
+# Stopping depth given to a QA2 dirty-only seed that carries no positive
+# threshold or nsigma (the Phase-2 default of the joint-imaging plan).
+DIRTY_SEED_NSIGMA = 2.0
+
+
+def _is_zero_threshold(threshold) -> bool:
+    """True for an absent/zero tclean threshold (``''``, ``0``, ``'0.0mJy'``)."""
+    if threshold in (None, ""):
+        return True
+    m = re.match(r"\s*([-+]?[0-9.]+(?:[eE][-+]?\d+)?)", str(threshold))
+    try:
+        return m is None or float(m.group(1)) == 0.0
+    except ValueError:
+        return False
+
+
+def clean_depth_fallback(recovered: dict, niter_fallback: int) -> dict:
+    """tclean overrides for a QA2 dirty-only seed; ``{}`` for a cleaned seed.
 
     A recovered ``niter=0`` is the QA2 dirty ``iter0`` call the pipeline
     publishes when it finds nothing to clean (recovery marks these
-    ``qa2_dirty_only``).  Imaging the more sensitive joint data with it
-    would leave the cube undeconvolved (and feather a Jy/dirty-beam image),
-    so it gets the same budget as a missing niter; the recovered threshold
-    and automasking still decide how deep it actually cleans.
+    ``qa2_dirty_only``; older sidecars just have niter=0).  Imaging the more
+    sensitive joint data with it would leave the cube undeconvolved (and
+    feather a Jy/dirty-beam image), so it gets the same niter as a missing
+    one.  Its threshold is a QA2 placeholder (``'0.0mJy'``, nsigma 0), so
+    when neither gives a positive stopping depth, nsigma=2 does.
     """
-    niter = int(recovered.get("niter", fallback))
-    if niter <= 0:
+    niter = int(recovered.get("niter", niter_fallback))
+    if niter > 0 and not recovered.get("qa2_dirty_only"):
+        return {}
+    out: dict = {"niter": niter_fallback}
+    try:
+        nsigma = float(recovered.get("nsigma") or 0.0)
+    except (TypeError, ValueError):
+        nsigma = 0.0
+    if nsigma <= 0 and _is_zero_threshold(recovered.get("threshold")):
+        out["nsigma"] = DIRTY_SEED_NSIGMA
+    return out
+
+
+def _apply_clean_depth_fallback(
+    params: dict, recovered: dict, niter_fallback: int,
+) -> None:
+    """Apply :func:`clean_depth_fallback` to *params*, with a warning."""
+    fallback = clean_depth_fallback(recovered, niter_fallback)
+    if fallback:
         log.warning(
-            "Recovered niter=%d (QA2 dirty-only seed) — using niter=%d",
-            niter, fallback,
+            "QA2 dirty-only seed (recovered niter=%s, threshold=%r, "
+            "nsigma=%r) — using %s",
+            recovered.get("niter"), recovered.get("threshold"),
+            recovered.get("nsigma"), fallback,
         )
-        return fallback
-    return niter
+        params.update(fallback)
 
 
 # Fixed parameters per plan (section 4)
@@ -435,7 +471,7 @@ def build_sdintimaging_params(
         "veltype": recovered.get("veltype", "radio"),
         "weighting": recovered.get("weighting", "briggsbwtaper"),
         "robust": float(recovered.get("robust", 0.5)),
-        "niter": _clean_budget(recovered, 30000),
+        "niter": int(recovered.get("niter", 30000)),
         "threshold": recovered.get("threshold", "0.0Jy"),
         "pblimit": float(recovered.get("pblimit", 0.2)),
         # Auto-masking from recovery
@@ -451,6 +487,7 @@ def build_sdintimaging_params(
         "scales": scales,
         "sdgain": sdgain,
     }
+    _apply_clean_depth_fallback(params, recovered, 30000)
 
     # Apply fixed params (always override)
     params.update(FIXED_PARAMS)
@@ -538,7 +575,7 @@ def build_tclean_params(
         "veltype": recovered.get("veltype", "radio"),
         "weighting": recovered.get("weighting", "briggsbwtaper"),
         "robust": float(recovered.get("robust", 0.5)),
-        "niter": _clean_budget(recovered, 30000),
+        "niter": int(recovered.get("niter", 30000)),
         "threshold": recovered.get("threshold", "0.0Jy"),
         "pblimit": float(recovered.get("pblimit", 0.2)),
         # Auto-masking from recovery
@@ -555,6 +592,7 @@ def build_tclean_params(
         "parallel": parallel,
     }
     _forward_recovered(params, recovered, FORWARDED_LINE_CONTROLS)
+    _apply_clean_depth_fallback(params, recovered, 30000)
 
     # Apply fixed params (always override)
     params.update(FIXED_TCLEAN_PARAMS)
@@ -607,7 +645,7 @@ def build_tclean_cont_params(
         "phasecenter": recovered.get("phasecenter", ""),
         "weighting": recovered.get("weighting", "briggs"),
         "robust": float(recovered.get("robust", 0.5)),
-        "niter": _clean_budget(recovered, 20000),
+        "niter": int(recovered.get("niter", 20000)),
         "threshold": recovered.get("threshold", "0.0Jy"),
         "pblimit": float(recovered.get("pblimit", 0.2)),
         "mosweight": bool(recovered.get("mosweight", True)),
@@ -632,6 +670,7 @@ def build_tclean_cont_params(
     if reffreq:
         params["reffreq"] = reffreq
     _forward_recovered(params, recovered, FORWARDED_TCLEAN_CONTROLS)
+    _apply_clean_depth_fallback(params, recovered, 20000)
 
     # Apply fixed continuum overrides (always win)
     params.update(FIXED_TCLEAN_CONT_PARAMS)
@@ -1399,6 +1438,9 @@ def run_tclean_feather(
         "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": get_casa_version(),
+        "clean_depth_fallback": (
+            clean_depth_fallback(unit.recovered_params, 30000) or None
+        ),
     }
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)
@@ -1639,6 +1681,7 @@ def run_tclean_feather_parallel(
         "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": "unknown",  # determined inside CASA
+        "clean_depth_fallback": clean_depth_fallback(recovered, 30000) or None,
     }
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)
@@ -1872,6 +1915,9 @@ def run_tclean_cont_parallel(
         "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": "unknown",
+        "clean_depth_fallback": (
+            clean_depth_fallback(unit.recovered_params, 20000) or None
+        ),
     }
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)

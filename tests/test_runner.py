@@ -581,14 +581,45 @@ class TestBuildTcleanParams:
         assert params["threshold"] == "0.276Jy"
 
     def test_qa2_dirty_seed_gets_positive_budget(self, basic_unit, caplog):
-        """A recovered niter=0 (QA2 dirty-only iter0) must not image dirty."""
-        basic_unit.recovered_params["niter"] = 0
-        basic_unit.recovered_params["qa2_dirty_only"] = True
+        """A real QA2 dirty iter0 seed (niter=0, threshold='0.0mJy',
+        nsigma=0.0) gets a positive niter and nsigma=2 stopping depth."""
+        from panta_rei.imaging.runner import clean_depth_fallback
+        basic_unit.recovered_params.update({
+            "niter": 0, "threshold": "0.0mJy", "nsigma": 0.0,
+            "qa2_dirty_only": True, "fastnoise": False,
+            "minpercentchange": 1.0, "dogrowprune": True,
+            "imagename": "x.spw27.cube.regcal.I.iter0",
+        })
         with caplog.at_level("WARNING", logger="panta_rei.imaging.runner"):
             params = build_tclean_params(basic_unit, imagename="/out/test")
         assert params["niter"] == 30000
+        assert params["nsigma"] == 2.0
+        assert params["threshold"] == "0.0mJy"
+        assert params["fastnoise"] is False
         assert "qa2_dirty_only" not in params
         assert "dirty-only" in caplog.text
+        assert clean_depth_fallback(basic_unit.recovered_params, 30000) == {
+            "niter": 30000, "nsigma": 2.0,
+        }
+
+    def test_dirty_seed_without_marker_still_covered(self, basic_unit):
+        """Pre-marker sidecars only have niter=0."""
+        basic_unit.recovered_params.update({"niter": 0, "threshold": "0.0mJy"})
+        params = build_tclean_params(basic_unit, "/o")
+        assert params["niter"] == 30000 and params["nsigma"] == 2.0
+
+    def test_dirty_seed_with_positive_threshold_keeps_it(self, basic_unit):
+        basic_unit.recovered_params.update({"niter": 0, "threshold": "0.01Jy",
+                                            "nsigma": 0.0})
+        params = build_tclean_params(basic_unit, "/o")
+        assert params["niter"] == 30000
+        assert params["nsigma"] == 0.0 and params["threshold"] == "0.01Jy"
+
+    def test_cleaned_seed_has_no_fallback(self, basic_unit):
+        from panta_rei.imaging.runner import clean_depth_fallback
+        basic_unit.recovered_params.update({"threshold": "0.0mJy", "nsigma": 0.0})
+        assert clean_depth_fallback(basic_unit.recovered_params, 30000) == {}
+        assert build_tclean_params(basic_unit, "/o")["nsigma"] == 0.0
 
     def test_positive_niter_unchanged(self, basic_unit):
         basic_unit.recovered_params["niter"] = 4360
@@ -901,6 +932,7 @@ class TestRunTcleanFeatherParallel:
         # job spec should advertise the 3 default aux products + canonical
         # paths for each
         assert observed_spec["aux_products"] == ["mask", "residual", "pb"]
+        assert observed_spec["clean_depth_fallback"] is None  # cleaned seed
         # Aux products live under output_dir/aux/group.../, separate from
         # the feathered cube which stays in output_dir/group.../.
         feathered_parent = Path(output).parent
@@ -1219,7 +1251,9 @@ class TestBuildContParams:
 
     def test_zero_niter_gets_positive_budget(self, cont_unit):
         cont_unit.recovered_params["niter"] = 0
-        assert build_tclean_cont_params(cont_unit, "/o")["niter"] == 20000
+        p = build_tclean_cont_params(cont_unit, "/o")
+        assert p["niter"] == 20000
+        assert "nsigma" not in p  # threshold 0.00311Jy is a real depth
 
     def test_scales_default_and_override(self, cont_unit):
         assert build_tclean_cont_params(cont_unit, "/o")["scales"] == [0]
