@@ -1055,6 +1055,52 @@ class TestPublishPair:
         # No leftover backup files
         assert not list(a_dst.parent.glob("*.bak.*"))
 
+    def test_pair_overwrite_retires_stale_destination(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("TT0_NEW")
+        a_dst = tmp_path / "out" / "tt0.fits"
+        a_dst.parent.mkdir(parents=True)
+        a_dst.write_text("TT0_OLD")
+        stale = tmp_path / "out" / "alpha.fits"
+        stale.write_text("ALPHA_OLD")
+        absent = tmp_path / "out" / "tt1.fits"  # retire of a missing file: no-op
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst))], policy="overwrite",
+            retire=(str(stale), str(absent)),
+        )
+        assert ok, msg
+        assert a_dst.read_text() == "TT0_NEW"
+        assert not stale.exists() and not absent.exists()
+        assert not list(a_dst.parent.glob("*.bak.*"))
+
+    def test_pair_overwrite_rollback_restores_retired(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("TT0_NEW")
+        a_dst = tmp_path / "out" / "tt0.fits"
+        a_dst.parent.mkdir(parents=True)
+        a_dst.write_text("TT0_OLD")
+        stale = tmp_path / "out" / "alpha.fits"
+        stale.write_text("ALPHA_OLD")
+        ghost = tmp_path / "ghost.fits"  # missing src → second publish fails
+        ok, _msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(ghost), str(tmp_path / "out" / "x.fits"))],
+            policy="overwrite", retire=(str(stale),),
+        )
+        assert not ok
+        assert a_dst.read_text() == "TT0_OLD"
+        assert stale.read_text() == "ALPHA_OLD"
+        assert not list(a_dst.parent.glob("*.bak.*"))
+
+    def test_pair_fail_if_exists_never_retires(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        stale = tmp_path / "out" / "alpha.fits"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("ALPHA_OLD")
+        ok, _msg = _publish_pair(
+            [(str(a_src), str(tmp_path / "out" / "tt0.fits"))],
+            policy="fail_if_exists", retire=(str(stale),),
+        )
+        assert ok
+        assert stale.read_text() == "ALPHA_OLD"
+
     def test_pair_overwrite_success_drops_backups(self, tmp_path):
         a_src = tmp_path / "a.fits"; a_src.write_text("A_NEW")
         b_src = tmp_path / "b.fits"; b_src.write_text("B_NEW")
@@ -1173,6 +1219,58 @@ class TestBuildContParams:
         assert build_tclean_cont_params(
             cont_unit, "/o", scales=[0, 5, 10]
         )["scales"] == [0, 5, 10]
+
+
+class TestRunTcleanContParallelPublish:
+    def test_reimage_without_alpha_retires_old_alpha(self, cont_unit, tmp_path):
+        """Overwrite re-image whose alpha export failed: the old alpha must
+        not survive beside the new tt0 (one generation per unit)."""
+        from panta_rei.imaging.runner import run_tclean_cont_parallel
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        output_dir = tmp_path / "output"
+        seen = {}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            run_dir = Path(spec["run_dir"])
+            canonical = spec["canonical_paths"]
+            seen.update(canonical)
+            # Previous generation already published tt0, tt1, alpha, mask.
+            for key in ("tt0", "tt1", "alpha"):
+                Path(canonical[key]).parent.mkdir(parents=True, exist_ok=True)
+                Path(canonical[key]).write_text(f"OLD-{key}")
+            Path(canonical["aux"]["mask"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(canonical["aux"]["mask"]).write_text("OLD-mask")
+            # New generation: tt0 + tt1 only (alpha and mask exports failed).
+            local = {}
+            for key in ("tt0", "tt1"):
+                local[key] = run_dir / Path(canonical[key]).name
+                local[key].write_text(f"NEW-{key}")
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True,
+                "tt0_fits": str(local["tt0"]),
+                "tt1_fits": str(local["tt1"]),
+                "alpha_fits": None,
+                "aux_fits": {},
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_continuum_trusted_preflight",
+                   return_value=(True, "OK")), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            ok, msg, out = run_tclean_cont_parallel(
+                unit=cont_unit, output_dir=output_dir, row_id=5,
+                casa_path=str(casa_path), publish_policy="overwrite",
+            )
+        assert ok, msg
+        assert Path(seen["tt0"]).read_text() == "NEW-tt0"
+        assert Path(seen["tt1"]).read_text() == "NEW-tt1"
+        assert not Path(seen["alpha"]).exists()
+        assert not Path(seen["aux"]["mask"]).exists()
 
 
 class TestRunContinuumTrustedPreflight:

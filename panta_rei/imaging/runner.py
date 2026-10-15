@@ -1166,6 +1166,7 @@ def _atomic_publish(src: str, dst: str) -> None:
 
 def _publish_pair(
     pairs: list[tuple[str, str]], *, policy: str = "overwrite",
+    retire: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """Publish a list of (src, dst) pairs as one logical transaction.
 
@@ -1183,6 +1184,13 @@ def _publish_pair(
       on rollback we ``os.replace`` the backup back into place.  On
       successful commit of the whole pair we unlink the backups.
 
+    *retire* lists destinations that the new generation does not provide
+    (e.g. an optional product whose export failed).  Under ``overwrite``
+    any that exist are snapshotted with the others, so commit removes them
+    and rollback restores them — the published set is always from one
+    generation.  ``fail_if_exists`` never removes files, so it ignores
+    *retire*.
+
     Returns ``(ok, message)``.
     """
     backups: list[tuple[str, str]] = []          # (canonical, backup)
@@ -1191,7 +1199,7 @@ def _publish_pair(
     if policy == "overwrite":
         # Snapshot pre-existing destinations *before* any publish so a
         # mid-pair failure can restore the prior canonical state.
-        for _src, dst in pairs:
+        for dst in [dst for _src, dst in pairs] + list(retire):
             dst_path = Path(dst)
             if dst_path.exists():
                 bak = (
@@ -1251,8 +1259,10 @@ def _publish_pair(
                 f"{len(backups)} backup(s)): {exc}"
             )
 
-    # Whole pair succeeded — drop backups.
-    for _canonical, bak in backups:
+    # Whole pair succeeded — drop backups (this also removes retired files).
+    for canonical, bak in backups:
+        if canonical in retire:
+            log.info("Retired stale publish target: %s", Path(canonical).name)
         try:
             os.unlink(bak)
         except OSError:
@@ -1936,9 +1946,19 @@ def run_tclean_cont_parallel(
         if canonical:
             pair.append((local_aux, canonical))
 
+    # Optional products this generation did not produce: an older copy left
+    # at the destination would sit beside the new tt0, so retire it in the
+    # same transaction.
+    published_dsts = {dst for _src, dst in pair}
+    retire = tuple(
+        dst for dst in [str(canonical_tt1), str(canonical_alpha),
+                        *canonical_aux.values()]
+        if dst not in published_dsts
+    )
+
     on_publish_start()
 
-    ok, msg = _publish_pair(pair, policy=publish_policy)
+    ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)
     if not ok:
         return False, msg, None
 
