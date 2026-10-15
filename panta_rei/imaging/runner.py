@@ -1227,13 +1227,25 @@ def _publish_pair(
     (e.g. an optional product whose export failed).  Under ``overwrite``
     any that exist are snapshotted with the others, so commit removes them
     and rollback restores them — the published set is always from one
-    generation.  ``fail_if_exists`` never removes files, so it ignores
-    *retire*.
+    generation.  ``fail_if_exists`` never removes files, so it instead
+    refuses the whole publication if any destination of the generation,
+    retire candidates included, already exists.
 
     Returns ``(ok, message)``.
     """
     backups: list[tuple[str, str]] = []          # (canonical, backup)
     published: list[str] = []                    # canonical paths written
+
+    if policy == "fail_if_exists":
+        collisions = [
+            dst for dst in [dst for _src, dst in pairs] + list(retire)
+            if Path(dst).exists()
+        ]
+        if collisions:
+            return False, (
+                "publish collision (fail_if_exists): existing "
+                + ", ".join(Path(c).name for c in collisions)
+            )
 
     if policy == "overwrite":
         # Snapshot pre-existing destinations *before* any publish so a

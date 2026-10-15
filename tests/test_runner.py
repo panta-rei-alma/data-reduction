@@ -1038,11 +1038,9 @@ class TestPublishPair:
         """If the second publish fails, the first must be unlinked
         so retries see a clean canonical area."""
         a_src = tmp_path / "a.fits"; a_src.write_text("A")
-        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        b_src = tmp_path / "ghost_b.fits"  # missing → second publish raises
         a_dst = tmp_path / "out" / "A.fits"
         b_dst = tmp_path / "out" / "B.fits"
-        b_dst.parent.mkdir(parents=True, exist_ok=True)
-        b_dst.write_text("preexisting")  # forces fail_if_exists to error
 
         ok, msg = _publish_pair(
             [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
@@ -1052,7 +1050,21 @@ class TestPublishPair:
         assert "rolled back 1" in msg
         # First publish was rolled back
         assert not a_dst.exists()
-        # Pre-existing second target is untouched
+        assert not b_dst.exists()
+
+    def test_pair_fail_if_exists_collision_refused_up_front(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        a_dst = tmp_path / "out" / "A.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        b_dst.parent.mkdir(parents=True, exist_ok=True)
+        b_dst.write_text("preexisting")
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="fail_if_exists",
+        )
+        assert not ok and "collision" in msg
+        assert not a_dst.exists()  # nothing was published
         assert b_dst.read_text() == "preexisting"
 
     def test_pair_first_fails_no_publishes(self, tmp_path):
@@ -1128,16 +1140,21 @@ class TestPublishPair:
         assert stale.read_text() == "ALPHA_OLD"
         assert not list(a_dst.parent.glob("*.bak.*"))
 
-    def test_pair_fail_if_exists_never_retires(self, tmp_path):
+    def test_pair_fail_if_exists_refuses_stale_retire_candidate(self, tmp_path):
+        """No-overwrite policy: an old optional product from another
+        generation is a collision, not something to publish beside."""
         a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        tt0 = tmp_path / "out" / "tt0.fits"
         stale = tmp_path / "out" / "alpha.fits"
         stale.parent.mkdir(parents=True)
         stale.write_text("ALPHA_OLD")
-        ok, _msg = _publish_pair(
-            [(str(a_src), str(tmp_path / "out" / "tt0.fits"))],
+        ok, msg = _publish_pair(
+            [(str(a_src), str(tt0))],
             policy="fail_if_exists", retire=(str(stale),),
         )
-        assert ok
+        assert not ok
+        assert "collision" in msg and "alpha.fits" in msg
+        assert not tt0.exists()
         assert stale.read_text() == "ALPHA_OLD"
 
     def test_pair_overwrite_success_drops_backups(self, tmp_path):
