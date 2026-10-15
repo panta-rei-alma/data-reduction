@@ -537,6 +537,13 @@ class TestBuildTcleanParams:
         assert params["gridder"] == "mosaic"
         assert params["pbcor"] is True
         assert params["stokes"] == "I"
+        assert params["restoringbeam"] == "common"
+
+    def test_common_beam_overrides_recovered(self, basic_unit):
+        """Every line cube gets one common restoring beam, whatever QA2 used."""
+        basic_unit.recovered_params["restoringbeam"] = ["2arcsec", "1arcsec", "0deg"]
+        params = build_tclean_params(basic_unit, imagename="/out/test")
+        assert params["restoringbeam"] == "common"
 
     def test_no_sdintimaging_params(self, basic_unit):
         """tclean params should NOT contain sdintimaging-specific keys."""
