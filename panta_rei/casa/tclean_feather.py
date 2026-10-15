@@ -45,7 +45,7 @@ log = logging.getLogger("tclean_feather")
 
 
 # Headline fields of tclean's return dict copied into result.json; the full
-# (JSON-safe) dict goes to the tclean_summary.json sidecar.
+# (JSON-safe) dict goes to the cleaning record (tclean_summary.json).
 SUMMARY_KEYS = ("stopcode", "stopDescription", "iterdone", "nmajordone")
 
 
@@ -78,48 +78,63 @@ def json_safe(obj):
     return repr(obj)
 
 
-def record_tclean_summary(ret, run_dir, result):
-    """Write tclean's return to tclean_summary.json; headline it in result."""
-    summary = json_safe(ret) if ret is not None else None
-    path = run_dir / "tclean_summary.json"
+# Cleaning record: the single source of truth for who cleaned the products.
+# Written straight after tclean returns (completed=True) or raises
+# (completed=False), before any export/TP/feather step, so a later failure
+# or resume can neither lose nor misattribute it.  A fresh tclean deletes
+# the previous record first, so it is always bound to the current
+# generation.  A prior result.json casa_version is never trusted (legacy
+# stamps there may be exporter versions).
+CLEANING_RECORD = "tclean_summary.json"
+
+
+def write_cleaning_record(run_dir, ret, casa_version, completed):
+    """Write {completed, casa_version, summary} for this tclean generation."""
+    record = {
+        "completed": completed,
+        "casa_version": casa_version,
+        "summary": json_safe(ret) if ret is not None else None,
+    }
+    path = run_dir / CLEANING_RECORD
     try:
-        path.write_text(json.dumps(summary, indent=2))
-        result["tclean_summary_json"] = str(path)
+        path.write_text(json.dumps(record, indent=2))
     except Exception as e:  # noqa: BLE001 - provenance must not fail the job
         log.warning("could not write %s: %s", path.name, e)
+
+
+def apply_cleaning_record(run_dir, result):
+    """Copy a *completed* cleaning record's version + headline into result.
+
+    Returns False (result untouched) if there is no completed record.
+    """
+    path = run_dir / CLEANING_RECORD
+    try:
+        record = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001 - missing/corrupt → no provenance
+        return False
+    if not isinstance(record, dict) or record.get("completed") is not True:
+        return False
+    result["casa_version"] = record.get("casa_version") or "unknown"
+    summary = record.get("summary")
     if isinstance(summary, dict):
         result["tclean_summary"] = {k: summary.get(k) for k in SUMMARY_KEYS}
+    result["tclean_summary_json"] = str(path)
+    return True
 
 
-def carry_prior_provenance(run_dir, result):
-    """On resume (tclean skipped), keep the original cleaning provenance.
-
-    The products were cleaned by an earlier invocation: its result.json
-    holds the cleaning CASA version and summary headline, and its
-    tclean_summary.json sidecar the full summary.  The current CASA only
-    exports (and feathers) and stays in ``export_casa_version``.  Without
-    prior provenance the cleaning version is ``unknown``.
-    """
+def run_tclean_recorded(tclean_task, params, run_dir, result, casa_version):
+    """Run a fresh tclean generation and record its cleaning provenance."""
+    path = run_dir / CLEANING_RECORD
+    if path.exists():
+        path.unlink()  # new generation: never inherit an old record
+    result["casa_version"] = casa_version
     try:
-        prior = json.loads((run_dir / "result.json").read_text())
-    except Exception:  # noqa: BLE001 - missing/corrupt → no provenance
-        prior = {}
-    if not isinstance(prior, dict):
-        prior = {}
-    result["casa_version"] = prior.get("casa_version") or "unknown"
-    result["tclean_summary"] = prior.get("tclean_summary")
-    sidecar = run_dir / "tclean_summary.json"
-    if sidecar.exists():
-        result["tclean_summary_json"] = str(sidecar)
-        if result["tclean_summary"] is None:
-            try:
-                summary = json.loads(sidecar.read_text())
-                if isinstance(summary, dict):
-                    result["tclean_summary"] = {
-                        k: summary.get(k) for k in SUMMARY_KEYS
-                    }
-            except Exception:  # noqa: BLE001
-                pass
+        ret = tclean_task(**params)
+    except Exception:
+        write_cleaning_record(run_dir, None, casa_version, completed=False)
+        raise
+    write_cleaning_record(run_dir, ret, casa_version, completed=True)
+    apply_cleaning_record(run_dir, result)
 
 
 def ensure_axis_order(casa_image):
@@ -186,9 +201,9 @@ def main():
         "tclean_fits": None,
         "aux_fits": {},
         "tclean_summary": None,
-        # CASA that cleaned the products; differs from export_casa_version
-        # only when a resume reuses earlier tclean output.
-        "casa_version": casa_version_string(),
+        # CASA that cleaned the products (from the cleaning record; unknown
+        # on a resume without one); export_casa_version is this CASA.
+        "casa_version": "unknown",
         "export_casa_version": casa_version_string(),
         "error_message": None,
     }
@@ -204,11 +219,12 @@ def main():
         # Skip tclean if products already exist (resume from feather)
         if Path(pbcor_image).exists():
             log.info("tclean products already exist, skipping to feather: %s", Path(pbcor_image).name)
-            carry_prior_provenance(run_dir, result)
+            apply_cleaning_record(run_dir, result)
         else:
             log.info("Running tclean: %s", Path(imagename).name)
-            ret = tclean(**params)
-            record_tclean_summary(ret, run_dir, result)
+            run_tclean_recorded(
+                tclean, params, run_dir, result, result["export_casa_version"],
+            )
 
             if not Path(pbcor_image).exists():
                 raise FileNotFoundError(f"tclean did not produce {pbcor_image}")
