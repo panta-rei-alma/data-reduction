@@ -376,6 +376,39 @@ def _copy_provenance_to_nas(
     return out
 
 
+def _terminal_provenance(
+    work_run_dir: Path,
+    log_path: Path,
+    nas_unit_dir: Path,
+    *,
+    best_effort: bool = False,
+) -> dict:
+    """Terminal-state provenance fields, shared by success and crash paths.
+
+    The cleaning CASA version is read from the local result.json first, so
+    it is recorded even when the NAS copy then fails (e.g. a post-CASA
+    publish/copy error).  With *best_effort* a copy failure is logged and the
+    ``provenance`` key omitted instead of raising.
+    """
+    from panta_rei.imaging.runner import executing_casa_version
+
+    fields: dict[str, Any] = {}
+    casa_version = executing_casa_version(work_run_dir)
+    if casa_version:
+        fields["casa_version"] = casa_version
+    try:
+        fields["provenance"] = _copy_provenance_to_nas(
+            work_run_dir=work_run_dir,
+            log_path=log_path,
+            nas_unit_dir=nas_unit_dir,
+        )
+    except OSError:
+        if not best_effort:
+            raise
+        log.exception("provenance copy to NAS failed")
+    return fields
+
+
 def run_unit(args: argparse.Namespace) -> int:
     """Process a single imaging unit end-to-end."""
     pgid = _setup_pgid()
@@ -524,13 +557,9 @@ def run_unit(args: argparse.Namespace) -> int:
             )
 
         # ---------- COPY PROVENANCE TO NAS ----------
-        provenance = _copy_provenance_to_nas(
-            work_run_dir=work_dir / "runs" / str(run_id),
-            log_path=log_path,
-            nas_unit_dir=nas_unit_dir,
+        provenance_fields = _terminal_provenance(
+            work_dir / "runs" / str(run_id), log_path, nas_unit_dir,
         )
-        from panta_rei.imaging.runner import executing_casa_version
-        casa_version = executing_casa_version(work_dir / "runs" / str(run_id))
 
         # Resolved selections survive on the worker side because
         # run_trusted_preflight mutates `unit` in-place inside the runner.
@@ -542,11 +571,9 @@ def run_unit(args: argparse.Namespace) -> int:
             "spw_selection": unit.spw_selection,
             "field_selection": unit.field_selection,
             "datacolumn": unit.datacolumn,
-            "provenance": provenance,
+            **provenance_fields,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        if casa_version:
-            terminal["casa_version"] = casa_version
         if not success:
             terminal["error_message"] = msg
 
@@ -558,23 +585,25 @@ def run_unit(args: argparse.Namespace) -> int:
         # Any unexpected failure → mark FAILED + last-resort log
         log.exception("worker crashed")
         crash_tail = traceback.format_exc()[-2000:]
+        # Best-effort provenance first, so the terminal state still carries
+        # the CASA version if CASA ran before the failure.
+        try:
+            provenance_fields = _terminal_provenance(
+                work_dir / "runs" / str(run_id), log_path, nas_unit_dir,
+                best_effort=True,
+            )
+        except Exception:  # noqa: BLE001 - never mask the original crash
+            log.exception("provenance collection failed")
+            provenance_fields = {}
         base_state.update({
             "phase": Phase.FAILED,
             "success": False,
             "error_message": f"worker exception: {exc}: {crash_tail}",
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **provenance_fields,
         })
         try:
             write_state_atomic(state_path, base_state)
-        except OSError:
-            pass
-        # Best-effort provenance copy
-        try:
-            _copy_provenance_to_nas(
-                work_run_dir=work_dir / "runs" / str(run_id),
-                log_path=log_path,
-                nas_unit_dir=nas_unit_dir,
-            )
         except OSError:
             pass
         return 2
