@@ -865,6 +865,31 @@ class TestRunTcleanFeather:
         result = json.loads((run_dir / "result.json").read_text())
         assert result["tclean_summary"] is None and result["success"] is False
 
+    def test_serial_result_write_failure_keeps_original_error(self, basic_unit, tmp_path):
+        """A result.json write error during failure handling must not
+        replace the task's own exception."""
+        run_dir = tmp_path / "output" / "runs" / "7"
+        (run_dir / "result.json").mkdir(parents=True)  # write_text → OSError
+
+        def fake_tclean(**kwargs):
+            Path(f"{kwargs['imagename']}.image.pbcor").mkdir(parents=True)
+            return {"stopcode": 2}
+
+        def broken_tp(*_a):
+            raise RuntimeError("original TP failure")
+
+        outcome, _, _ = self._serial(basic_unit, tmp_path, "A", fake_tclean, broken_tp)
+        assert isinstance(outcome, RuntimeError)
+        assert str(outcome) == "original TP failure"
+
+    def test_serial_missing_pbcor_writes_result(self, basic_unit, tmp_path):
+        outcome, run_dir, _ = self._serial(
+            basic_unit, tmp_path, "A", lambda **_kw: {"stopcode": 2})
+        ok, msg, _ = outcome
+        assert not ok and "did not produce" in msg
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["success"] is False and "did not produce" in result["error_message"]
+
     def test_preflight_failure(self, basic_unit, tmp_path):
         """If trusted preflight fails, should return failure."""
         with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(False, "no SPW")):

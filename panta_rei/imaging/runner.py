@@ -1605,6 +1605,8 @@ def run_tclean_feather(
                 result["error_message"] = (
                     f"tclean did not produce {Path(pbcor_image).name}"
                 )
+                (run_dir / "result.json").write_text(
+                    json.dumps(result, indent=2))
                 return False, result["error_message"], None
 
         # 8. Export tclean-only product to run_dir
@@ -1653,8 +1655,14 @@ def run_tclean_feather(
         )
     except Exception as exc:
         result["error_message"] = str(exc)
+        # Don't let a result.json write failure replace the task's own error.
+        try:
+            (run_dir / "result.json").write_text(json.dumps(result, indent=2))
+        except OSError as write_exc:
+            log.error("could not write result.json after failure: %s",
+                      write_exc)
         raise
-    finally:
+    else:
         (run_dir / "result.json").write_text(json.dumps(result, indent=2))
 
     # 12. Atomic publish to canonical paths (only on success).  Treat the
