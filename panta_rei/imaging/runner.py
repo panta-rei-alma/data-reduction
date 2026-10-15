@@ -94,11 +94,13 @@ def get_casa_version() -> str:
 # ---------------------------------------------------------------------------
 
 def executing_casa_version(run_dir: Path) -> Optional[str]:
-    """CASA version recorded in ``run_dir/result.json`` by the CASA script.
+    """CASA version that cleaned the products, from ``run_dir/result.json``.
 
     The standalone mpicasa scripts run in monolithic CASA, whose version can
     differ from the orchestration env's casatools (:func:`get_casa_version`).
-    Returns None if result.json is missing, unreadable or has no version.
+    On a resume the script carries the original cleaning version forward
+    (``unknown`` if it had none), so that is what this returns.  Returns None
+    if result.json is missing, unreadable or predates version recording.
     """
     try:
         version = json.loads((Path(run_dir) / "result.json").read_text()).get(
@@ -106,7 +108,7 @@ def executing_casa_version(run_dir: Path) -> Optional[str]:
         )
     except (OSError, ValueError, AttributeError):
         return None
-    return version if version and version != "unknown" else None
+    return version or None
 
 
 def resolve_spw_for_ms(

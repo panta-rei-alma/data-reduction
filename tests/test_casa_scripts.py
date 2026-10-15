@@ -90,6 +90,7 @@ class TestTcleanContScript:
         result = json.loads((run_dir / "result.json").read_text())
         assert result["success"] is True
         assert result["casa_version"] == "6.6.6.17"
+        assert result["export_casa_version"] == "6.6.6.17"
         assert result["tclean_summary"] == {
             "stopcode": 2, "stopDescription": "Reached global threshold",
             "iterdone": 1234, "nmajordone": 5,
@@ -98,7 +99,7 @@ class TestTcleanContScript:
         assert sidecar["summaryminor"]["0"]["0"]["0"]["iterDone"] == [10, 20]
         assert result["tclean_summary_json"] == str(run_dir / "tclean_summary.json")
 
-    def test_resume_skips_summary(self, tmp_path, monkeypatch):
+    def test_resume_without_prior_provenance(self, tmp_path, monkeypatch):
         run_dir, imagename, job_path = self._job(tmp_path)
         Path(f"{imagename}.image.tt0.pbcor").mkdir()  # products already exist
         script = _load_script("tclean_cont", monkeypatch)
@@ -106,5 +107,50 @@ class TestTcleanContScript:
         assert script.main() == 0
         result = json.loads((run_dir / "result.json").read_text())
         assert result["tclean_summary"] is None
-        assert result["casa_version"] == "6.6.6.17"
+        assert result["casa_version"] == "unknown"
+        assert result["export_casa_version"] == "6.6.6.17"
         assert not (run_dir / "tclean_summary.json").exists()
+
+    @pytest.mark.parametrize("name", ["tclean_cont", "tclean_feather"])
+    def test_resume_keeps_cleaning_provenance(self, tmp_path, monkeypatch, name):
+        """Cleaned under 6.6.6.old, resumed (export only) under 6.6.6.17."""
+        run_dir, imagename, job_path = self._job(tmp_path)
+        if name == "tclean_cont":
+            Path(f"{imagename}.image.tt0.pbcor").mkdir()
+        else:
+            Path(f"{imagename}.image.pbcor").mkdir()
+        headline = {"stopcode": 2, "stopDescription": "threshold",
+                    "iterdone": 99, "nmajordone": 3}
+        (run_dir / "result.json").write_text(json.dumps({
+            "success": False, "casa_version": "6.6.6.old",
+            "tclean_summary": headline, "error_message": "feather crashed",
+        }))
+        (run_dir / "tclean_summary.json").write_text(json.dumps(
+            dict(headline, summaryminor={})
+        ))
+        script = _load_script(name, monkeypatch)
+        result = {}
+        script.carry_prior_provenance(run_dir, result)
+        assert result["casa_version"] == "6.6.6.old"
+        assert result["tclean_summary"] == headline
+        assert result["tclean_summary_json"] == str(run_dir / "tclean_summary.json")
+
+        if name == "tclean_cont":
+            monkeypatch.setattr(sys, "argv", ["tclean_cont.py", str(job_path)])
+            assert script.main() == 0
+            final = json.loads((run_dir / "result.json").read_text())
+            assert final["casa_version"] == "6.6.6.old"
+            assert final["export_casa_version"] == "6.6.6.17"
+            assert final["tclean_summary"] == headline
+
+    def test_headline_rebuilt_from_sidecar(self, tmp_path, monkeypatch):
+        run_dir, _imagename, _job_path = self._job(tmp_path)
+        (run_dir / "result.json").write_text(json.dumps({"casa_version": "6.6.6.old"}))
+        (run_dir / "tclean_summary.json").write_text(json.dumps(
+            {"stopcode": 1, "stopDescription": "niter", "iterdone": 5,
+             "nmajordone": 2, "summarymajor": [1, 2]}
+        ))
+        script = _load_script("tclean_cont", monkeypatch)
+        result = {}
+        script.carry_prior_provenance(run_dir, result)
+        assert result["tclean_summary"]["iterdone"] == 5

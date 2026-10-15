@@ -181,13 +181,22 @@ class TestExecutingCasaVersion:
         )
         assert executing_casa_version(tmp_path) == "6.6.6.17"
 
-    def test_none_when_missing_unknown_or_corrupt(self, tmp_path):
+    def test_none_when_missing_old_schema_or_corrupt(self, tmp_path):
         from panta_rei.imaging.runner import executing_casa_version
         assert executing_casa_version(tmp_path) is None
-        (tmp_path / "result.json").write_text(json.dumps({"casa_version": "unknown"}))
+        (tmp_path / "result.json").write_text(json.dumps({"success": True}))
         assert executing_casa_version(tmp_path) is None
         (tmp_path / "result.json").write_text("{not json")
         assert executing_casa_version(tmp_path) is None
+
+    def test_unknown_cleaning_version_is_reported(self, tmp_path):
+        """A resume without prior provenance records 'unknown', which must
+        replace the (wrong) orchestrator version in the DB."""
+        from panta_rei.imaging.runner import executing_casa_version
+        (tmp_path / "result.json").write_text(json.dumps(
+            {"casa_version": "unknown", "export_casa_version": "6.7.4"}
+        ))
+        assert executing_casa_version(tmp_path) == "unknown"
 
 
 # ---------------------------------------------------------------------------

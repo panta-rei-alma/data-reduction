@@ -91,6 +91,37 @@ def record_tclean_summary(ret, run_dir, result):
         result["tclean_summary"] = {k: summary.get(k) for k in SUMMARY_KEYS}
 
 
+def carry_prior_provenance(run_dir, result):
+    """On resume (tclean skipped), keep the original cleaning provenance.
+
+    The products were cleaned by an earlier invocation: its result.json
+    holds the cleaning CASA version and summary headline, and its
+    tclean_summary.json sidecar the full summary.  The current CASA only
+    exports (and feathers) and stays in ``export_casa_version``.  Without
+    prior provenance the cleaning version is ``unknown``.
+    """
+    try:
+        prior = json.loads((run_dir / "result.json").read_text())
+    except Exception:  # noqa: BLE001 - missing/corrupt → no provenance
+        prior = {}
+    if not isinstance(prior, dict):
+        prior = {}
+    result["casa_version"] = prior.get("casa_version") or "unknown"
+    result["tclean_summary"] = prior.get("tclean_summary")
+    sidecar = run_dir / "tclean_summary.json"
+    if sidecar.exists():
+        result["tclean_summary_json"] = str(sidecar)
+        if result["tclean_summary"] is None:
+            try:
+                summary = json.loads(sidecar.read_text())
+                if isinstance(summary, dict):
+                    result["tclean_summary"] = {
+                        k: summary.get(k) for k in SUMMARY_KEYS
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def ensure_axis_order(casa_image):
     """Transpose to [RA, DEC, Stokes, Freq] if needed."""
     ia = iatool()
@@ -155,7 +186,10 @@ def main():
         "tclean_fits": None,
         "aux_fits": {},
         "tclean_summary": None,
+        # CASA that cleaned the products; differs from export_casa_version
+        # only when a resume reuses earlier tclean output.
         "casa_version": casa_version_string(),
+        "export_casa_version": casa_version_string(),
         "error_message": None,
     }
     result_path = run_dir / "result.json"
@@ -170,6 +204,7 @@ def main():
         # Skip tclean if products already exist (resume from feather)
         if Path(pbcor_image).exists():
             log.info("tclean products already exist, skipping to feather: %s", Path(pbcor_image).name)
+            carry_prior_provenance(run_dir, result)
         else:
             log.info("Running tclean: %s", Path(imagename).name)
             ret = tclean(**params)
