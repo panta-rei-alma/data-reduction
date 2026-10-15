@@ -62,6 +62,7 @@ def test_copy_provenance_copies_present_files(tmp_path):
     work_run.mkdir(parents=True)
     (work_run / "job.json").write_text(json.dumps({"k": "v"}))
     (work_run / "result.json").write_text(json.dumps({"success": True}))
+    (work_run / "tclean_summary.json").write_text(json.dumps({"iterdone": 5}))
     log_path = tmp_path / "logs" / "unit_1.log"
     log_path.parent.mkdir(parents=True)
     log_path.write_text("hello")
@@ -72,6 +73,8 @@ def test_copy_provenance_copies_present_files(tmp_path):
     assert (nas_unit / "unit.log").exists()
     assert out["job_json"] == str(nas_unit / "job.json")
     assert out["log"] == str(nas_unit / "unit.log")
+    assert out["tclean_summary_json"] == str(nas_unit / "tclean_summary.json")
+    assert (nas_unit / "tclean_summary.json").exists()
 
 
 def test_copy_provenance_handles_missing_optional(tmp_path):
@@ -84,6 +87,7 @@ def test_copy_provenance_handles_missing_optional(tmp_path):
     out = W._copy_provenance_to_nas(work_run, log_path, nas_unit)
     assert out["job_json"] is not None
     assert out["result_json"] is None
+    assert out["tclean_summary_json"] is None
     assert out["log"] is None
 
 

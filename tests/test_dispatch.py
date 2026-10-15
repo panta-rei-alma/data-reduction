@@ -146,6 +146,7 @@ def test_db_writer_handles_lifecycle(tmp_path):
                 "line_group": "LG", "spw_id": "23",
                 "started_at": "2026-01-01T00:00:00",
                 "status": ImagingRunStatus.QUEUED,
+                "casa_version": "6.7.0",  # orchestrator casatools
             },
             "row_id_holder": holder,
         })
@@ -178,6 +179,7 @@ def test_db_writer_handles_lifecycle(tmp_path):
             "spw_selection": json.dumps(["23"]),
             "field_selection": json.dumps(["S"]),
             "job_json_path": "/nas/jobs/x.json",
+            "casa_version": "6.6.6.17",  # executing CASA, from result.json
         })
     finally:
         writer.stop()
@@ -190,6 +192,7 @@ def test_db_writer_handles_lifecycle(tmp_path):
     assert row["last_heartbeat"] == "2026-01-01T00:00:30"
     assert row["output_fits"] == "/nas/out.fits"
     assert row["job_json_path"] == "/nas/jobs/x.json"
+    assert row["casa_version"] == "6.6.6.17"
     assert row["dispatch_id"] == dispatch_id
     assert row["hostname"] == "alpha"
 

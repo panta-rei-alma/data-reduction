@@ -173,6 +173,23 @@ class TestCasaVersion:
             assert isinstance(version, str)
 
 
+class TestExecutingCasaVersion:
+    def test_reads_version_from_result_json(self, tmp_path):
+        from panta_rei.imaging.runner import executing_casa_version
+        (tmp_path / "result.json").write_text(
+            json.dumps({"success": True, "casa_version": "6.6.6.17"})
+        )
+        assert executing_casa_version(tmp_path) == "6.6.6.17"
+
+    def test_none_when_missing_unknown_or_corrupt(self, tmp_path):
+        from panta_rei.imaging.runner import executing_casa_version
+        assert executing_casa_version(tmp_path) is None
+        (tmp_path / "result.json").write_text(json.dumps({"casa_version": "unknown"}))
+        assert executing_casa_version(tmp_path) is None
+        (tmp_path / "result.json").write_text("{not json")
+        assert executing_casa_version(tmp_path) is None
+
+
 # ---------------------------------------------------------------------------
 # Trusted preflight (mocked casatools)
 # ---------------------------------------------------------------------------

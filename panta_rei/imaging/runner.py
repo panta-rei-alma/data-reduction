@@ -92,6 +92,22 @@ def get_casa_version() -> str:
 # Trusted-mode preflight
 # ---------------------------------------------------------------------------
 
+def executing_casa_version(run_dir: Path) -> Optional[str]:
+    """CASA version recorded in ``run_dir/result.json`` by the CASA script.
+
+    The standalone mpicasa scripts run in monolithic CASA, whose version can
+    differ from the orchestration env's casatools (:func:`get_casa_version`).
+    Returns None if result.json is missing, unreadable or has no version.
+    """
+    try:
+        version = json.loads((Path(run_dir) / "result.json").read_text()).get(
+            "casa_version"
+        )
+    except (OSError, ValueError, AttributeError):
+        return None
+    return version if version and version != "unknown" else None
+
+
 def resolve_spw_for_ms(
     ms_path: str,
     target_center_hz: float,

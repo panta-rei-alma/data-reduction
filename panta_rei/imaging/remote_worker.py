@@ -345,10 +345,14 @@ def _copy_provenance_to_nas(
     log_path: Path,
     nas_unit_dir: Path,
 ) -> dict:
-    """Copy job.json, result.json, log to NAS.  Return absolute NAS paths."""
+    """Copy job.json, result.json, tclean_summary.json, log to NAS.
+
+    Return absolute NAS paths.
+    """
     nas_unit_dir.mkdir(parents=True, exist_ok=True)
     out: dict[str, Optional[str]] = {
-        "job_json": None, "result_json": None, "log": None,
+        "job_json": None, "result_json": None, "tclean_summary_json": None,
+        "log": None,
     }
     job_src = work_run_dir / "job.json"
     if job_src.exists():
@@ -360,6 +364,11 @@ def _copy_provenance_to_nas(
         dst = nas_unit_dir / "result.json"
         shutil.copy2(str(result_src), str(dst))
         out["result_json"] = str(dst)
+    summary_src = work_run_dir / "tclean_summary.json"
+    if summary_src.exists():
+        dst = nas_unit_dir / "tclean_summary.json"
+        shutil.copy2(str(summary_src), str(dst))
+        out["tclean_summary_json"] = str(dst)
     if log_path.exists():
         dst = nas_unit_dir / "unit.log"
         shutil.copy2(str(log_path), str(dst))
@@ -520,6 +529,8 @@ def run_unit(args: argparse.Namespace) -> int:
             log_path=log_path,
             nas_unit_dir=nas_unit_dir,
         )
+        from panta_rei.imaging.runner import executing_casa_version
+        casa_version = executing_casa_version(work_dir / "runs" / str(run_id))
 
         # Resolved selections survive on the worker side because
         # run_trusted_preflight mutates `unit` in-place inside the runner.
@@ -534,6 +545,8 @@ def run_unit(args: argparse.Namespace) -> int:
             "provenance": provenance,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+        if casa_version:
+            terminal["casa_version"] = casa_version
         if not success:
             terminal["error_message"] = msg
 

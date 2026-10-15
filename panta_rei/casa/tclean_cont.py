@@ -44,6 +44,53 @@ logging.basicConfig(
 log = logging.getLogger("tclean_cont")
 
 
+# Headline fields of tclean's return dict copied into result.json; the full
+# (JSON-safe) dict goes to the tclean_summary.json sidecar.
+SUMMARY_KEYS = ("stopcode", "stopDescription", "iterdone", "nmajordone")
+
+
+def casa_version_string():
+    """Version of the CASA actually executing this script."""
+    try:
+        import casatools
+        return casatools.version_string()
+    except Exception:  # noqa: BLE001 - provenance only
+        return "unknown"
+
+
+def json_safe(obj):
+    """Recursively convert tclean's return value into JSON-serialisable data.
+
+    numpy scalars/arrays become Python numbers/lists; anything else that
+    json cannot handle is stored as its repr rather than failing the job.
+    """
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if hasattr(obj, "tolist"):  # numpy array or scalar
+        try:
+            return json_safe(obj.tolist())
+        except Exception:  # noqa: BLE001
+            pass
+    return repr(obj)
+
+
+def record_tclean_summary(ret, run_dir, result):
+    """Write tclean's return to tclean_summary.json; headline it in result."""
+    summary = json_safe(ret) if ret is not None else None
+    path = run_dir / "tclean_summary.json"
+    try:
+        path.write_text(json.dumps(summary, indent=2))
+        result["tclean_summary_json"] = str(path)
+    except Exception as e:  # noqa: BLE001 - provenance must not fail the job
+        log.warning("could not write %s: %s", path.name, e)
+    if isinstance(summary, dict):
+        result["tclean_summary"] = {k: summary.get(k) for k in SUMMARY_KEYS}
+
+
 # CASA image suffix (relative to imagename) for each aux/diagnostic product
 # under multi-term MFS.  ``mask`` is not term-split; the others are (we keep
 # the tt0 term for residual/pb/psf).  ``tt0_image``/``tt1_image`` are the flat,
@@ -100,6 +147,8 @@ def main():
         "tt1_fits": None,
         "alpha_fits": None,
         "aux_fits": {},
+        "tclean_summary": None,
+        "casa_version": casa_version_string(),
         "error_message": None,
     }
     result_path = run_dir / "result.json"
@@ -118,7 +167,8 @@ def main():
                      Path(tt0_pbcor).name)
         else:
             log.info("Running continuum tclean (mtmfs): %s", Path(imagename).name)
-            tclean(**params)
+            ret = tclean(**params)
+            record_tclean_summary(ret, run_dir, result)
             if not Path(tt0_pbcor).exists():
                 raise FileNotFoundError(f"tclean did not produce {tt0_pbcor}")
 
