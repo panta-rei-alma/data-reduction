@@ -59,6 +59,31 @@ ITER0_AND_ITER1 = dedent("""\
     tclean(vis=['test.ms'], field='"SRC1"', spw=['25'], specmode='cube', nchan=100, start='87.0GHz', width='244.14kHz', imsize=[100, 100], cell=['0.5arcsec'], restoration=True, pbcor=True, niter=30000, threshold='0.1Jy', imagename='test.spw25.cube.I.iter1')
 """)
 
+# A real-format QA2 cube call (casa_commands.log line-wrapping preserved),
+# including values the old regex fallback dropped: nested lists, restfreq,
+# uvtaper, scales, a value split across a line break, negative numbers.
+REAL_FORMAT_TCLEAN = dedent("""\
+    # hif_makeimlist(specmode='cube')
+    tclean(vis=['uid___A002_X135387b_Xa317_targets_line.ms'],
+           field='"AG221.9599-1.9932"', spw=['27'],
+           antenna=['0,1,2,3,4,5,6,7&'],
+           scan=['7'], intent='OBSERVE_TARGET#ON_SOURCE', datacolumn='data',
+           imagename='uid___A001_X3833_X64ba.s45_0._AG221.9599-1.9932__sci.spw27.cube.regcal.I.iter1',
+           imsize=[480, 450], cell=['0.36arcsec'], phasecenter='ICRS 07:00:50.9517
+           -008.56.30.169', stokes='I', specmode='cube', nchan=1916,
+           start='102.4527117095GHz', width='0.0610408MHz', outframe='LSRK',
+           restfreq=['102.5479844GHz'], uvtaper=[], scales=[0, 5, 15],
+           perchanweightdensity=True, gridder='mosaic', mosweight=True,
+           usepointing=False, pblimit=0.2, deconvolver='hogbom', restoration=True,
+           restoringbeam='common', pbcor=True, weighting='briggsbwtaper',
+           robust=-0.5, npixels=0, niter=4360, threshold='0.0145Jy', nsigma=0.0,
+           cyclefactor=3.0, interactive=False, fullsummary=False, usemask='auto-multithresh',
+           sidelobethreshold=2.0, noisethreshold=4.25, lownoisethreshold=1.5,
+           negativethreshold=15.0, minbeamfrac=0.3, growiterations=50,
+           dogrowprune=True, minpercentchange=1.0, fastnoise=False,
+           savemodel='none', parallel=True)
+""")
+
 
 # ---------------------------------------------------------------------------
 # parse_tclean_calls
@@ -92,6 +117,62 @@ class TestParseTcleanCalls:
         p.write_text("")
         calls = parse_tclean_calls(p)
         assert calls == []
+
+    def test_real_format_keeps_every_literal(self, tmp_path):
+        p = tmp_path / "casa_commands.log"
+        p.write_text(REAL_FORMAT_TCLEAN)
+        (c,) = parse_tclean_calls(p)
+        assert c["field"] == '"AG221.9599-1.9932"'
+        assert c["antenna"] == ["0,1,2,3,4,5,6,7&"]
+        assert c["imsize"] == [480, 450]
+        assert c["restfreq"] == ["102.5479844GHz"]
+        assert c["uvtaper"] == []
+        assert c["scales"] == [0, 5, 15]
+        assert c["robust"] == -0.5
+        assert c["cyclefactor"] == 3.0
+        assert c["fastnoise"] is False and c["dogrowprune"] is True
+        assert c["minpercentchange"] == 1.0
+        assert c["niter"] == 4360 and isinstance(c["niter"], int)
+        # Value wrapped across a line break: whitespace collapsed later by
+        # _normalize_string_values, but the value itself is intact.
+        assert " ".join(c["phasecenter"].split()) == "ICRS 07:00:50.9517 -008.56.30.169"
+
+    def test_nested_lists_and_negative_numbers(self, tmp_path):
+        p = tmp_path / "casa_commands.log"
+        p.write_text(
+            "tclean(vis=['a.ms', 'b.ms'], spw=['24:86.1~86.2GHz;86.3~86.4GHz', '18'], "
+            "mask=[[1, 2], [3, 4]], negativethreshold=-1.5e-3, nterms=2, "
+            "reffreq='86.5GHz', calcres=False)\n"
+        )
+        (c,) = parse_tclean_calls(p)
+        assert c["vis"] == ["a.ms", "b.ms"]
+        assert c["spw"] == ["24:86.1~86.2GHz;86.3~86.4GHz", "18"]
+        assert c["mask"] == [[1, 2], [3, 4]]
+        assert c["negativethreshold"] == -1.5e-3
+        assert c["nterms"] == 2
+        assert c["reffreq"] == "86.5GHz"
+        assert c["calcres"] is False
+
+    def test_non_literal_value_skipped_rest_kept(self, tmp_path):
+        """Self-cal solve calls carry ``np.float64(...)`` reprs; that key is
+        skipped, never evaluated, and the other keywords survive."""
+        p = tmp_path / "casa_commands.log"
+        p.write_text(
+            "tclean(vis=['a.ms'], noisethreshold=np.float64(5.0), "
+            "niter=100, imagename=__import__('os').getcwd())\n"
+        )
+        (c,) = parse_tclean_calls(p)
+        assert c == {"vis": ["a.ms"], "niter": 100}
+
+    def test_unparseable_call_falls_back_to_regex(self, tmp_path):
+        """A truncated/garbled call still yields its recognisable params."""
+        p = tmp_path / "casa_commands.log"
+        p.write_text("tclean(field='SRC1', niter=50, restoration=True, imsize=[10, 10] ,,)\n")
+        (c,) = parse_tclean_calls(p)
+        assert c["field"] == "SRC1"
+        assert c["niter"] == 50
+        assert c["restoration"] is True
+        assert c["imsize"] == [10, 10]
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +268,43 @@ class TestExtractByFieldSpw:
         # Unrelated values pass through with internal whitespace collapsed:
         assert out["specmode"] == "cube"
         assert out["weighting"] == "briggsbwtaper"
+
+
+# A QA2 cube section where spw27 is a nondetection (only the restored dirty
+# iter0 is published) and spw25 has a dirty iter0 published *after* its iter1
+# (order must not matter: the cleaned call wins).
+DIRTY_ONLY_LOG = dedent("""\
+    # hif_makeimlist(specmode='cube')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['25'], specmode='cube', restoration=False, pbcor=False, niter=0, imagename='x.spw25.cube.selfcal.I.iter0')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['25'], specmode='cube', restoration=True, pbcor=True, niter=4360, threshold='0.0145Jy', imagename='x.spw25.cube.selfcal.I.iter1')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['25'], specmode='cube', restoration=True, pbcor=True, niter=0, threshold='0.0mJy', imagename='x.spw25.cube.regcal.I.iter0')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['27'], specmode='cube', restoration=True, pbcor=True, niter=0, threshold='0.0mJy', imagename='x.spw27.cube.regcal.I.iter0')
+""")
+
+
+class TestDirtyIter0Seeds:
+    def _extract(self, tmp_path):
+        from panta_rei.imaging.recovery import clear_parse_cache
+        clear_parse_cache()
+        p = tmp_path / "casa_commands.log"
+        p.write_text(DIRTY_ONLY_LOG)
+        return extract_by_field_spw(filter_cube_iter1_calls(parse_tclean_calls(p), p))
+
+    def test_cleaned_call_beats_dirty_iter0(self, tmp_path):
+        params = self._extract(tmp_path)[("SRC1", "25")]
+        assert params["niter"] == 4360
+        assert params["imagename"].endswith(".iter1")
+        assert "qa2_dirty_only" not in params
+
+    def test_dirty_only_kept_and_marked(self, tmp_path):
+        params = self._extract(tmp_path)[("SRC1", "27")]
+        assert params["niter"] == 0
+        assert params["qa2_dirty_only"] is True
+
+    def test_marker_does_not_leak_into_parse_cache(self, tmp_path):
+        self._extract(tmp_path)
+        cached = parse_tclean_calls(tmp_path / "casa_commands.log")
+        assert not any("qa2_dirty_only" in c for c in cached)
 
 
 # ---------------------------------------------------------------------------

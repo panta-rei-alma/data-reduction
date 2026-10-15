@@ -7,6 +7,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from panta_rei.imaging import remote_worker as W
 
 
@@ -62,6 +64,7 @@ def test_copy_provenance_copies_present_files(tmp_path):
     work_run.mkdir(parents=True)
     (work_run / "job.json").write_text(json.dumps({"k": "v"}))
     (work_run / "result.json").write_text(json.dumps({"success": True}))
+    (work_run / "tclean_summary.json").write_text(json.dumps({"iterdone": 5}))
     log_path = tmp_path / "logs" / "unit_1.log"
     log_path.parent.mkdir(parents=True)
     log_path.write_text("hello")
@@ -72,6 +75,8 @@ def test_copy_provenance_copies_present_files(tmp_path):
     assert (nas_unit / "unit.log").exists()
     assert out["job_json"] == str(nas_unit / "job.json")
     assert out["log"] == str(nas_unit / "unit.log")
+    assert out["tclean_summary_json"] == str(nas_unit / "tclean_summary.json")
+    assert (nas_unit / "tclean_summary.json").exists()
 
 
 def test_copy_provenance_handles_missing_optional(tmp_path):
@@ -84,7 +89,39 @@ def test_copy_provenance_handles_missing_optional(tmp_path):
     out = W._copy_provenance_to_nas(work_run, log_path, nas_unit)
     assert out["job_json"] is not None
     assert out["result_json"] is None
+    assert out["tclean_summary_json"] is None
     assert out["log"] is None
+
+
+def test_terminal_provenance_survives_post_casa_copy_failure(tmp_path, monkeypatch):
+    """CASA wrote result.json, then the NAS copy failed: the crash path
+    still records the cleaning CASA version; the strict path re-raises."""
+    work_run = tmp_path / "work" / "runs" / "3"
+    work_run.mkdir(parents=True)
+    (work_run / "result.json").write_text(
+        json.dumps({"success": True, "casa_version": "6.6.6.17"})
+    )
+    log_path = tmp_path / "unit.log"
+    log_path.write_text("log")
+
+    def broken_copy(*_a, **_kw):
+        raise OSError("NAS gone")
+
+    monkeypatch.setattr(W.shutil, "copy2", broken_copy)
+    fields = W._terminal_provenance(work_run, log_path, tmp_path / "nas",
+                                    best_effort=True)
+    assert fields == {"casa_version": "6.6.6.17"}
+    with pytest.raises(OSError):
+        W._terminal_provenance(work_run, log_path, tmp_path / "nas")
+
+
+def test_terminal_provenance_happy_path(tmp_path):
+    work_run = tmp_path / "work" / "runs" / "4"
+    work_run.mkdir(parents=True)
+    (work_run / "result.json").write_text(json.dumps({"casa_version": "6.6.6.17"}))
+    fields = W._terminal_provenance(work_run, tmp_path / "none.log", tmp_path / "nas")
+    assert fields["casa_version"] == "6.6.6.17"
+    assert fields["provenance"]["result_json"] == str(tmp_path / "nas" / "result.json")
 
 
 def test_preflight_emits_json(tmp_path, capsys, monkeypatch):

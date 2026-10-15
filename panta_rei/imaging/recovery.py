@@ -1,9 +1,10 @@
 """Recover tclean imaging parameters from ALMA pipeline weblogs.
 
 Parses ``casa_commands.log`` from TM (12m) pipeline weblogs to extract
-the tclean parameters used for cube imaging.  Only the **iter1** calls
-(``restoration=True, pbcor=True``) are returned — these represent the
-final cleaned images.
+the tclean parameters used for cube imaging.  Only the restored,
+PB-corrected calls (``restoration=True, pbcor=True``) are returned — the
+final cleaned ``iter1`` images, or the published dirty ``iter0`` image when
+QA2 found nothing to clean (see :func:`extract_by_field_spw`).
 
 The recovered parameters serve as the baseline for ``sdintimaging``.
 """
@@ -166,7 +167,7 @@ def parse_tclean_calls(log_path: Path) -> list[dict]:
 
     Each call may span multiple lines.  The parser accumulates lines from
     ``tclean(`` until a line ending with ``)`` is found, joins them, and
-    converts the parameter string to a dict via :func:`ast.literal_eval`.
+    converts the keyword arguments to a dict (see :func:`_parse_one_call`).
 
     Results are memoized per-process (see ``_PARSE_CACHE``) since recovery
     re-parses the same weblogs repeatedly.
@@ -306,6 +307,14 @@ def extract_by_field_spw(calls: list[dict]) -> dict[tuple[str, str], dict]:
     joins lines with spaces, which can introduce spurious whitespace
     inside string values like ``'auto- multithresh'``).
 
+    The restored/PB-corrected filter also admits the QA2 ``iter0`` dirty
+    call (``niter=0``) that the pipeline publishes directly when it sees no
+    emission.  A cleaned call (``niter>0``) always wins over a dirty one for
+    the same key; a key with only a dirty call keeps it (geometry, spectral
+    grid and weighting are still the right seed) but is marked
+    ``qa2_dirty_only=True`` so the builder gives it a positive clean budget
+    — a QA2 nondetection is not a joint 12m+7m nondetection.
+
     Returns ``{(field, spw): params_dict}``.
     """
     result: dict[tuple[str, str], dict] = {}
@@ -322,10 +331,28 @@ def extract_by_field_spw(calls: list[dict]) -> dict[tuple[str, str], dict]:
 
         key = (field, spw)
         if key in result:
+            if _is_dirty_call(call) and not _is_dirty_call(result[key]):
+                log.debug("Duplicate (field, spw) = %s; keeping cleaned call "
+                          "over dirty iter0", key)
+                continue
             log.debug("Duplicate (field, spw) = %s; keeping last", key)
         result[key] = call
 
+    for key, call in result.items():
+        if _is_dirty_call(call):
+            log.info("(field, spw) = %s has only a QA2 dirty (niter=0) call",
+                     key)
+            call["qa2_dirty_only"] = True
+
     return result
+
+
+def _is_dirty_call(params: dict) -> bool:
+    """True for a tclean call that does no deconvolution (``niter=0``)."""
+    try:
+        return int(params.get("niter", -1)) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _normalize_string_values(params: dict) -> dict:
@@ -472,30 +499,47 @@ def recover_continuum_params_for_mous(
 def _parse_one_call(call_str: str) -> dict:
     """Parse a single ``tclean(key=val, ...)`` string into a dict.
 
-    Primary method: ``ast.literal_eval`` on ``dict(...)`` form.
-    Fallback: regex-based extraction of individual parameters.
-    """
-    # Strip leading 'tclean' and convert to dict(...)
-    inner = call_str.strip()
-    if inner.startswith("tclean"):
-        inner = inner[len("tclean"):]
+    Primary method: ``ast.parse`` the call expression and
+    ``ast.literal_eval`` each keyword value (never ``eval``), so every
+    literal argument is kept — nested lists, quoted field names, booleans,
+    negative numbers.  A keyword whose value is not a literal is logged and
+    skipped; the rest of the call is still recovered.
 
-    # Try ast.literal_eval with dict() wrapper
+    Fallback: if the call text itself does not parse (e.g. a truncated
+    log), regex-based extraction of the most important parameters.
+    """
     try:
-        result = ast.literal_eval(f"dict{inner}")
+        node = ast.parse(call_str.strip(), mode="eval").body
+    except SyntaxError:
+        node = None
+
+    if isinstance(node, ast.Call):
+        result: dict = {}
+        for kw in node.keywords:
+            if kw.arg is None:  # **kwargs splat — nothing literal to keep
+                continue
+            try:
+                result[kw.arg] = ast.literal_eval(kw.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError,
+                    RecursionError):
+                # debug, not warning: the only non-literals seen in real
+                # weblogs are np.float64(...) reprs in self-cal solve calls.
+                log.debug(
+                    "Skipping non-literal tclean argument %s=%.60s",
+                    kw.arg, ast.unparse(kw.value),
+                )
         return result
-    except (ValueError, SyntaxError):
-        pass
 
     # Fallback: regex extraction
-    log.debug("ast.literal_eval failed, falling back to regex for: %.100s...", call_str)
+    log.debug("ast.parse failed, falling back to regex for: %.100s...", call_str)
     return _regex_parse(call_str)
 
 
 def _regex_parse(call_str: str) -> dict:
     """Fallback regex parser for tclean parameter strings.
 
-    Handles the most important parameters that sdintimaging needs.
+    Only used when the call text is not valid Python.  Handles the most
+    important parameters that sdintimaging needs.
     """
     result: dict = {}
 

@@ -88,6 +88,27 @@ def needs_contsub(member_dir: Path) -> Tuple[bool, str]:
     )
 
 
+REFUSED_MSG = (
+    "existing contsub outputs present; contsub over existing outputs is "
+    "unsupported (re-subtraction will use direct uvcontsub into versioned "
+    "outputs)"
+)
+
+
+def existing_contsub_outputs(member_dir: Path) -> List[Path]:
+    """Existing ``*_targets.ms`` / ``*_targets_line.ms`` for the base EBs."""
+    working_dir = member_dir / "calibrated" / "working"
+    found: List[Path] = []
+    if not working_dir.is_dir():
+        return found
+    for ms_path in _find_base_ms_files(working_dir):
+        for suffix in ("_targets.ms", "_targets_line.ms"):
+            product = working_dir / ms_path.name.replace(".ms", suffix)
+            if product.is_dir():
+                found.append(product)
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Single MOUS execution
 # ---------------------------------------------------------------------------
@@ -100,8 +121,13 @@ def _run_one_contsub(
     contsub_script: Path,
     extra_meta: Dict[str, Optional[str]],
     dry_run: bool = False,
+    re_run: bool = False,
 ) -> Tuple[str, int, Path]:
     """Run the contsub CASA script for one MOUS.
+
+    *re_run* is forwarded to the script.  The script refuses to run over
+    any existing contsub output (the step checks that first, see
+    :func:`existing_contsub_outputs`).
 
     Returns ``(status, retcode, log_path)``.
     """
@@ -115,6 +141,8 @@ def _run_one_contsub(
     log_path = log_dir / f"contsub_{ts}.log"
 
     full_cmd = f"{casa_cmd} -c {contsub_script} --member-dir {member_dir}"
+    if re_run:
+        full_cmd += " --re-run"
 
     with db_manager.connect() as con:
         row_id = ContsubRunsQueries.insert_row(
@@ -281,6 +309,18 @@ class ContsubStep(Step):
                     skipped += 1
                     continue
 
+            # Anything that would run mstransform/uvcontsub is only allowed
+            # for genuinely fresh EBs: refuse loudly over existing outputs
+            # (partial state, or --re-run) rather than touching them.
+            present = existing_contsub_outputs(mous_dir)
+            if present:
+                log.error(
+                    "Refusing contsub for %s: %s (%s)", uid,
+                    REFUSED_MSG, ", ".join(p.name for p in present),
+                )
+                errors.append(f"{uid}: {REFUSED_MSG}")
+                continue
+
             # Apply limit
             if opts.limit is not None and processed >= opts.limit:
                 log.info("Limit of %d reached, stopping.", opts.limit)
@@ -315,6 +355,7 @@ class ContsubStep(Step):
                 contsub_script=contsub_script,
                 extra_meta=extra_meta,
                 dry_run=ctx.dry_run,
+                re_run=opts.re_run,
             )
 
             processed += 1

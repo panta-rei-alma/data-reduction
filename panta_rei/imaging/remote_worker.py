@@ -345,10 +345,14 @@ def _copy_provenance_to_nas(
     log_path: Path,
     nas_unit_dir: Path,
 ) -> dict:
-    """Copy job.json, result.json, log to NAS.  Return absolute NAS paths."""
+    """Copy job.json, result.json, tclean_summary.json, log to NAS.
+
+    Return absolute NAS paths.
+    """
     nas_unit_dir.mkdir(parents=True, exist_ok=True)
     out: dict[str, Optional[str]] = {
-        "job_json": None, "result_json": None, "log": None,
+        "job_json": None, "result_json": None, "tclean_summary_json": None,
+        "log": None,
     }
     job_src = work_run_dir / "job.json"
     if job_src.exists():
@@ -360,11 +364,49 @@ def _copy_provenance_to_nas(
         dst = nas_unit_dir / "result.json"
         shutil.copy2(str(result_src), str(dst))
         out["result_json"] = str(dst)
+    summary_src = work_run_dir / "tclean_summary.json"
+    if summary_src.exists():
+        dst = nas_unit_dir / "tclean_summary.json"
+        shutil.copy2(str(summary_src), str(dst))
+        out["tclean_summary_json"] = str(dst)
     if log_path.exists():
         dst = nas_unit_dir / "unit.log"
         shutil.copy2(str(log_path), str(dst))
         out["log"] = str(dst)
     return out
+
+
+def _terminal_provenance(
+    work_run_dir: Path,
+    log_path: Path,
+    nas_unit_dir: Path,
+    *,
+    best_effort: bool = False,
+) -> dict:
+    """Terminal-state provenance fields, shared by success and crash paths.
+
+    The cleaning CASA version is read from the local result.json first, so
+    it is recorded even when the NAS copy then fails (e.g. a post-CASA
+    publish/copy error).  With *best_effort* a copy failure is logged and the
+    ``provenance`` key omitted instead of raising.
+    """
+    from panta_rei.imaging.runner import executing_casa_version
+
+    fields: dict[str, Any] = {}
+    casa_version = executing_casa_version(work_run_dir)
+    if casa_version:
+        fields["casa_version"] = casa_version
+    try:
+        fields["provenance"] = _copy_provenance_to_nas(
+            work_run_dir=work_run_dir,
+            log_path=log_path,
+            nas_unit_dir=nas_unit_dir,
+        )
+    except OSError:
+        if not best_effort:
+            raise
+        log.exception("provenance copy to NAS failed")
+    return fields
 
 
 def run_unit(args: argparse.Namespace) -> int:
@@ -515,10 +557,8 @@ def run_unit(args: argparse.Namespace) -> int:
             )
 
         # ---------- COPY PROVENANCE TO NAS ----------
-        provenance = _copy_provenance_to_nas(
-            work_run_dir=work_dir / "runs" / str(run_id),
-            log_path=log_path,
-            nas_unit_dir=nas_unit_dir,
+        provenance_fields = _terminal_provenance(
+            work_dir / "runs" / str(run_id), log_path, nas_unit_dir,
         )
 
         # Resolved selections survive on the worker side because
@@ -531,7 +571,7 @@ def run_unit(args: argparse.Namespace) -> int:
             "spw_selection": unit.spw_selection,
             "field_selection": unit.field_selection,
             "datacolumn": unit.datacolumn,
-            "provenance": provenance,
+            **provenance_fields,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         if not success:
@@ -545,23 +585,25 @@ def run_unit(args: argparse.Namespace) -> int:
         # Any unexpected failure → mark FAILED + last-resort log
         log.exception("worker crashed")
         crash_tail = traceback.format_exc()[-2000:]
+        # Best-effort provenance first, so the terminal state still carries
+        # the CASA version if CASA ran before the failure.
+        try:
+            provenance_fields = _terminal_provenance(
+                work_dir / "runs" / str(run_id), log_path, nas_unit_dir,
+                best_effort=True,
+            )
+        except Exception:  # noqa: BLE001 - never mask the original crash
+            log.exception("provenance collection failed")
+            provenance_fields = {}
         base_state.update({
             "phase": Phase.FAILED,
             "success": False,
             "error_message": f"worker exception: {exc}: {crash_tail}",
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **provenance_fields,
         })
         try:
             write_state_atomic(state_path, base_state)
-        except OSError:
-            pass
-        # Best-effort provenance copy
-        try:
-            _copy_provenance_to_nas(
-                work_run_dir=work_dir / "runs" / str(run_id),
-                log_path=log_path,
-                nas_unit_dir=nas_unit_dir,
-            )
         except OSError:
             pass
         return 2

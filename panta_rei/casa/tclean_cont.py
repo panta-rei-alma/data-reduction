@@ -44,6 +44,99 @@ logging.basicConfig(
 log = logging.getLogger("tclean_cont")
 
 
+# Headline fields of tclean's return dict copied into result.json; the full
+# (JSON-safe) dict goes to the cleaning record (tclean_summary.json).
+SUMMARY_KEYS = ("stopcode", "stopDescription", "iterdone", "nmajordone")
+
+
+def casa_version_string():
+    """Version of the CASA actually executing this script."""
+    try:
+        import casatools
+        return casatools.version_string()
+    except Exception:  # noqa: BLE001 - provenance only
+        return "unknown"
+
+
+def json_safe(obj):
+    """Recursively convert tclean's return value into JSON-serialisable data.
+
+    numpy scalars/arrays become Python numbers/lists; anything else that
+    json cannot handle is stored as its repr rather than failing the job.
+    """
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if hasattr(obj, "tolist"):  # numpy array or scalar
+        try:
+            return json_safe(obj.tolist())
+        except Exception:  # noqa: BLE001
+            pass
+    return repr(obj)
+
+
+# Cleaning record: the single source of truth for who cleaned the products.
+# Written straight after tclean returns (completed=True) or raises
+# (completed=False), before any export/TP/feather step, so a later failure
+# or resume can neither lose nor misattribute it.  A fresh tclean deletes
+# the previous record first, so it is always bound to the current
+# generation.  A prior result.json casa_version is never trusted (legacy
+# stamps there may be exporter versions).
+CLEANING_RECORD = "tclean_summary.json"
+
+
+def write_cleaning_record(run_dir, ret, casa_version, completed):
+    """Write {completed, casa_version, summary} for this tclean generation."""
+    record = {
+        "completed": completed,
+        "casa_version": casa_version,
+        "summary": json_safe(ret) if ret is not None else None,
+    }
+    path = run_dir / CLEANING_RECORD
+    try:
+        path.write_text(json.dumps(record, indent=2))
+    except Exception as e:  # noqa: BLE001 - provenance must not fail the job
+        log.warning("could not write %s: %s", path.name, e)
+
+
+def apply_cleaning_record(run_dir, result):
+    """Copy a *completed* cleaning record's version + headline into result.
+
+    Returns False (result untouched) if there is no completed record.
+    """
+    path = run_dir / CLEANING_RECORD
+    try:
+        record = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001 - missing/corrupt → no provenance
+        return False
+    if not isinstance(record, dict) or record.get("completed") is not True:
+        return False
+    result["casa_version"] = record.get("casa_version") or "unknown"
+    summary = record.get("summary")
+    if isinstance(summary, dict):
+        result["tclean_summary"] = {k: summary.get(k) for k in SUMMARY_KEYS}
+    result["tclean_summary_json"] = str(path)
+    return True
+
+
+def run_tclean_recorded(tclean_task, params, run_dir, result, casa_version):
+    """Run a fresh tclean generation and record its cleaning provenance."""
+    path = run_dir / CLEANING_RECORD
+    if path.exists():
+        path.unlink()  # new generation: never inherit an old record
+    result["casa_version"] = casa_version
+    try:
+        ret = tclean_task(**params)
+    except Exception:
+        write_cleaning_record(run_dir, None, casa_version, completed=False)
+        raise
+    write_cleaning_record(run_dir, ret, casa_version, completed=True)
+    apply_cleaning_record(run_dir, result)
+
+
 # CASA image suffix (relative to imagename) for each aux/diagnostic product
 # under multi-term MFS.  ``mask`` is not term-split; the others are (we keep
 # the tt0 term for residual/pb/psf).  ``tt0_image``/``tt1_image`` are the flat,
@@ -100,6 +193,11 @@ def main():
         "tt1_fits": None,
         "alpha_fits": None,
         "aux_fits": {},
+        "tclean_summary": None,
+        # CASA that cleaned the products (from the cleaning record; unknown
+        # on a resume without one); export_casa_version is this CASA.
+        "casa_version": "unknown",
+        "export_casa_version": casa_version_string(),
         "error_message": None,
     }
     result_path = run_dir / "result.json"
@@ -116,9 +214,12 @@ def main():
         if Path(tt0_pbcor).exists():
             log.info("tclean tt0 product already exists, skipping tclean: %s",
                      Path(tt0_pbcor).name)
+            apply_cleaning_record(run_dir, result)
         else:
             log.info("Running continuum tclean (mtmfs): %s", Path(imagename).name)
-            tclean(**params)
+            run_tclean_recorded(
+                tclean, params, run_dir, result, result["export_casa_version"],
+            )
             if not Path(tt0_pbcor).exists():
                 raise FileNotFoundError(f"tclean did not produce {tt0_pbcor}")
 

@@ -173,6 +173,32 @@ class TestCasaVersion:
             assert isinstance(version, str)
 
 
+class TestExecutingCasaVersion:
+    def test_reads_version_from_result_json(self, tmp_path):
+        from panta_rei.imaging.runner import executing_casa_version
+        (tmp_path / "result.json").write_text(
+            json.dumps({"success": True, "casa_version": "6.6.6.17"})
+        )
+        assert executing_casa_version(tmp_path) == "6.6.6.17"
+
+    def test_none_when_missing_old_schema_or_corrupt(self, tmp_path):
+        from panta_rei.imaging.runner import executing_casa_version
+        assert executing_casa_version(tmp_path) is None
+        (tmp_path / "result.json").write_text(json.dumps({"success": True}))
+        assert executing_casa_version(tmp_path) is None
+        (tmp_path / "result.json").write_text("{not json")
+        assert executing_casa_version(tmp_path) is None
+
+    def test_unknown_cleaning_version_is_reported(self, tmp_path):
+        """A resume without prior provenance records 'unknown', which must
+        replace the (wrong) orchestrator version in the DB."""
+        from panta_rei.imaging.runner import executing_casa_version
+        (tmp_path / "result.json").write_text(json.dumps(
+            {"casa_version": "unknown", "export_casa_version": "6.7.4"}
+        ))
+        assert executing_casa_version(tmp_path) == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Trusted preflight (mocked casatools)
 # ---------------------------------------------------------------------------
@@ -520,6 +546,13 @@ class TestBuildTcleanParams:
         assert params["gridder"] == "mosaic"
         assert params["pbcor"] is True
         assert params["stokes"] == "I"
+        assert params["restoringbeam"] == "common"
+
+    def test_common_beam_overrides_recovered(self, basic_unit):
+        """Every line cube gets one common restoring beam, whatever QA2 used."""
+        basic_unit.recovered_params["restoringbeam"] = ["2arcsec", "1arcsec", "0deg"]
+        params = build_tclean_params(basic_unit, imagename="/out/test")
+        assert params["restoringbeam"] == "common"
 
     def test_no_sdintimaging_params(self, basic_unit):
         """tclean params should NOT contain sdintimaging-specific keys."""
@@ -555,6 +588,74 @@ class TestBuildTcleanParams:
         assert params["nchan"] == 956
         assert params["robust"] == 0.5
         assert params["threshold"] == "0.276Jy"
+
+    def test_qa2_dirty_seed_gets_positive_budget(self, basic_unit, caplog):
+        """A real QA2 dirty iter0 seed (niter=0, threshold='0.0mJy',
+        nsigma=0.0) gets a positive niter and nsigma=2 stopping depth."""
+        from panta_rei.imaging.runner import clean_depth_fallback
+        basic_unit.recovered_params.update({
+            "niter": 0, "threshold": "0.0mJy", "nsigma": 0.0,
+            "qa2_dirty_only": True, "fastnoise": False,
+            "minpercentchange": 1.0, "dogrowprune": True,
+            "imagename": "x.spw27.cube.regcal.I.iter0",
+        })
+        with caplog.at_level("WARNING", logger="panta_rei.imaging.runner"):
+            params = build_tclean_params(basic_unit, imagename="/out/test")
+        assert params["niter"] == 30000
+        assert params["nsigma"] == 2.0
+        assert params["threshold"] == "0.0mJy"
+        assert params["fastnoise"] is False
+        assert "qa2_dirty_only" not in params
+        assert "dirty-only" in caplog.text
+        assert clean_depth_fallback(basic_unit.recovered_params, 30000) == {
+            "niter": 30000, "nsigma": 2.0,
+        }
+
+    def test_dirty_seed_without_marker_still_covered(self, basic_unit):
+        """Pre-marker sidecars only have niter=0."""
+        basic_unit.recovered_params.update({"niter": 0, "threshold": "0.0mJy"})
+        params = build_tclean_params(basic_unit, "/o")
+        assert params["niter"] == 30000 and params["nsigma"] == 2.0
+
+    def test_dirty_seed_with_positive_threshold_keeps_it(self, basic_unit):
+        basic_unit.recovered_params.update({"niter": 0, "threshold": "0.01Jy",
+                                            "nsigma": 0.0})
+        params = build_tclean_params(basic_unit, "/o")
+        assert params["niter"] == 30000
+        assert params["nsigma"] == 0.0 and params["threshold"] == "0.01Jy"
+
+    def test_cleaned_seed_has_no_fallback(self, basic_unit):
+        from panta_rei.imaging.runner import clean_depth_fallback
+        basic_unit.recovered_params.update({"threshold": "0.0mJy", "nsigma": 0.0})
+        assert clean_depth_fallback(basic_unit.recovered_params, 30000) == {}
+        assert build_tclean_params(basic_unit, "/o")["nsigma"] == 0.0
+
+    def test_positive_niter_unchanged(self, basic_unit):
+        basic_unit.recovered_params["niter"] = 4360
+        assert build_tclean_params(basic_unit, "/o")["niter"] == 4360
+
+    def test_recovered_controls_forwarded(self, basic_unit):
+        basic_unit.recovered_params.update({
+            "cyclefactor": 3.0, "fastnoise": False, "minpercentchange": 1.0,
+            "dogrowprune": True, "nsigma": 0.0, "mosweight": True,
+            "perchanweightdensity": True, "smoothfactor": 1.0,
+        })
+        params = build_tclean_params(basic_unit, "/o")
+        assert params["cyclefactor"] == 3.0
+        assert params["fastnoise"] is False
+        assert params["minpercentchange"] == 1.0
+        assert params["dogrowprune"] is True
+        assert params["nsigma"] == 0.0
+        assert params["mosweight"] is True
+        assert params["perchanweightdensity"] is True
+        assert params["smoothfactor"] == 1.0
+
+    def test_absent_controls_left_to_casa(self, basic_unit):
+        params = build_tclean_params(basic_unit, "/o")
+        for key in ("cyclefactor", "fastnoise", "minpercentchange",
+                    "minpsffraction", "maxpsffraction", "cutthreshold",
+                    "mosweight", "perchanweightdensity", "nsigma"):
+            assert key not in params
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +700,10 @@ class TestRunTcleanFeather:
             Path(f"{imagename}.image").mkdir(parents=True)
             Path(f"{imagename}.pb").mkdir(parents=True)
             Path(f"{imagename}.psf").mkdir(parents=True)
+            import numpy as np
+            return {"stopcode": np.int64(2), "stopDescription": "threshold",
+                    "iterdone": np.int64(321), "nmajordone": 4,
+                    "summarymajor": np.array([0, 100, 321])}
 
         mock_tclean.side_effect = fake_tclean
 
@@ -674,6 +779,116 @@ class TestRunTcleanFeather:
         assert spec["canonical_paths"]["tclean_only"].endswith(".fits")
         assert "12m7mTP" in spec["canonical_paths"]["feathered"]
         assert "12m7m." in spec["canonical_paths"]["tclean_only"]
+
+        # Same result.json / tclean_summary.json schema as the CASA scripts
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["success"] is True
+        assert result["casa_version"] == "6.6.6"
+        assert result["export_casa_version"] == "6.6.6"
+        assert result["tclean_summary"] == {
+            "stopcode": 2, "stopDescription": "threshold",
+            "iterdone": 321, "nmajordone": 4,
+        }
+        record = json.loads((run_dir / "tclean_summary.json").read_text())
+        assert record["completed"] is True and record["casa_version"] == "6.6.6"
+        assert record["summary"]["summarymajor"] == [0, 100, 321]
+
+    def _serial(self, basic_unit, tmp_path, version, tclean=None,
+                prepare_tp=None):
+        """run_tclean_feather with CASA mocked; returns (outcome, run_dir)."""
+        output_dir = tmp_path / "output"
+
+        def fake_exportfits(imagename, fitsimage, **kwargs):
+            Path(fitsimage).parent.mkdir(parents=True, exist_ok=True)
+            Path(fitsimage).write_text("fits")
+
+        def fake_prepare_tp(tp_fits_path, tclean_image, run_dir):
+            regridded = Path(run_dir) / "tp" / "tp_regridded.image"
+            regridded.mkdir(parents=True, exist_ok=True)
+            return str(regridded)
+
+        mock_tclean = MagicMock(side_effect=tclean)
+        with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(True, "OK")), \
+             patch("panta_rei.imaging.runner._ensure_casatasks_tclean",
+                   return_value=(mock_tclean, MagicMock(), MagicMock(), MagicMock())), \
+             patch("panta_rei.imaging.runner.export_to_fits", side_effect=lambda i, o: fake_exportfits(i, o)), \
+             patch("panta_rei.imaging.runner.run_feather_task"), \
+             patch("panta_rei.imaging.runner.prepare_tp_for_feather",
+                   side_effect=prepare_tp or fake_prepare_tp), \
+             patch("panta_rei.imaging.runner.get_casa_version", return_value=version):
+            try:
+                outcome = run_tclean_feather(unit=basic_unit, output_dir=output_dir, row_id=7)
+            except Exception as exc:  # noqa: BLE001
+                outcome = exc
+        return outcome, output_dir / "runs" / "7", mock_tclean
+
+    def test_serial_failure_after_tclean_keeps_record(self, basic_unit, tmp_path):
+        """N1: TP prep fails after tclean.  result.json records the failure,
+        the cleaning record survives, and a resume credits the cleaner."""
+        def fake_tclean(**kwargs):
+            Path(f"{kwargs['imagename']}.image.pbcor").mkdir(parents=True)
+            return {"stopcode": 2, "iterdone": 77}
+
+        def broken_tp(*_a):
+            raise RuntimeError("TP regrid failed")
+
+        outcome, run_dir, _ = self._serial(basic_unit, tmp_path, "A", fake_tclean, broken_tp)
+        assert isinstance(outcome, RuntimeError)
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["success"] is False
+        assert result["error_message"] == "TP regrid failed"
+        assert result["casa_version"] == "A"
+        assert json.loads((run_dir / "tclean_summary.json").read_text())["completed"] is True
+
+        (ok, _msg, _out), run_dir, mock_tclean = self._serial(basic_unit, tmp_path, "B")
+        assert ok
+        mock_tclean.assert_not_called()  # resumed
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["casa_version"] == "A"
+        assert result["export_casa_version"] == "B"
+        assert result["tclean_summary"]["iterdone"] == 77
+
+    def test_serial_failed_fresh_tclean_drops_old_record(self, basic_unit, tmp_path):
+        run_dir = tmp_path / "output" / "runs" / "7"
+        run_dir.mkdir(parents=True)
+        (run_dir / "tclean_summary.json").write_text(json.dumps(
+            {"completed": True, "casa_version": "A", "summary": {"iterdone": 123}}
+        ))
+
+        def failing_tclean(**_kw):
+            raise RuntimeError("tclean failed")
+
+        outcome, run_dir, _ = self._serial(basic_unit, tmp_path, "B", failing_tclean)
+        assert isinstance(outcome, RuntimeError)
+        record = json.loads((run_dir / "tclean_summary.json").read_text())
+        assert record == {"completed": False, "casa_version": "B", "summary": None}
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["tclean_summary"] is None and result["success"] is False
+
+    def test_serial_result_write_failure_keeps_original_error(self, basic_unit, tmp_path):
+        """A result.json write error during failure handling must not
+        replace the task's own exception."""
+        run_dir = tmp_path / "output" / "runs" / "7"
+        (run_dir / "result.json").mkdir(parents=True)  # write_text → OSError
+
+        def fake_tclean(**kwargs):
+            Path(f"{kwargs['imagename']}.image.pbcor").mkdir(parents=True)
+            return {"stopcode": 2}
+
+        def broken_tp(*_a):
+            raise RuntimeError("original TP failure")
+
+        outcome, _, _ = self._serial(basic_unit, tmp_path, "A", fake_tclean, broken_tp)
+        assert isinstance(outcome, RuntimeError)
+        assert str(outcome) == "original TP failure"
+
+    def test_serial_missing_pbcor_writes_result(self, basic_unit, tmp_path):
+        outcome, run_dir, _ = self._serial(
+            basic_unit, tmp_path, "A", lambda **_kw: {"stopcode": 2})
+        ok, msg, _ = outcome
+        assert not ok and "did not produce" in msg
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["success"] is False and "did not produce" in result["error_message"]
 
     def test_preflight_failure(self, basic_unit, tmp_path):
         """If trusted preflight fails, should return failure."""
@@ -840,6 +1055,7 @@ class TestRunTcleanFeatherParallel:
         # job spec should advertise the 3 default aux products + canonical
         # paths for each
         assert observed_spec["aux_products"] == ["mask", "residual", "pb"]
+        assert observed_spec["clean_depth_fallback"] is None  # cleaned seed
         # Aux products live under output_dir/aux/group.../, separate from
         # the feathered cube which stays in output_dir/group.../.
         feathered_parent = Path(output).parent
@@ -896,6 +1112,55 @@ class TestRunTcleanFeatherParallel:
             assert not list(Path(output).parent.glob(f"*.cube.{kind}.fits"))
 
 
+class TestRunTcleanFeatherParallelGenerations:
+    def _run(self, basic_unit, tmp_path, policy):
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True, exist_ok=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        seen = {}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            seen.update(spec["canonical_paths"])
+            run_dir = Path(spec["run_dir"])
+            # Previous generation: tclean-only cube + mask already published.
+            for dst in (spec["canonical_paths"]["tclean_only"],
+                        spec["canonical_paths"]["aux"]["mask"]):
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                Path(dst).write_text("OLD")
+            feathered = run_dir / Path(spec["canonical_paths"]["feathered"]).name
+            feathered.write_text("NEW-F")
+            # New generation: feathered only (tclean/aux exports failed).
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True, "feathered_fits": str(feathered),
+                "tclean_fits": None, "aux_fits": {},
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(True, "OK")), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            result = run_tclean_feather_parallel(
+                unit=basic_unit, output_dir=tmp_path / "output", row_id=9,
+                casa_path=str(casa_path), publish_policy=policy,
+            )
+        return result, seen
+
+    def test_overwrite_retires_old_optional_products(self, basic_unit, tmp_path):
+        (ok, msg, out), seen = self._run(basic_unit, tmp_path, "overwrite")
+        assert ok, msg
+        assert Path(out).read_text() == "NEW-F"
+        assert not Path(seen["tclean_only"]).exists()
+        assert not Path(seen["aux"]["mask"]).exists()
+
+    def test_fail_if_exists_refuses_mixed_generation(self, basic_unit, tmp_path):
+        (ok, msg, _), seen = self._run(basic_unit, tmp_path, "fail_if_exists")
+        assert not ok and "collision" in msg
+        assert not Path(seen["feathered"]).exists()
+        assert Path(seen["aux"]["mask"]).read_text() == "OLD"
+
+
 # ---------------------------------------------------------------------------
 # _publish + _publish_pair
 # ---------------------------------------------------------------------------
@@ -945,11 +1210,9 @@ class TestPublishPair:
         """If the second publish fails, the first must be unlinked
         so retries see a clean canonical area."""
         a_src = tmp_path / "a.fits"; a_src.write_text("A")
-        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        b_src = tmp_path / "ghost_b.fits"  # missing → second publish raises
         a_dst = tmp_path / "out" / "A.fits"
         b_dst = tmp_path / "out" / "B.fits"
-        b_dst.parent.mkdir(parents=True, exist_ok=True)
-        b_dst.write_text("preexisting")  # forces fail_if_exists to error
 
         ok, msg = _publish_pair(
             [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
@@ -959,7 +1222,21 @@ class TestPublishPair:
         assert "rolled back 1" in msg
         # First publish was rolled back
         assert not a_dst.exists()
-        # Pre-existing second target is untouched
+        assert not b_dst.exists()
+
+    def test_pair_fail_if_exists_collision_refused_up_front(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        b_src = tmp_path / "b.fits"; b_src.write_text("B")
+        a_dst = tmp_path / "out" / "A.fits"
+        b_dst = tmp_path / "out" / "B.fits"
+        b_dst.parent.mkdir(parents=True, exist_ok=True)
+        b_dst.write_text("preexisting")
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(b_src), str(b_dst))],
+            policy="fail_if_exists",
+        )
+        assert not ok and "collision" in msg
+        assert not a_dst.exists()  # nothing was published
         assert b_dst.read_text() == "preexisting"
 
     def test_pair_first_fails_no_publishes(self, tmp_path):
@@ -1000,6 +1277,57 @@ class TestPublishPair:
         assert b_dst.read_text() == "B_PRIOR_CANONICAL"
         # No leftover backup files
         assert not list(a_dst.parent.glob("*.bak.*"))
+
+    def test_pair_overwrite_retires_stale_destination(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("TT0_NEW")
+        a_dst = tmp_path / "out" / "tt0.fits"
+        a_dst.parent.mkdir(parents=True)
+        a_dst.write_text("TT0_OLD")
+        stale = tmp_path / "out" / "alpha.fits"
+        stale.write_text("ALPHA_OLD")
+        absent = tmp_path / "out" / "tt1.fits"  # retire of a missing file: no-op
+        ok, msg = _publish_pair(
+            [(str(a_src), str(a_dst))], policy="overwrite",
+            retire=(str(stale), str(absent)),
+        )
+        assert ok, msg
+        assert a_dst.read_text() == "TT0_NEW"
+        assert not stale.exists() and not absent.exists()
+        assert not list(a_dst.parent.glob("*.bak.*"))
+
+    def test_pair_overwrite_rollback_restores_retired(self, tmp_path):
+        a_src = tmp_path / "a.fits"; a_src.write_text("TT0_NEW")
+        a_dst = tmp_path / "out" / "tt0.fits"
+        a_dst.parent.mkdir(parents=True)
+        a_dst.write_text("TT0_OLD")
+        stale = tmp_path / "out" / "alpha.fits"
+        stale.write_text("ALPHA_OLD")
+        ghost = tmp_path / "ghost.fits"  # missing src → second publish fails
+        ok, _msg = _publish_pair(
+            [(str(a_src), str(a_dst)), (str(ghost), str(tmp_path / "out" / "x.fits"))],
+            policy="overwrite", retire=(str(stale),),
+        )
+        assert not ok
+        assert a_dst.read_text() == "TT0_OLD"
+        assert stale.read_text() == "ALPHA_OLD"
+        assert not list(a_dst.parent.glob("*.bak.*"))
+
+    def test_pair_fail_if_exists_refuses_stale_retire_candidate(self, tmp_path):
+        """No-overwrite policy: an old optional product from another
+        generation is a collision, not something to publish beside."""
+        a_src = tmp_path / "a.fits"; a_src.write_text("A")
+        tt0 = tmp_path / "out" / "tt0.fits"
+        stale = tmp_path / "out" / "alpha.fits"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("ALPHA_OLD")
+        ok, msg = _publish_pair(
+            [(str(a_src), str(tt0))],
+            policy="fail_if_exists", retire=(str(stale),),
+        )
+        assert not ok
+        assert "collision" in msg and "alpha.fits" in msg
+        assert not tt0.exists()
+        assert stale.read_text() == "ALPHA_OLD"
 
     def test_pair_overwrite_success_drops_backups(self, tmp_path):
         a_src = tmp_path / "a.fits"; a_src.write_text("A_NEW")
@@ -1103,11 +1431,136 @@ class TestBuildContParams:
         assert p["deconvolver"] == "mtmfs"
         assert p["specmode"] == "mfs"
 
+    def test_recovered_controls_forwarded(self, cont_unit):
+        cont_unit.recovered_params.update({"cyclefactor": 3.0, "fastnoise": False})
+        p = build_tclean_cont_params(cont_unit, "/o")
+        assert p["cyclefactor"] == 3.0
+        assert p["fastnoise"] is False
+        assert "minpercentchange" not in p
+
+    def test_zero_niter_gets_positive_budget(self, cont_unit):
+        cont_unit.recovered_params["niter"] = 0
+        p = build_tclean_cont_params(cont_unit, "/o")
+        assert p["niter"] == 20000
+        assert "nsigma" not in p  # threshold 0.00311Jy is a real depth
+
     def test_scales_default_and_override(self, cont_unit):
         assert build_tclean_cont_params(cont_unit, "/o")["scales"] == [0]
         assert build_tclean_cont_params(
             cont_unit, "/o", scales=[0, 5, 10]
         )["scales"] == [0, 5, 10]
+
+
+class TestRunTcleanContParallelPublish:
+    def test_reimage_without_alpha_retires_old_alpha(self, cont_unit, tmp_path):
+        """Overwrite re-image whose alpha export failed: the old alpha must
+        not survive beside the new tt0 (one generation per unit)."""
+        from panta_rei.imaging.runner import run_tclean_cont_parallel
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        output_dir = tmp_path / "output"
+        seen = {}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            run_dir = Path(spec["run_dir"])
+            canonical = spec["canonical_paths"]
+            seen.update(canonical)
+            # Previous generation already published tt0, tt1, alpha, mask.
+            for key in ("tt0", "tt1", "alpha"):
+                Path(canonical[key]).parent.mkdir(parents=True, exist_ok=True)
+                Path(canonical[key]).write_text(f"OLD-{key}")
+            Path(canonical["aux"]["mask"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(canonical["aux"]["mask"]).write_text("OLD-mask")
+            # New generation: tt0 + tt1 only (alpha and mask exports failed).
+            local = {}
+            for key in ("tt0", "tt1"):
+                local[key] = run_dir / Path(canonical[key]).name
+                local[key].write_text(f"NEW-{key}")
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True,
+                "tt0_fits": str(local["tt0"]),
+                "tt1_fits": str(local["tt1"]),
+                "alpha_fits": None,
+                "aux_fits": {},
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_continuum_trusted_preflight",
+                   return_value=(True, "OK")), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            ok, msg, out = run_tclean_cont_parallel(
+                unit=cont_unit, output_dir=output_dir, row_id=5,
+                casa_path=str(casa_path), publish_policy="overwrite",
+            )
+        assert ok, msg
+        assert Path(seen["tt0"]).read_text() == "NEW-tt0"
+        assert Path(seen["tt1"]).read_text() == "NEW-tt1"
+        assert not Path(seen["alpha"]).exists()
+        assert not Path(seen["aux"]["mask"]).exists()
+
+
+class TestRunTcleanContReducedAux:
+    def test_reduced_aux_overwrite_retires_unrequested_old_aux(self, cont_unit, tmp_path):
+        """Full-aux publish, then an overwrite with a reduced aux list: the
+        old psf/tt0_image/tt1_image must not survive beside the new tt0."""
+        from panta_rei.imaging.runner import run_tclean_cont_parallel
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        output_dir = tmp_path / "output"
+        specs = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            specs.append(spec)
+            run_dir = Path(spec["run_dir"])
+            canonical = spec["canonical_paths"]
+            tag = f"GEN{len(specs)}"
+            out = {}
+            for key in ("tt0", "tt1", "alpha"):
+                out[key] = run_dir / Path(canonical[key]).name
+                out[key].write_text(f"{tag}-{key}")
+            aux = {}
+            for kind, dst in canonical["aux"].items():
+                aux[kind] = str(run_dir / Path(dst).name)
+                Path(aux[kind]).write_text(f"{tag}-{kind}")
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True, "tt0_fits": str(out["tt0"]),
+                "tt1_fits": str(out["tt1"]), "alpha_fits": str(out["alpha"]),
+                "aux_fits": aux,
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_continuum_trusted_preflight",
+                   return_value=(True, "OK")), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            ok, msg, _ = run_tclean_cont_parallel(
+                unit=cont_unit, output_dir=output_dir, row_id=1,
+                casa_path=str(casa_path), publish_policy="overwrite",
+            )
+            assert ok, msg
+            full_aux = dict(specs[0]["canonical_paths"]["aux"])
+            assert set(full_aux) == {"tt0_image", "tt1_image", "mask",
+                                     "residual", "pb", "psf"}
+            assert all(Path(p).exists() for p in full_aux.values())
+
+            ok, msg, _ = run_tclean_cont_parallel(
+                unit=cont_unit, output_dir=output_dir, row_id=2,
+                casa_path=str(casa_path), publish_policy="overwrite",
+                aux_products=("mask", "residual", "pb"),
+            )
+            assert ok, msg
+        for kind in ("mask", "residual", "pb"):
+            assert Path(full_aux[kind]).read_text() == f"GEN2-{kind}"
+        for kind in ("tt0_image", "tt1_image", "psf"):
+            assert not Path(full_aux[kind]).exists()
+        assert Path(specs[1]["canonical_paths"]["alpha"]).read_text() == "GEN2-alpha"
 
 
 class TestRunContinuumTrustedPreflight:

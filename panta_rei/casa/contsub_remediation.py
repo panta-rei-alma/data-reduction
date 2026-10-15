@@ -19,12 +19,25 @@ Usage:
     casa --nologger --nogui --pipeline -c contsub_remediation.py \
          --member-dir /path/to/member.uid___... --dry-run
 
+    casa --nologger --nogui --pipeline -c contsub_remediation.py \
+         --member-dir /path/to/member.uid___... --re-run
+
+Only genuinely fresh EBs are processed.  If every _targets_line.ms exists
+(and no --re-run) the script is a no-op; otherwise it refuses (exit 2,
+touching nothing) when any *_targets.ms / *_targets_line.ms already
+exists, with or without --re-run.  Running the pipeline stages over
+existing outputs inside a resumed context is unsupported: the context
+already registers those MSs, hif_uvcontsub deletes an existing line MS,
+and a partial failure would leave canonical products half-replaced.
+Re-subtraction will instead use direct uvcontsub into versioned outputs.
+
 Author: Generated for Dan Walker
 Project: Panta Rei ALMA Large Program (2025.1.00383.L)
 """
 
 import argparse
 import ast
+import builtins
 import glob
 import logging
 import os
@@ -153,8 +166,29 @@ def check_has_uvcontfit(member_dir):
     if "hif_uvcontfit" not in content:
         return False
 
-    # Check if the task is available in the CASA session
-    return "hif_uvcontfit" in dir()
+    # Check if the task is available in the CASA session.  CASA injects
+    # tasks into the script's global namespace (or builtins); a bare dir()
+    # here would only list this function's locals.
+    return "hif_uvcontfit" in globals() or hasattr(builtins, "hif_uvcontfit")
+
+
+def existing_targets_products(working_dir):
+    """Return the existing *_targets.ms / *_targets_line.ms for the base EBs."""
+    found = []
+    for ms_path in find_base_ms_files(working_dir):
+        for suffix in ("_targets.ms", "_targets_line.ms"):
+            product = ms_path.replace(".ms", suffix)
+            if os.path.isdir(product):
+                found.append(product)
+    return found
+
+
+# Shared with panta_rei.workflows.contsub (this script cannot import it).
+REFUSED_MSG = (
+    "existing contsub outputs present; contsub over existing outputs is "
+    "unsupported (re-subtraction will use direct uvcontsub into versioned "
+    "outputs)"
+)
 
 
 def validate_output(working_dir):
@@ -210,11 +244,17 @@ def main():
         "--dry-run", action="store_true",
         help="Print what would be done without executing",
     )
+    parser.add_argument(
+        "--re-run", action="store_true",
+        help="Skip the all-complete no-op; still refuses if any "
+             "_targets*.ms is already present",
+    )
 
     # CASA passes extra args we need to ignore
     args, _unknown = parser.parse_known_args()
     member_dir = os.path.abspath(args.member_dir)
     dry_run = args.dry_run
+    re_run = args.re_run
 
     log.info("=" * 70)
     log.info("Contsub remediation for %s", os.path.basename(member_dir))
@@ -232,9 +272,18 @@ def main():
     log.info("Existing _targets_line.ms: %d", len(existing))
     log.info("Missing _targets_line.ms: %d", len(missing))
 
-    if all_present:
+    if all_present and not re_run:
         log.info("All _targets_line.ms already exist. Nothing to do.")
         sys.exit(0)
+
+    # Every remaining path would run mstransform/uvcontsub: only allowed
+    # when no EB has any output yet.
+    present = existing_targets_products(working_dir)
+    if present:
+        log.error("REFUSED: %s", REFUSED_MSG)
+        for path in present:
+            log.error("  %s", path)
+        sys.exit(2)
 
     if not base_ms:
         log.error("No base calibrated MS files in %s", working_dir)

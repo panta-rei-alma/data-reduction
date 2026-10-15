@@ -727,6 +727,16 @@ class ImagingRunsQueries:
         )
 
     @staticmethod
+    def set_casa_version(
+        con: sqlite3.Connection, run_id: int, version: str,
+    ) -> None:
+        """Record the CASA version that actually executed the run."""
+        con.execute(
+            "UPDATE imaging_runs SET casa_version=? WHERE id=?",
+            (version, run_id),
+        )
+
+    @staticmethod
     def set_error_message(
         con: sqlite3.Connection, run_id: int, msg: Optional[str],
     ) -> None:

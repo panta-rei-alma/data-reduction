@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -91,6 +92,108 @@ def get_casa_version() -> str:
 # ---------------------------------------------------------------------------
 # Trusted-mode preflight
 # ---------------------------------------------------------------------------
+
+def executing_casa_version(run_dir: Path) -> Optional[str]:
+    """CASA version that cleaned the products, from ``run_dir/result.json``.
+
+    The standalone mpicasa scripts run in monolithic CASA, whose version can
+    differ from the orchestration env's casatools (:func:`get_casa_version`).
+    On a resume that version comes only from the run's completed cleaning
+    record (tclean_summary.json), else ``unknown``; this returns it as is.  Returns None
+    if result.json is missing, unreadable or predates version recording.
+    """
+    try:
+        version = json.loads((Path(run_dir) / "result.json").read_text()).get(
+            "casa_version"
+        )
+    except (OSError, ValueError, AttributeError):
+        return None
+    return version or None
+
+
+# tclean cleaning-record provenance for the in-process (serial) line path.
+# Mirrors the helpers in panta_rei/casa/tclean_feather.py / tclean_cont.py
+# (see CLEANING_RECORD there), which run inside monolithic CASA and cannot
+# import panta_rei; keep the result.json / tclean_summary.json schema
+# identical.
+TCLEAN_SUMMARY_KEYS = ("stopcode", "stopDescription", "iterdone", "nmajordone")
+CLEANING_RECORD = "tclean_summary.json"
+
+
+def _json_safe(obj):
+    """Recursively convert tclean's return value into JSON-serialisable data."""
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if hasattr(obj, "tolist"):  # numpy array or scalar
+        try:
+            return _json_safe(obj.tolist())
+        except Exception:  # noqa: BLE001
+            pass
+    return repr(obj)
+
+
+def _write_cleaning_record(
+    run_dir: Path, ret, casa_version: str, completed: bool,
+) -> None:
+    """Write {completed, casa_version, summary} for this tclean generation."""
+    record = {
+        "completed": completed,
+        "casa_version": casa_version,
+        "summary": _json_safe(ret) if ret is not None else None,
+    }
+    path = run_dir / CLEANING_RECORD
+    try:
+        path.write_text(json.dumps(record, indent=2))
+    except OSError as e:
+        log.warning("could not write %s: %s", path.name, e)
+
+
+def _apply_cleaning_record(run_dir: Path, result: dict) -> bool:
+    """Copy a *completed* cleaning record's version + headline into result.
+
+    The record is the only source of cleaning provenance: a prior
+    result.json casa_version may be a legacy exporter stamp.  Returns False
+    (result untouched) if there is no completed record.
+    """
+    path = run_dir / CLEANING_RECORD
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("completed") is not True:
+        return False
+    result["casa_version"] = record.get("casa_version") or "unknown"
+    summary = record.get("summary")
+    if isinstance(summary, dict):
+        result["tclean_summary"] = {k: summary.get(k) for k in TCLEAN_SUMMARY_KEYS}
+    result["tclean_summary_json"] = str(path)
+    return True
+
+
+def _run_tclean_recorded(
+    tclean_task, params: dict, run_dir: Path, result: dict, casa_version: str,
+) -> None:
+    """Run a fresh tclean generation and record its cleaning provenance.
+
+    The previous record is deleted first and the new one is written as
+    soon as tclean returns (or raises), before any export/feather step.
+    """
+    path = run_dir / CLEANING_RECORD
+    if path.exists():
+        path.unlink()  # new generation: never inherit an old record
+    result["casa_version"] = casa_version
+    try:
+        ret = tclean_task(**params)
+    except Exception:
+        _write_cleaning_record(run_dir, None, casa_version, completed=False)
+        raise
+    _write_cleaning_record(run_dir, ret, casa_version, completed=True)
+    _apply_cleaning_record(run_dir, result)
+
 
 def resolve_spw_for_ms(
     ms_path: str,
@@ -351,6 +454,61 @@ def run_continuum_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 # Parameter assembly
 # ---------------------------------------------------------------------------
 
+# Stopping depth given to a QA2 dirty-only seed that carries no positive
+# threshold or nsigma (the Phase-2 default of the joint-imaging plan).
+DIRTY_SEED_NSIGMA = 2.0
+
+
+def _is_zero_threshold(threshold) -> bool:
+    """True for an absent/zero tclean threshold (``''``, ``0``, ``'0.0mJy'``)."""
+    if threshold in (None, ""):
+        return True
+    m = re.match(r"\s*([-+]?[0-9.]+(?:[eE][-+]?\d+)?)", str(threshold))
+    try:
+        return m is None or float(m.group(1)) == 0.0
+    except ValueError:
+        return False
+
+
+def clean_depth_fallback(recovered: dict, niter_fallback: int) -> dict:
+    """tclean overrides for a QA2 dirty-only seed; ``{}`` for a cleaned seed.
+
+    A recovered ``niter=0`` is the QA2 dirty ``iter0`` call the pipeline
+    publishes when it finds nothing to clean (recovery marks these
+    ``qa2_dirty_only``; older sidecars just have niter=0).  Imaging the more
+    sensitive joint data with it would leave the cube undeconvolved (and
+    feather a Jy/dirty-beam image), so it gets the same niter as a missing
+    one.  Its threshold is a QA2 placeholder (``'0.0mJy'``, nsigma 0), so
+    when neither gives a positive stopping depth, nsigma=2 does.
+    """
+    niter = int(recovered.get("niter", niter_fallback))
+    if niter > 0 and not recovered.get("qa2_dirty_only"):
+        return {}
+    out: dict = {"niter": niter_fallback}
+    try:
+        nsigma = float(recovered.get("nsigma") or 0.0)
+    except (TypeError, ValueError):
+        nsigma = 0.0
+    if nsigma <= 0 and _is_zero_threshold(recovered.get("threshold")):
+        out["nsigma"] = DIRTY_SEED_NSIGMA
+    return out
+
+
+def _apply_clean_depth_fallback(
+    params: dict, recovered: dict, niter_fallback: int,
+) -> None:
+    """Apply :func:`clean_depth_fallback` to *params*, with a warning."""
+    fallback = clean_depth_fallback(recovered, niter_fallback)
+    if fallback:
+        log.warning(
+            "QA2 dirty-only seed (recovered niter=%s, threshold=%r, "
+            "nsigma=%r) — using %s",
+            recovered.get("niter"), recovered.get("threshold"),
+            recovered.get("nsigma"), fallback,
+        )
+        params.update(fallback)
+
+
 # Fixed parameters per plan (section 4)
 FIXED_PARAMS = {
     "gridder": "mosaic",
@@ -415,6 +573,7 @@ def build_sdintimaging_params(
         "scales": scales,
         "sdgain": sdgain,
     }
+    _apply_clean_depth_fallback(params, recovered, 30000)
 
     # Apply fixed params (always override)
     params.update(FIXED_PARAMS)
@@ -425,6 +584,36 @@ def build_sdintimaging_params(
 # ---------------------------------------------------------------------------
 # tclean parameter assembly
 # ---------------------------------------------------------------------------
+
+# Clean-cycle and automask controls copied verbatim from the recovered call
+# when present (e.g. QA2's cyclefactor=3, fastnoise=False,
+# minpercentchange=1.0).  Absent keys are not passed, so CASA's defaults
+# apply as before.
+FORWARDED_TCLEAN_CONTROLS = (
+    "cyclefactor",
+    "minpsffraction",
+    "maxpsffraction",
+    "nsigma",
+    "fastnoise",
+    "minpercentchange",
+    "dogrowprune",
+    "smoothfactor",
+    "cutthreshold",
+)
+
+# Line-only extras: the continuum builder already seeds these with fallbacks.
+FORWARDED_LINE_CONTROLS = FORWARDED_TCLEAN_CONTROLS + (
+    "mosweight",
+    "perchanweightdensity",
+)
+
+
+def _forward_recovered(params: dict, recovered: dict, keys: tuple) -> None:
+    """Copy each of *keys* present in *recovered* into *params*."""
+    for key in keys:
+        if key in recovered:
+            params[key] = recovered[key]
+
 
 # Fixed parameters for tclean (no sdintimaging-specific keys)
 FIXED_TCLEAN_PARAMS = {
@@ -488,6 +677,8 @@ def build_tclean_params(
         "scales": scales,
         "parallel": parallel,
     }
+    _forward_recovered(params, recovered, FORWARDED_LINE_CONTROLS)
+    _apply_clean_depth_fallback(params, recovered, 30000)
 
     # Apply fixed params (always override)
     params.update(FIXED_TCLEAN_PARAMS)
@@ -564,6 +755,8 @@ def build_tclean_cont_params(
     reffreq = recovered.get("reffreq")
     if reffreq:
         params["reffreq"] = reffreq
+    _forward_recovered(params, recovered, FORWARDED_TCLEAN_CONTROLS)
+    _apply_clean_depth_fallback(params, recovered, 20000)
 
     # Apply fixed continuum overrides (always win)
     params.update(FIXED_TCLEAN_CONT_PARAMS)
@@ -1098,6 +1291,7 @@ def _atomic_publish(src: str, dst: str) -> None:
 
 def _publish_pair(
     pairs: list[tuple[str, str]], *, policy: str = "overwrite",
+    retire: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """Publish a list of (src, dst) pairs as one logical transaction.
 
@@ -1115,15 +1309,34 @@ def _publish_pair(
       on rollback we ``os.replace`` the backup back into place.  On
       successful commit of the whole pair we unlink the backups.
 
+    *retire* lists destinations that the new generation does not provide
+    (e.g. an optional product whose export failed).  Under ``overwrite``
+    any that exist are snapshotted with the others, so commit removes them
+    and rollback restores them — the published set is always from one
+    generation.  ``fail_if_exists`` never removes files, so it instead
+    refuses the whole publication if any destination of the generation,
+    retire candidates included, already exists.
+
     Returns ``(ok, message)``.
     """
     backups: list[tuple[str, str]] = []          # (canonical, backup)
     published: list[str] = []                    # canonical paths written
 
+    if policy == "fail_if_exists":
+        collisions = [
+            dst for dst in [dst for _src, dst in pairs] + list(retire)
+            if Path(dst).exists()
+        ]
+        if collisions:
+            return False, (
+                "publish collision (fail_if_exists): existing "
+                + ", ".join(Path(c).name for c in collisions)
+            )
+
     if policy == "overwrite":
         # Snapshot pre-existing destinations *before* any publish so a
         # mid-pair failure can restore the prior canonical state.
-        for _src, dst in pairs:
+        for dst in [dst for _src, dst in pairs] + list(retire):
             dst_path = Path(dst)
             if dst_path.exists():
                 bak = (
@@ -1183,13 +1396,40 @@ def _publish_pair(
                 f"{len(backups)} backup(s)): {exc}"
             )
 
-    # Whole pair succeeded — drop backups.
-    for _canonical, bak in backups:
+    # Whole pair succeeded — drop backups (this also removes retired files).
+    for canonical, bak in backups:
+        if canonical in retire:
+            log.info("Retired stale publish target: %s", Path(canonical).name)
         try:
             os.unlink(bak)
         except OSError:
             log.warning("could not unlink backup: %s", bak)
     return True, "ok"
+
+
+def _line_retire_candidates(
+    output_dir: Path, unit: ImagingUnit, freq_min: float, freq_max: float,
+    pairs: list[tuple[str, str]],
+) -> tuple[str, ...]:
+    """Optional line products (12m7m tclean-only + every aux kind) that
+    this generation is not publishing; see ``_publish_pair(retire=...)``."""
+    from panta_rei.imaging.matching import (
+        AUX_PRODUCT_KINDS,
+        build_aux_output_path,
+        build_tclean_only_output_path,
+    )
+
+    candidates = [str(build_tclean_only_output_path(
+        output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max,
+    ))] + [
+        str(build_aux_output_path(
+            output_dir, unit.gous_uid, unit.source_name,
+            freq_min, freq_max, kind,
+        ))
+        for kind in AUX_PRODUCT_KINDS
+    ]
+    published = {dst for _src, dst in pairs}
+    return tuple(dst for dst in candidates if dst not in published)
 
 
 def run_tclean_feather(
@@ -1321,67 +1561,109 @@ def run_tclean_feather(
         "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": get_casa_version(),
+        "clean_depth_fallback": (
+            clean_depth_fallback(unit.recovered_params, 30000) or None
+        ),
     }
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)
 
-    # 7. Execute tclean (or skip if products already exist)
+    # 7. Execute tclean (or skip if products already exist).  ``result``
+    # follows the result.json schema of the standalone CASA scripts.
     pbcor_image = f"{imagename}.image.pbcor"
+    casa_version = get_casa_version()
+    result: dict = {
+        "success": False,
+        "feathered_fits": None,
+        "tclean_fits": None,
+        "aux_fits": {},
+        "tclean_summary": None,
+        "casa_version": "unknown",  # set from the cleaning record
+        "export_casa_version": casa_version,
+        "error_message": None,
+    }
 
-    if Path(pbcor_image).exists():
-        log.info(
-            "tclean products already exist, skipping to feather: %s",
-            Path(pbcor_image).name,
+    # Steps 7-11 persist result.json on success or failure (try/finally);
+    # the cleaning record written right after tclean is never discarded.
+    try:
+        if Path(pbcor_image).exists():
+            log.info(
+                "tclean products already exist, skipping to feather: %s",
+                Path(pbcor_image).name,
+            )
+            _apply_cleaning_record(run_dir, result)
+        else:
+            tclean, _, _, _ = _ensure_casatasks_tclean()
+            log.info(
+                "Running tclean: %s/%s/spw%s → %s",
+                unit.gous_uid, unit.source_name, unit.spw_id,
+                Path(imagename).name,
+            )
+            _run_tclean_recorded(tclean, params, run_dir, result, casa_version)
+
+            if not Path(pbcor_image).exists():
+                result["error_message"] = (
+                    f"tclean did not produce {Path(pbcor_image).name}"
+                )
+                (run_dir / "result.json").write_text(
+                    json.dumps(result, indent=2))
+                return False, result["error_message"], None
+
+        # 8. Export tclean-only product to run_dir
+        local_tclean_fits = str(run_dir / canonical_tclean.name)
+        export_to_fits(pbcor_image, local_tclean_fits)
+
+        # 9. Prepare TP for feathering
+        tp_regridded = prepare_tp_for_feather(
+            unit.sdimage, f"{imagename}.image", run_dir,
         )
-    else:
-        tclean, _, _, _ = _ensure_casatasks_tclean()
-        log.info(
-            "Running tclean: %s/%s/spw%s → %s",
-            unit.gous_uid, unit.source_name, unit.spw_id,
-            Path(imagename).name,
+
+        # 10. Feather
+        feathered_image = f"{imagename}.image.pbcor.feather"
+        run_feather_task(pbcor_image, tp_regridded, feathered_image)
+
+        # 11. Export feathered product to run_dir
+        local_feathered_fits = str(run_dir / canonical_feathered.name)
+        export_to_fits(feathered_image, local_feathered_fits)
+
+        # 11b. Best-effort export of aux QA products (mask/residual/pb) to
+        # FITS.  Each is sourced from <imagename>.<kind> in the run_dir.  A
+        # failure here is logged but does NOT fail the imaging run; the aux
+        # is simply omitted from the publish transaction.
+        aux_local: dict[str, str] = {}
+        for kind in aux_products:
+            casa_image = f"{imagename}.{kind}"
+            if not Path(casa_image).exists():
+                log.warning("aux %s: CASA image not found at %s — skipping",
+                            kind, Path(casa_image).name)
+                continue
+            canonical = canonical_aux.get(kind)
+            if not canonical:
+                continue
+            local_path = str(run_dir / Path(canonical).name)
+            try:
+                export_to_fits(casa_image, local_path)
+                aux_local[kind] = local_path
+            except Exception as exc:
+                log.warning("aux %s export failed: %s", kind, exc)
+
+        result.update(
+            success=True,
+            feathered_fits=local_feathered_fits,
+            tclean_fits=local_tclean_fits,
+            aux_fits=aux_local,
         )
-        tclean(**params)
-
-        if not Path(pbcor_image).exists():
-            return False, f"tclean did not produce {Path(pbcor_image).name}", None
-
-    # 8. Export tclean-only product to run_dir
-    local_tclean_fits = str(run_dir / canonical_tclean.name)
-    export_to_fits(pbcor_image, local_tclean_fits)
-
-    # 9. Prepare TP for feathering
-    tp_regridded = prepare_tp_for_feather(
-        unit.sdimage, f"{imagename}.image", run_dir,
-    )
-
-    # 10. Feather
-    feathered_image = f"{imagename}.image.pbcor.feather"
-    run_feather_task(pbcor_image, tp_regridded, feathered_image)
-
-    # 11. Export feathered product to run_dir
-    local_feathered_fits = str(run_dir / canonical_feathered.name)
-    export_to_fits(feathered_image, local_feathered_fits)
-
-    # 11b. Best-effort export of aux QA products (mask/residual/pb) to
-    # FITS.  Each is sourced from <imagename>.<kind> in the run_dir.  A
-    # failure here is logged but does NOT fail the imaging run; the aux
-    # is simply omitted from the publish transaction.
-    aux_local: dict[str, str] = {}
-    for kind in aux_products:
-        casa_image = f"{imagename}.{kind}"
-        if not Path(casa_image).exists():
-            log.warning("aux %s: CASA image not found at %s — skipping",
-                        kind, Path(casa_image).name)
-            continue
-        canonical = canonical_aux.get(kind)
-        if not canonical:
-            continue
-        local_path = str(run_dir / Path(canonical).name)
+    except Exception as exc:
+        result["error_message"] = str(exc)
+        # Don't let a result.json write failure replace the task's own error.
         try:
-            export_to_fits(casa_image, local_path)
-            aux_local[kind] = local_path
-        except Exception as exc:
-            log.warning("aux %s export failed: %s", kind, exc)
+            (run_dir / "result.json").write_text(json.dumps(result, indent=2))
+        except OSError as write_exc:
+            log.error("could not write result.json after failure: %s",
+                      write_exc)
+        raise
+    else:
+        (run_dir / "result.json").write_text(json.dumps(result, indent=2))
 
     # 12. Atomic publish to canonical paths (only on success).  Treat the
     # tclean + feathered + aux outputs as a single transaction: if any
@@ -1394,7 +1676,8 @@ def run_tclean_feather(
     for kind, local_path in aux_local.items():
         pair.append((local_path, canonical_aux[kind]))
 
-    ok, msg = _publish_pair(pair, policy=publish_policy)
+    retire = _line_retire_candidates(output_dir, unit, freq_min, freq_max, pair)
+    ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)
     if not ok:
         return False, msg, None
 
@@ -1561,6 +1844,7 @@ def run_tclean_feather_parallel(
         "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": "unknown",  # determined inside CASA
+        "clean_depth_fallback": clean_depth_fallback(recovered, 30000) or None,
     }
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)
@@ -1655,7 +1939,10 @@ def run_tclean_feather_parallel(
     # whether publish is in progress, so publish is also unsafe to start.
     on_publish_start()
 
-    ok, msg = _publish_pair(pair, policy=publish_policy)
+    # Older optional products this generation lacks must not survive beside
+    # the new feathered cube (same rule as continuum).
+    retire = _line_retire_candidates(output_dir, unit, freq_min, freq_max, pair)
+    ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)
     if not ok:
         return False, msg, None
 
@@ -1698,6 +1985,8 @@ def run_tclean_cont_parallel(
     import subprocess
 
     from panta_rei.imaging.matching import (
+        CONT_AUX_PRODUCTS,
+        CONT_SCIENCE_PRODUCTS,
         build_cont_output_path,
         continuum_freq_bounds_hz,
     )
@@ -1794,6 +2083,9 @@ def run_tclean_cont_parallel(
         "aux_products": list(aux_products),
         "run_dir": str(run_dir),
         "casa_version": "unknown",
+        "clean_depth_fallback": (
+            clean_depth_fallback(unit.recovered_params, 20000) or None
+        ),
     }
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)
@@ -1868,9 +2160,25 @@ def run_tclean_cont_parallel(
         if canonical:
             pair.append((local_aux, canonical))
 
+    # Every supported optional product this generation did not publish
+    # (whatever this run's aux list): an older copy left at the destination
+    # would sit beside the new tt0, so retire it in the same transaction.
+    published_dsts = {dst for _src, dst in pair}
+    retire = tuple(
+        dst for dst in (
+            str(build_cont_output_path(
+                output_dir, unit.gous_uid, unit.source_name,
+                freq_min, freq_max, product,
+            ))
+            for product in CONT_SCIENCE_PRODUCTS + CONT_AUX_PRODUCTS
+            if product != "tt0"
+        )
+        if dst not in published_dsts
+    )
+
     on_publish_start()
 
-    ok, msg = _publish_pair(pair, policy=publish_policy)
+    ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)
     if not ok:
         return False, msg, None
 

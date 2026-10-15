@@ -280,6 +280,12 @@ class DBWriter(threading.Thread):
                     "UPDATE imaging_runs SET job_json_path=? WHERE id=?",
                     (ev["job_json_path"], ev["run_id"]),
                 )
+            # Prefer the CASA version the worker's script actually ran under
+            # over the orchestrator's casatools version stamped at insert.
+            if ev.get("casa_version"):
+                ImagingRunsQueries.set_casa_version(
+                    con, ev["run_id"], ev["casa_version"],
+                )
             ImagingRunsQueries.mark_done(
                 con,
                 ev["run_id"],
@@ -1383,6 +1389,10 @@ def _apply_terminal_to_db(db_manager, run_id, state, unit_dir) -> None:
             con.execute(
                 "UPDATE imaging_runs SET job_json_path=? WHERE id=?",
                 (job_json, run_id),
+            )
+        if state.get("casa_version"):
+            ImagingRunsQueries.set_casa_version(
+                con, run_id, state["casa_version"],
             )
         ImagingRunsQueries.mark_done(
             con, run_id, status=status,
@@ -2498,6 +2508,7 @@ class MachineSlot(threading.Thread):
                                     if final.get("field_selection") else None),
                 "error_message": err,
                 "job_json_path": prov.get("job_json"),
+                "casa_version": final.get("casa_version"),
                 # v5: source set explicitly by poll/verify paths, carried
                 # through; default unknown for anything that didn't stamp.
                 "terminal_source": final.get("terminal_source", TS_UNKNOWN),
@@ -2934,6 +2945,7 @@ class AdoptionPoller(threading.Thread):
                                         if (final or {}).get("field_selection") else None),
                     "error_message": err_msg,
                     "job_json_path": prov.get("job_json"),
+                    "casa_version": (final or {}).get("casa_version"),
                     # Observed terminal → worker_observed (carried by poll);
                     # synthetic-verified → mapped above; default unknown.
                     "terminal_source": (final or {}).get(

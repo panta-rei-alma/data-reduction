@@ -667,7 +667,21 @@ class JointImagingStep(Step):
             status = ImagingRunStatus.SUCCESS if success else ImagingRunStatus.FAILED
             retcode = 0 if success else 1
 
+            # result.json records the CASA that cleaned the products (the
+            # parallel path's monolithic CASA, or a resumed run's original
+            # cleaner); prefer it over the casatools version stamped above.
+            executed_version = None
+            if opts.method == "tclean_feather":
+                from panta_rei.imaging.runner import executing_casa_version
+                executed_version = executing_casa_version(
+                    opts.output_dir / "runs" / str(row_id)
+                )
+
             with ctx.db_manager.connect() as con:
+                if executed_version:
+                    ImagingRunsQueries.set_casa_version(
+                        con, row_id, executed_version,
+                    )
                 # Store resolved selections (populated by trusted preflight)
                 if u.spw_selection or u.field_selection:
                     ImagingRunsQueries.update_resolved(
