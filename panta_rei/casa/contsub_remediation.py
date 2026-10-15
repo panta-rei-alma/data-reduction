@@ -19,12 +19,26 @@ Usage:
     casa --nologger --nogui --pipeline -c contsub_remediation.py \
          --member-dir /path/to/member.uid___... --dry-run
 
+    casa --nologger --nogui --pipeline -c contsub_remediation.py \
+         --member-dir /path/to/member.uid___... --re-run
+
+``--re-run`` regenerates the products even when every _targets_line.ms
+exists.  Nothing is deleted: each existing *_targets.ms / *_targets_line.ms
+is first renamed to ``<name>.pre-rerun-<timestamp>`` so the stages run on
+the same clean state as a first remediation (hif_uvcontsub would otherwise
+rmtree the line MS itself, and hif_mstransform is not designed to run over
+an existing _targets.ms).  Note the regenerated _targets.ms carries no
+hif_selfcal solutions (this script never runs hif_selfcal); the renamed
+originals stay alongside for comparison or manual restore.
+
 Author: Generated for Dan Walker
 Project: Panta Rei ALMA Large Program (2025.1.00383.L)
 """
 
 import argparse
 import ast
+import builtins
+import datetime
 import glob
 import logging
 import os
@@ -153,8 +167,35 @@ def check_has_uvcontfit(member_dir):
     if "hif_uvcontfit" not in content:
         return False
 
-    # Check if the task is available in the CASA session
-    return "hif_uvcontfit" in dir()
+    # Check if the task is available in the CASA session.  CASA injects
+    # tasks into the script's global namespace (or builtins); a bare dir()
+    # here would only list this function's locals.
+    return "hif_uvcontfit" in globals() or hasattr(builtins, "hif_uvcontfit")
+
+
+def existing_targets_products(working_dir):
+    """Return the existing *_targets.ms / *_targets_line.ms for the base EBs."""
+    found = []
+    for ms_path in find_base_ms_files(working_dir):
+        for suffix in ("_targets.ms", "_targets_line.ms"):
+            product = ms_path.replace(".ms", suffix)
+            if os.path.isdir(product):
+                found.append(product)
+    return found
+
+
+def move_aside(paths, stamp):
+    """Rename each path to ``<path>.pre-rerun-<stamp>``; return the new names."""
+    moved = []
+    for path in paths:
+        dest = f"{path}.pre-rerun-{stamp}"
+        if os.path.exists(dest):
+            raise FileExistsError(f"Backup name already in use: {dest}")
+        os.rename(path, dest)
+        log.info("Moved aside: %s -> %s", os.path.basename(path),
+                 os.path.basename(dest))
+        moved.append(dest)
+    return moved
 
 
 def validate_output(working_dir):
@@ -210,11 +251,17 @@ def main():
         "--dry-run", action="store_true",
         help="Print what would be done without executing",
     )
+    parser.add_argument(
+        "--re-run", action="store_true",
+        help="Regenerate even if all _targets_line.ms exist (existing "
+             "_targets*.ms are renamed aside, not deleted)",
+    )
 
     # CASA passes extra args we need to ignore
     args, _unknown = parser.parse_known_args()
     member_dir = os.path.abspath(args.member_dir)
     dry_run = args.dry_run
+    re_run = args.re_run
 
     log.info("=" * 70)
     log.info("Contsub remediation for %s", os.path.basename(member_dir))
@@ -232,9 +279,13 @@ def main():
     log.info("Existing _targets_line.ms: %d", len(existing))
     log.info("Missing _targets_line.ms: %d", len(missing))
 
-    if all_present:
+    if all_present and not re_run:
         log.info("All _targets_line.ms already exist. Nothing to do.")
         sys.exit(0)
+
+    # --re-run: existing products are renamed aside just before execution
+    to_move = existing_targets_products(working_dir) if re_run else []
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     if not base_ms:
         log.error("No base calibrated MS files in %s", working_dir)
@@ -275,6 +326,9 @@ def main():
     # --- Dry run ---
     if dry_run:
         log.info("DRY RUN — would execute:")
+        for path in to_move:
+            log.info("  0. mv %s -> %s.pre-rerun-%s",
+                     os.path.basename(path), os.path.basename(path), stamp)
         log.info("  1. os.chdir(%s)", working_dir)
         log.info("  2. cp %s -> %s", cont_dat_src, cont_dat_dst)
         if context_files:
@@ -296,6 +350,10 @@ def main():
         sys.exit(0)
 
     # --- Execute ---
+    if to_move:
+        log.info("--re-run: moving %d existing _targets*.ms aside", len(to_move))
+        move_aside(to_move, stamp)
+
     os.chdir(working_dir)
     log.info("Working directory: %s", os.getcwd())
 

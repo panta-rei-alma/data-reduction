@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -306,6 +307,19 @@ class TestContsubStep:
         assert result.items_processed == 1  # re_run forces processing
 
     @patch("panta_rei.workflows.contsub.subprocess.run")
+    def test_re_run_forwarded_to_script(self, mock_sub, contsub_tree, db):
+        mock_sub.return_value = MagicMock(returncode=0)
+        ctx = self._make_ctx(contsub_tree, db)
+        ContsubStep(ContsubOptions(
+            casa_cmd="casa --pipeline", match="X64bd", re_run=True,
+        )).run(ctx)
+        assert mock_sub.call_args[0][0][-1] == "--re-run"
+
+        mock_sub.reset_mock()
+        ContsubStep(ContsubOptions(casa_cmd="casa --pipeline", match="X64bc")).run(ctx)
+        assert "--re-run" not in mock_sub.call_args[0][0]
+
+    @patch("panta_rei.workflows.contsub.subprocess.run")
     def test_failed_casa(self, mock_sub, contsub_tree, db):
         mock_sub.return_value = MagicMock(returncode=1)
         ctx = self._make_ctx(contsub_tree, db)
@@ -334,6 +348,99 @@ class TestContsubStep:
         con = db.connect()
         rows = con.execute("SELECT * FROM contsub_runs").fetchall()
         assert len(rows) >= 1
+
+
+# =====================================================================
+# CASA script: contsub_remediation.py (pipeline tasks faked)
+# =====================================================================
+
+
+class TestContsubRemediationScript:
+    @pytest.fixture
+    def script(self, monkeypatch):
+        import panta_rei.casa.contsub_remediation as script
+        calls = []
+
+        def fake_mstransform(**_kw):
+            calls.append("hif_mstransform")
+            for ms in script.find_base_ms_files(os.getcwd()):
+                os.mkdir(ms.replace(".ms", "_targets.ms"))
+
+        def fake_uvcontsub(**_kw):
+            calls.append("hif_uvcontsub")
+            for ms in script.find_base_ms_files(os.getcwd()):
+                os.mkdir(ms.replace(".ms", "_targets_line.ms"))
+
+        msmd = MagicMock()
+        msmd.fieldnames.return_value = ["SRC1"]
+        msmd.spwsforintent.return_value = [22]
+        fakes = {
+            "h_resume": lambda *_a: calls.append("h_resume"),
+            "h_init": lambda: None,
+            "hifa_restoredata": lambda **_kw: None,
+            "hif_mstransform": fake_mstransform,
+            "hifa_flagtargets": lambda **_kw: calls.append("hifa_flagtargets"),
+            "hif_uvcontsub": fake_uvcontsub,
+            "h_save": lambda: None,
+            "msmd": msmd,
+        }
+        for name, fake in fakes.items():
+            monkeypatch.setattr(script, name, fake, raising=False)
+        script.calls = calls
+        return script
+
+    def _complete_member(self, contsub_tree):
+        member = contsub_tree["member_needs"]
+        working = member / "calibrated" / "working"
+        (working / "uid___A002_X12fb842_X4e4e_targets.ms").mkdir()
+        line = working / "uid___A002_X12fb842_X4e4e_targets_line.ms"
+        line.mkdir()
+        (line / "old_marker").write_text("old")
+        return member, working
+
+    def _main(self, script, monkeypatch, *argv):
+        monkeypatch.setattr("sys.argv", ["contsub_remediation.py", *argv])
+        with pytest.raises(SystemExit) as exc:
+            script.main()
+        return exc.value.code
+
+    def test_complete_without_re_run_is_noop(self, script, contsub_tree, monkeypatch):
+        member, _ = self._complete_member(contsub_tree)
+        monkeypatch.chdir(member)
+        assert self._main(script, monkeypatch, "--member-dir", str(member)) == 0
+        assert script.calls == []
+
+    def test_re_run_moves_aside_and_regenerates(self, script, contsub_tree, monkeypatch):
+        member, working = self._complete_member(contsub_tree)
+        monkeypatch.chdir(member)
+        code = self._main(script, monkeypatch, "--member-dir", str(member), "--re-run")
+        assert code == 0
+        assert "hif_uvcontsub" in script.calls
+        line = working / "uid___A002_X12fb842_X4e4e_targets_line.ms"
+        assert line.is_dir() and not (line / "old_marker").exists()
+        backups = sorted(p.name for p in working.glob("*.pre-rerun-*"))
+        assert len(backups) == 2
+        old_line = next(working.glob("*_targets_line.ms.pre-rerun-*"))
+        assert (old_line / "old_marker").read_text() == "old"
+        # Backups don't look like MSs to the base-EB / product globs
+        assert len(script.find_base_ms_files(str(working))) == 1
+
+    def test_re_run_dry_run_moves_nothing(self, script, contsub_tree, monkeypatch):
+        member, working = self._complete_member(contsub_tree)
+        monkeypatch.chdir(member)
+        code = self._main(script, monkeypatch, "--member-dir", str(member),
+                          "--re-run", "--dry-run")
+        assert code == 0
+        assert script.calls == []
+        assert not list(working.glob("*.pre-rerun-*"))
+
+    def test_has_uvcontfit_sees_global_task(self, script, contsub_tree, monkeypatch):
+        member = contsub_tree["member_needs"]
+        pipescript = next((member / "script").glob("*casa_pipescript.py"))
+        pipescript.write_text("hif_uvcontfit()\nhif_uvcontsub()\n")
+        assert script.check_has_uvcontfit(str(member)) is False
+        monkeypatch.setattr(script, "hif_uvcontfit", lambda **_kw: None, raising=False)
+        assert script.check_has_uvcontfit(str(member)) is True
 
 
 # =====================================================================

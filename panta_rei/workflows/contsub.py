@@ -100,8 +100,12 @@ def _run_one_contsub(
     contsub_script: Path,
     extra_meta: Dict[str, Optional[str]],
     dry_run: bool = False,
+    re_run: bool = False,
 ) -> Tuple[str, int, Path]:
     """Run the contsub CASA script for one MOUS.
+
+    *re_run* is forwarded to the script, which otherwise exits early when
+    every ``_targets_line.ms`` already exists.
 
     Returns ``(status, retcode, log_path)``.
     """
@@ -115,6 +119,8 @@ def _run_one_contsub(
     log_path = log_dir / f"contsub_{ts}.log"
 
     full_cmd = f"{casa_cmd} -c {contsub_script} --member-dir {member_dir}"
+    if re_run:
+        full_cmd += " --re-run"
 
     with db_manager.connect() as con:
         row_id = ContsubRunsQueries.insert_row(
@@ -315,6 +321,7 @@ class ContsubStep(Step):
                 contsub_script=contsub_script,
                 extra_meta=extra_meta,
                 dry_run=ctx.dry_run,
+                re_run=opts.re_run,
             )
 
             processed += 1
