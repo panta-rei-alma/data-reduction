@@ -219,9 +219,11 @@ class TestContsubStep:
         ctx = self._make_ctx(contsub_tree, db)
         opts = ContsubOptions(casa_cmd="casa --pipeline")
         result = ContsubStep(opts).run(ctx)
-        # Should process at least the two MOUSs that need contsub
-        assert result.items_processed >= 2
+        # Only the fresh MOUS runs; the partial one is refused, the
+        # complete one skipped.
+        assert result.items_processed == 1
         assert result.items_skipped >= 1  # member_complete
+        assert len(result.errors) == 1 and "x64be" in result.errors[0].lower()
 
     @patch("panta_rei.workflows.contsub.subprocess.run")
     def test_skips_when_needs_contsub_false(self, mock_sub, contsub_tree, db):
@@ -305,7 +307,7 @@ class TestContsubStep:
         result = ContsubStep(opts).run(ctx)
         assert not result.success
         assert result.items_processed == 0
-        assert "in-place re-run is unsupported" in result.errors[0]
+        assert "contsub over existing outputs is unsupported" in result.errors[0]
         mock_sub.assert_not_called()
         # Existing output untouched
         working = contsub_tree["member_complete"] / "calibrated" / "working"
@@ -335,13 +337,26 @@ class TestContsubStep:
         assert "failed" in result.errors[0].lower()
 
     @patch("panta_rei.workflows.contsub.subprocess.run")
-    def test_multi_eb_discovery(self, mock_sub, contsub_tree, db):
-        """Partial multi-EB case: 1 of 3 targets_line.ms exists."""
-        mock_sub.return_value = MagicMock(returncode=0)
+    def test_partial_multi_eb_refused(self, mock_sub, contsub_tree, db):
+        """Partial multi-EB case (1 of 3 targets_line.ms exists): the
+        default path refuses too and never launches CASA."""
         ctx = self._make_ctx(contsub_tree, db)
         opts = ContsubOptions(casa_cmd="casa --pipeline", match="X64be")
         result = ContsubStep(opts).run(ctx)
-        assert result.items_processed == 1
+        assert result.items_processed == 0
+        assert "contsub over existing outputs is unsupported" in result.errors[0]
+        mock_sub.assert_not_called()
+
+    @patch("panta_rei.workflows.contsub.subprocess.run")
+    def test_targets_present_line_missing_refused(self, mock_sub, contsub_tree, db):
+        working = contsub_tree["member_needs"] / "calibrated" / "working"
+        (working / "uid___A002_X12fb842_X4e4e_targets.ms").mkdir()
+        ctx = self._make_ctx(contsub_tree, db)
+        result = ContsubStep(ContsubOptions(
+            casa_cmd="casa --pipeline", match="X64bc",
+        )).run(ctx)
+        assert result.items_processed == 0 and len(result.errors) == 1
+        mock_sub.assert_not_called()
 
     @patch("panta_rei.workflows.contsub.subprocess.run")
     def test_db_records_created(self, mock_sub, contsub_tree, db):
@@ -424,13 +439,31 @@ class TestContsubRemediationScript:
                           "--re-run", *extra)
         assert code == 2
         assert script.calls == []
-        assert "in-place re-run is unsupported" in caplog.text
+        assert "contsub over existing outputs is unsupported" in caplog.text
         line = working / "uid___A002_X12fb842_X4e4e_targets_line.ms"
         assert (line / "old_marker").read_text() == "old"
         assert sorted(p.name for p in working.iterdir() if "targets" in p.name) == [
             "uid___A002_X12fb842_X4e4e_targets.ms",
             "uid___A002_X12fb842_X4e4e_targets_line.ms",
         ]
+
+    def test_partial_state_refused_without_re_run(self, script, contsub_tree,
+                                                 monkeypatch, caplog):
+        """_targets.ms present, _targets_line.ms missing: refuse, exit 2."""
+        member = contsub_tree["member_needs"]
+        working = member / "calibrated" / "working"
+        (working / "uid___A002_X12fb842_X4e4e_targets.ms").mkdir()
+        monkeypatch.chdir(member)
+        assert self._main(script, monkeypatch, "--member-dir", str(member)) == 2
+        assert script.calls == []
+        assert "contsub over existing outputs is unsupported" in caplog.text
+        assert not (working / "uid___A002_X12fb842_X4e4e_targets_line.ms").exists()
+
+    def test_fresh_member_proceeds(self, script, contsub_tree, monkeypatch):
+        member = contsub_tree["member_needs"]
+        monkeypatch.chdir(member)
+        assert self._main(script, monkeypatch, "--member-dir", str(member)) == 0
+        assert "hif_uvcontsub" in script.calls
 
     def test_re_run_without_outputs_runs_normally(self, script, contsub_tree, monkeypatch):
         member = contsub_tree["member_needs"]
@@ -440,8 +473,8 @@ class TestContsubRemediationScript:
         assert "hif_uvcontsub" in script.calls
 
     def test_refusal_message_matches_workflow(self, script):
-        from panta_rei.workflows.contsub import RERUN_REFUSED_MSG
-        assert script.RERUN_REFUSED_MSG == RERUN_REFUSED_MSG
+        from panta_rei.workflows.contsub import REFUSED_MSG
+        assert script.REFUSED_MSG == REFUSED_MSG
 
     def test_has_uvcontfit_sees_global_task(self, script, contsub_tree, monkeypatch):
         member = contsub_tree["member_needs"]

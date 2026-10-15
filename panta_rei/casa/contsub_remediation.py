@@ -22,12 +22,14 @@ Usage:
     casa --nologger --nogui --pipeline -c contsub_remediation.py \
          --member-dir /path/to/member.uid___... --re-run
 
-``--re-run`` refuses (exit 2) when any *_targets.ms / *_targets_line.ms
-already exists: re-running the pipeline stages in place inside a resumed
-context is unsupported (the context already registers those MSs, and a
-partial failure would leave canonical products half-replaced).
+Only genuinely fresh EBs are processed.  If every _targets_line.ms exists
+(and no --re-run) the script is a no-op; otherwise it refuses (exit 2,
+touching nothing) when any *_targets.ms / *_targets_line.ms already
+exists, with or without --re-run.  Running the pipeline stages over
+existing outputs inside a resumed context is unsupported: the context
+already registers those MSs, hif_uvcontsub deletes an existing line MS,
+and a partial failure would leave canonical products half-replaced.
 Re-subtraction will instead use direct uvcontsub into versioned outputs.
-With no existing outputs it behaves like a normal run.
 
 Author: Generated for Dan Walker
 Project: Panta Rei ALMA Large Program (2025.1.00383.L)
@@ -182,9 +184,10 @@ def existing_targets_products(working_dir):
 
 
 # Shared with panta_rei.workflows.contsub (this script cannot import it).
-RERUN_REFUSED_MSG = (
-    "existing contsub outputs present; in-place re-run is unsupported "
-    "(re-subtraction will use direct uvcontsub into versioned outputs)"
+REFUSED_MSG = (
+    "existing contsub outputs present; contsub over existing outputs is "
+    "unsupported (re-subtraction will use direct uvcontsub into versioned "
+    "outputs)"
 )
 
 
@@ -243,7 +246,7 @@ def main():
     )
     parser.add_argument(
         "--re-run", action="store_true",
-        help="Run even if outputs might exist; refuses if any "
+        help="Skip the all-complete no-op; still refuses if any "
              "_targets*.ms is already present",
     )
 
@@ -269,17 +272,18 @@ def main():
     log.info("Existing _targets_line.ms: %d", len(existing))
     log.info("Missing _targets_line.ms: %d", len(missing))
 
-    if re_run:
-        present = existing_targets_products(working_dir)
-        if present:
-            log.error("REFUSED --re-run: %s", RERUN_REFUSED_MSG)
-            for path in present:
-                log.error("  %s", path)
-            sys.exit(2)
-
-    if all_present:
+    if all_present and not re_run:
         log.info("All _targets_line.ms already exist. Nothing to do.")
         sys.exit(0)
+
+    # Every remaining path would run mstransform/uvcontsub: only allowed
+    # when no EB has any output yet.
+    present = existing_targets_products(working_dir)
+    if present:
+        log.error("REFUSED: %s", REFUSED_MSG)
+        for path in present:
+            log.error("  %s", path)
+        sys.exit(2)
 
     if not base_ms:
         log.error("No base calibrated MS files in %s", working_dir)
