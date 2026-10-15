@@ -136,9 +136,6 @@ def main():
         exportfits(imagename=pbcor_image, fitsimage=local_tclean_fits, overwrite=True)
         result["tclean_fits"] = local_tclean_fits
 
-        # Ensure common beam for tclean
-        params["restoringbeam"] = "common"
-
         # Prepare TP for feathering
         tp_fits = unit["sdimage"]
         tp_work = run_dir / "tp"
