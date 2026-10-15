@@ -36,6 +36,19 @@ MOCK_CASA_COMMANDS = dedent("""\
     tclean(vis=['test.ms'], field='"SRC1"', spw=['25'], specmode='cube', nchan=100, start='87.0GHz', width='244.14kHz', imsize=[100, 100], cell=['0.5arcsec'], restoration=True, pbcor=True, niter=30000, threshold='0.1Jy', imagename='test.spw25.cube.I.iter1')
 """)
 
+# Aggregate-continuum iter1 call (one product per field, line-free GHz ranges).
+# vis names map to EB uids "tm_eb" / "sm_eb" (basename minus _targets.ms).
+MOCK_CONTINUUM_COMMANDS = dedent("""\
+    # hif_makeimlist(specmode='cont')
+    tclean(vis=['tm_eb_targets.ms'], field='"SRC1"', spw=['23:86.0~86.1GHz,25:87.0~87.1GHz'], datacolumn='data', specmode='mfs', deconvolver='hogbom', gridder='mosaic', mosweight=True, imsize=[100, 100], cell=['0.5arcsec'], restoration=True, pbcor=True, imagename='test.spw23_25.cont.I.iter1')
+""")
+
+# The 7m (SM) member's own aggregate-continuum call — different spw ids/frame.
+MOCK_CONTINUUM_COMMANDS_SM = dedent("""\
+    # hif_makeimlist(specmode='cont')
+    tclean(vis=['sm_eb_targets.ms'], field='"SRC1"', spw=['22:85.99~86.09GHz,24:86.99~87.09GHz'], datacolumn='data', specmode='mfs', deconvolver='hogbom', gridder='mosaic', mosweight=True, imsize=[60, 60], cell=['2.0arcsec'], restoration=True, pbcor=True, imagename='sm.spw22_24.cont.I.iter1')
+""")
+
 
 @pytest.fixture
 def imaging_tree(tmp_path):
@@ -117,6 +130,7 @@ def imaging_tree(tmp_path):
         "csv_path": csv_path,
         "gous_id": gous_id,
         "mous_id_tm": mous_id_tm,
+        "mous_id_sm": mous_id_sm,
     }
 
 
@@ -195,6 +209,141 @@ class TestRecoverParamsStep:
         result = step.run(imaging_ctx)
         assert result.success
         assert result.items_processed == 0
+
+    def test_continuum_divergence_on_geometry_not_spw(self):
+        from panta_rei.workflows.imaging import _check_param_divergence
+        # Differing imaging GEOMETRY across TM MOUSs → divergence.
+        results = {
+            "m1": {("SRC1", "cont"): {"spw": ["23:86.0~86.2GHz"], "imsize": [160, 160]}},
+            "m2": {("SRC1", "cont"): {"spw": ["23:86.0~86.2GHz"], "imsize": [200, 200]}},
+        }
+        msg = _check_param_divergence("SRC1", "cont", results, product_type="cont")
+        assert msg is not None and "imsize" in msg
+        # Differing line-free spw selections alone do NOT diverge — each EB
+        # legitimately carries its own selection (captured per-EB).
+        same_geom = {
+            "m1": {("SRC1", "cont"): {"spw": ["23:86.0~86.2GHz"], "imsize": [160, 160]}},
+            "m2": {("SRC1", "cont"): {"spw": ["23:86.0~86.1GHz"], "imsize": [160, 160]}},
+        }
+        assert _check_param_divergence(
+            "SRC1", "cont", same_geom, product_type="cont"
+        ) is None
+
+    def test_continuum_recovery_builds_combined_per_eb_spw_map(
+        self, imaging_ctx, imaging_tree
+    ):
+        """Recovery captures EACH EB's own selection — 12m from the TM call and
+        7m from the SM member's own continuum call — in one spw_by_eb map."""
+        tm_log = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_tm']}"
+            / "pipeline-20250101" / "html" / "casa_commands.log"
+        )
+        tm_log.write_text(tm_log.read_text() + MOCK_CONTINUUM_COMMANDS)
+        # Create the SM member's weblog with its own continuum call.
+        sm_html = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_sm']}"
+            / "pipeline-20250101" / "html"
+        )
+        sm_html.mkdir(parents=True)
+        (sm_html / "casa_commands.log").write_text(MOCK_CONTINUUM_COMMANDS_SM)
+
+        RecoverParamsStep(ImagingOptions(
+            product_type="cont",
+            weblog_dir=imaging_tree["weblog_dir"],
+            obs_csv=imaging_tree["csv_path"],
+            step="recover",
+        )).run(imaging_ctx)
+
+        with imaging_ctx.db_manager.connect() as con:
+            rows = ImagingParamsQueries.get_all_recovered(con, product_type="cont")
+        assert len(rows) == 1
+        params = json.loads(Path(rows[0]["params_json_path"]).read_text())
+        # Both the 12m and 7m EBs, each with its OWN spw selection (ids/frame).
+        assert params["spw_by_eb"] == {
+            "tm_eb": "23:86.0~86.1GHz,25:87.0~87.1GHz",
+            "sm_eb": "22:85.99~86.09GHz,24:86.99~87.09GHz",
+        }
+
+    def test_continuum_vis_spw_mismatch_fails_unit(self, imaging_ctx, imaging_tree):
+        """A malformed per-EB selection (vis/spw lengths differ) must fail the
+        unit at recovery, not zip-truncate EBs out of the joint image."""
+        tm_log = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_tm']}"
+            / "pipeline-20250101" / "html" / "casa_commands.log"
+        )
+        tm_log.write_text(tm_log.read_text() + MOCK_CONTINUUM_COMMANDS)
+        sm_html = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_sm']}"
+            / "pipeline-20250101" / "html"
+        )
+        sm_html.mkdir(parents=True)
+        (sm_html / "casa_commands.log").write_text(
+            MOCK_CONTINUUM_COMMANDS_SM.replace(
+                "vis=['sm_eb_targets.ms']",
+                "vis=['sm_eb_targets.ms', 'sm_eb2_targets.ms', 'sm_eb3_targets.ms']",
+            ).replace(
+                "spw=['22:85.99~86.09GHz,24:86.99~87.09GHz']",
+                "spw=['22:85.99~86.09GHz', '24:86.99~87.09GHz']",
+            )
+        )
+
+        RecoverParamsStep(ImagingOptions(
+            product_type="cont",
+            weblog_dir=imaging_tree["weblog_dir"],
+            obs_csv=imaging_tree["csv_path"],
+            step="recover",
+        )).run(imaging_ctx)
+
+        with imaging_ctx.db_manager.connect() as con:
+            assert ImagingParamsQueries.get_all_recovered(
+                con, product_type="cont"
+            ) == []
+            row = con.execute(
+                "SELECT status, error_message FROM imaging_params "
+                "WHERE product_type='cont'"
+            ).fetchone()
+        status, error_message = tuple(row)
+        assert status == "failed"
+        assert "length mismatch" in error_message
+
+    def test_recovers_continuum_isolated_from_line(self, imaging_ctx, imaging_tree):
+        """Continuum recovery stores spw_id='cont'/product_type='cont' rows, and
+        the default (line) selection never sees them (Codex line-isolation)."""
+        log = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_tm']}"
+            / "pipeline-20250101" / "html" / "casa_commands.log"
+        )
+        log.write_text(log.read_text() + MOCK_CONTINUUM_COMMANDS)
+
+        common = dict(
+            weblog_dir=imaging_tree["weblog_dir"],
+            obs_csv=imaging_tree["csv_path"],
+            step="recover",
+        )
+        RecoverParamsStep(ImagingOptions(**common)).run(imaging_ctx)  # line
+        res = RecoverParamsStep(
+            ImagingOptions(product_type="cont", **common)
+        ).run(imaging_ctx)
+        assert res.success
+
+        with imaging_ctx.db_manager.connect() as con:
+            line_rows = ImagingParamsQueries.get_all_recovered(con)  # default line
+            cont_rows = ImagingParamsQueries.get_all_recovered(
+                con, product_type="cont"
+            )
+
+        # Line selection is blind to continuum rows.
+        assert line_rows and all(r["product_type"] == "line" for r in line_rows)
+        # Exactly one aggregate continuum product for SRC1, keyed spw_id='cont'.
+        assert len(cont_rows) == 1
+        assert cont_rows[0]["source_name"] == "SRC1"
+        assert cont_rows[0]["spw_id"] == "cont"
+        assert cont_rows[0]["product_type"] == "cont"
 
 
 # ---------------------------------------------------------------------------

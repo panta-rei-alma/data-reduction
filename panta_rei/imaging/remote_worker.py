@@ -263,6 +263,7 @@ def _build_imaging_unit(unit_dict: dict):
         line_group=unit_dict.get("line_group"),
         spw_id=str(unit_dict["spw_id"]),
         params_id=int(unit_dict["params_id"]),
+        product_type=unit_dict.get("product_type", "line"),
         recovered_params=unit_dict.get("recovered_params", {}),
         vis_tm=list(unit_dict.get("vis_tm", [])),
         vis_sm=list(unit_dict.get("vis_sm", [])),
@@ -473,8 +474,6 @@ def run_unit(args: argparse.Namespace) -> int:
         base_state["phase"] = Phase.RUNNING
         write_state_atomic(state_path, base_state)
 
-        from panta_rei.imaging.runner import run_tclean_feather_parallel
-
         # F2.f: flip state.json to PUBLISHING immediately before the runner
         # starts the publish step.  This lets the orchestrator's re-read in
         # the verify-or-quarantine flow safely distinguish "still tclean-ing"
@@ -484,15 +483,13 @@ def run_unit(args: argparse.Namespace) -> int:
             base_state["phase"] = Phase.PUBLISHING
             write_state_atomic(state_path, base_state)
 
-        success, msg, output_fits = run_tclean_feather_parallel(
+        _common = dict(
             unit=unit,
             output_dir=publish_dir,
             row_id=run_id,
             nproc=nproc,
             casa_path=casa_path,
-            deconvolver=deconvolver,
             scales=scales,
-            keep_intermediates=manifest.get("keep_intermediates", False),
             dry_run=False,
             work_dir=work_dir,
             publish_policy=publish_policy,
@@ -504,6 +501,18 @@ def run_unit(args: argparse.Namespace) -> int:
             },
             on_publish_start=_on_publish_start,
         )
+        # Select the runner by product_type. Continuum is mtmfs (no
+        # deconvolver/keep_intermediates knobs); line is tclean+feather.
+        if unit.product_type == "cont":
+            from panta_rei.imaging.runner import run_tclean_cont_parallel
+            success, msg, output_fits = run_tclean_cont_parallel(**_common)
+        else:
+            from panta_rei.imaging.runner import run_tclean_feather_parallel
+            success, msg, output_fits = run_tclean_feather_parallel(
+                deconvolver=deconvolver,
+                keep_intermediates=manifest.get("keep_intermediates", False),
+                **_common,
+            )
 
         # ---------- COPY PROVENANCE TO NAS ----------
         provenance = _copy_provenance_to_nas(

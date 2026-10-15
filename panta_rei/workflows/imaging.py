@@ -34,7 +34,11 @@ from panta_rei.imaging.matching import (
     find_member_dir,
     load_targets_csv,
 )
-from panta_rei.imaging.recovery import has_staged_weblog, recover_params_for_mous
+from panta_rei.imaging.recovery import (
+    has_staged_weblog,
+    recover_continuum_params_for_mous,
+    recover_params_for_mous,
+)
 from panta_rei.workflows.base import Step, StepResult, WorkflowContext
 
 log = logging.getLogger(__name__)
@@ -64,6 +68,7 @@ class ImagingOptions:
     keep_intermediates: bool = False
     parallel: bool = False          # use mpicasa for tclean
     nproc: int = 4                  # MPI processes (only with --parallel)
+    product_type: str = "line"      # 'line' (cube) or 'cont' (continuum)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +98,11 @@ class RecoverParamsStep(Step):
         return None
 
     def run(self, ctx: WorkflowContext) -> StepResult:
+        from panta_rei.imaging.recovery import clear_parse_cache
+
+        # Glob/weblog caches are memoized within one recovery; reset them so a
+        # second recovery in the same process sees new members and weblogs.
+        clear_parse_cache()
         opts = self._opts
         weblog_dir = opts.weblog_dir or ctx.config.weblog_dir
         csv_path = opts.obs_csv or ctx.targets_csv_path
@@ -160,14 +170,27 @@ class RecoverParamsStep(Step):
                         continue
 
                     log.info(
-                        "Recovering params: GOUS=%s source=%s MOUS=%s",
-                        gous_uid, source, full_mous,
+                        "Recovering %s params: GOUS=%s source=%s MOUS=%s",
+                        opts.product_type, gous_uid, source, full_mous,
                     )
-                    result = recover_params_for_mous(
-                        full_mous,
-                        weblog_dir,
-                        ctx.data_dir,
-                    )
+                    if opts.product_type == "cont":
+                        # Continuum is aggregated over spws → one product per
+                        # field. Shape {field: params} into the same
+                        # {(field, spw): params} structure the rest of the loop
+                        # expects, with the sentinel spw_id 'cont'.
+                        raw = recover_continuum_params_for_mous(
+                            full_mous, weblog_dir, ctx.data_dir,
+                        )
+                        result = (
+                            {(f, "cont"): p for f, p in raw.items()}
+                            if raw else None
+                        )
+                    else:
+                        result = recover_params_for_mous(
+                            full_mous,
+                            weblog_dir,
+                            ctx.data_dir,
+                        )
                     if result is None:
                         log.warning(
                             "No params recovered for MOUS %s", mous_id
@@ -200,7 +223,8 @@ class RecoverParamsStep(Step):
                     divergence = keyset_error
                     if divergence is None:
                         divergence = _check_param_divergence(
-                            field_name, spw_id, all_mous_results
+                            field_name, spw_id, all_mous_results,
+                            product_type=opts.product_type,
                         )
 
                     # Get params from canonical if available, else first MOUS that has it
@@ -216,7 +240,8 @@ class RecoverParamsStep(Step):
                     # Check existing in DB
                     with ctx.db_manager.connect() as con:
                         existing = ImagingParamsQueries.get_by_key(
-                            con, gous_uid, field_name, lg, spw_id
+                            con, gous_uid, field_name, lg, spw_id,
+                            product_type=opts.product_type,
                         )
 
                     if existing and not opts.re_run:
@@ -226,6 +251,21 @@ class RecoverParamsStep(Step):
                         )
                         skipped += 1
                         continue
+
+                    # Continuum: attach each EB's own line-free spw selection
+                    # (12m from the TM call(s), 7m recovered from the SM call(s))
+                    # so the joint image uses pipeline-prescribed channels per EB.
+                    cont_error = None
+                    if opts.product_type == "cont":
+                        canon_params = dict(canon_params)
+                        try:
+                            canon_params["spw_by_eb"] = _build_cont_spw_by_eb(
+                                all_mous_results, groups, field_name, lg,
+                                weblog_dir, ctx.data_dir,
+                            )
+                        except ValueError as exc:
+                            cont_error = f"per-EB continuum selection: {exc}"
+                            canon_params["spw_by_eb"] = {}
 
                     # Write JSON sidecar
                     safe_source = field_name.replace('"', "").replace("'", "")
@@ -242,6 +282,13 @@ class RecoverParamsStep(Step):
                         log.error(
                             "DIVERGENCE: %s/%s/spw%s — %s",
                             gous_uid, field_name, spw_id, divergence,
+                        )
+                    elif cont_error:
+                        status = ImagingParamsStatus.FAILED
+                        error_msg = cont_error
+                        log.error(
+                            "CONT SELECTION: %s/%s/spw%s — %s",
+                            gous_uid, field_name, spw_id, cont_error,
                         )
                     else:
                         status = ImagingParamsStatus.RECOVERED
@@ -294,6 +341,7 @@ class RecoverParamsStep(Step):
                                 nchan=int(nchan) if nchan is not None else None,
                                 phasecenter=phasecenter,
                                 robust=float(robust) if robust is not None else None,
+                                product_type=opts.product_type,
                             )
                             con.commit()
 
@@ -678,6 +726,18 @@ _DIVERGENCE_KEYS = [
     "outframe", "veltype", "weighting", "robust", "niter", "threshold",
 ]
 
+# Continuum has no start/width/nchan (mfs).  The line-free spw selection is NOT
+# compared here: it is captured per-EB (each EB has its own, by design), so a
+# top-level spw mismatch across MOUSs is expected, not a divergence.  We compare
+# the imaging geometry + weighting/masking knobs that must agree across the TM
+# MOUSs being combined.
+_CONT_DIVERGENCE_KEYS = [
+    "imsize", "cell", "phasecenter", "weighting", "robust", "threshold",
+    "mosweight", "pblimit", "perchanweightdensity", "usemask",
+    "sidelobethreshold", "noisethreshold", "lownoisethreshold",
+    "negativethreshold", "minbeamfrac",
+]
+
 # Relative tolerance for float comparisons
 _FLOAT_RTOL = 1e-6
 
@@ -711,10 +771,13 @@ def _check_param_divergence(
     field_name: str,
     spw_id: str,
     all_mous_results: dict[str, dict[tuple[str, str], dict]],
+    product_type: str = "line",
 ) -> Optional[str]:
     """Compare recovered params for (field, spw) across TM MOUSs.
 
     Returns an error message describing the divergence, or None if they match.
+    Continuum compares the line-free ``spw`` selection + continuum knobs
+    instead of the cube start/width/nchan grid.
     """
     key = (field_name, spw_id)
     mous_params: list[tuple[str, dict]] = []
@@ -725,9 +788,10 @@ def _check_param_divergence(
     if len(mous_params) <= 1:
         return None  # Only one MOUS — no divergence possible
 
+    keys = _CONT_DIVERGENCE_KEYS if product_type == "cont" else _DIVERGENCE_KEYS
     _, reference = mous_params[0]
     for mous_id, params in mous_params[1:]:
-        for k in _DIVERGENCE_KEYS:
+        for k in keys:
             ref_val = reference.get(k)
             cur_val = params.get(k)
             if not _values_match(ref_val, cur_val):
@@ -758,6 +822,73 @@ def _values_match(a, b) -> bool:
     if isinstance(a, str) and isinstance(b, str):
         return a.strip() == b.strip()
     return str(a) == str(b)
+
+
+def _build_cont_spw_by_eb(
+    all_mous_results: dict,
+    groups: list,
+    field_name: str,
+    lg: Optional[str],
+    weblog_dir: Path,
+    data_dir: Path,
+) -> dict[str, str]:
+    """Build the combined ``{eb_uid: spw_selection}`` map for a continuum unit.
+
+    Each EB — 12m and 7m — gets the exact line-free selection the ALMA pipeline
+    prescribed for it (its own spw ids and topocentric frame), so the joint
+    image needs no cross-array frequency remap.  The 12m EBs come from the
+    already-recovered TM call(s); the 7m EBs are recovered here from the SM
+    MOUS weblog(s).
+    """
+    from panta_rei.imaging.recovery import (
+        eb_spw_map_from_call,
+        recover_continuum_params_for_mous,
+    )
+
+    spw_by_eb: dict[str, str] = {}
+    # 12m EBs — from the TM calls already recovered for this (field, 'cont').
+    for results in all_mous_results.values():
+        call = results.get((field_name, "cont"))
+        if call:
+            spw_by_eb.update(eb_spw_map_from_call(call))
+    # 7m EBs — recover the SM aggregate-continuum call(s) for the same source.
+    sm_groups = [
+        g for g in groups
+        if g.array == "SM" and g.source_name == field_name
+        and (not lg or g.line_group == lg)
+    ]
+    if not sm_groups:
+        log.warning(
+            "continuum %s/%s: no SM group in CSV — no 7m EBs will contribute",
+            field_name, lg,
+        )
+    n_sm_before = len(spw_by_eb)
+    for g in sm_groups:
+        for mous_id in g.mous_ids:
+            full = _ensure_full_uid(mous_id)
+            if (
+                not has_staged_weblog(weblog_dir, full)
+                and not find_member_dir(data_dir, mous_id)
+            ):
+                log.warning(
+                    "continuum %s: SM MOUS %s not on disk — its 7m EBs omitted",
+                    field_name, mous_id,
+                )
+                continue
+            raw = recover_continuum_params_for_mous(full, weblog_dir, data_dir)
+            if not raw or field_name not in raw:
+                log.warning(
+                    "continuum %s: no SM continuum call for this source in "
+                    "MOUS %s — its 7m EBs omitted", field_name, mous_id,
+                )
+                continue
+            spw_by_eb.update(eb_spw_map_from_call(raw[field_name]))
+    if sm_groups and len(spw_by_eb) == n_sm_before:
+        log.warning(
+            "continuum %s/%s: SM groups present but no 7m EB selection "
+            "recovered — preflight will fail this unit", field_name, lg,
+        )
+    return spw_by_eb
 
 
 def _ensure_full_uid(mous_id: str) -> str:

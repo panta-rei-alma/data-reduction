@@ -69,7 +69,7 @@ ALL_INDEXES = {
 }
 
 
-ALL_VERSIONS = set(range(1, 17))  # migrations 1-16
+ALL_VERSIONS = set(range(1, 18))  # migrations 1-17
 
 
 def assert_full_schema(con: sqlite3.Connection) -> None:
@@ -568,11 +568,11 @@ class TestMigrationRollback:
 
 class TestMigrationV16TerminalSource:
 
-    def test_version_set_is_exactly_1_to_16(self):
+    def test_version_set_is_exactly_1_to_17(self):
         """Guards against an off-by-one: the full version set, not a count."""
         db = DatabaseManager(":memory:")
         con = db.connect()
-        assert get_schema_versions(con) == set(range(1, 17))
+        assert get_schema_versions(con) == set(range(1, 18))
 
     def test_terminal_source_column_added_with_default(self):
         db = DatabaseManager(":memory:")
@@ -611,8 +611,88 @@ class TestMigrationV16TerminalSource:
         with DatabaseManager(db_path).connect() as con:
             n_after = con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
             integ = con.execute("PRAGMA integrity_check").fetchone()[0]
-        assert n_after == n_before == 16
+        assert n_after == n_before == 17
         assert integ == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Migration v17 (product_type) — table rebuild must preserve ids + widen key
+# ---------------------------------------------------------------------------
+
+class TestMigrationV17ProductType:
+    """The imaging_params rebuild is the riskiest migration: it DROPs and
+    recreates the table. These tests pin the invariants Codex flagged — id
+    preservation (imaging_runs.params_id FK), the widened unique key, and the
+    recreated idx_ip_key."""
+
+    def _build_v16_db(self, db_path, monkeypatch):
+        """Build a DB stopped at v16 (no product_type) by hiding the v17
+        migration, then return after inserting a line row with a known id."""
+        from panta_rei.db import connection as conn_mod
+        from panta_rei.db import schema as schema_mod
+
+        v16 = [m for m in schema_mod.MIGRATIONS if m.version <= 16]
+        monkeypatch.setattr(conn_mod, "MIGRATIONS", v16)
+        with DatabaseManager(db_path).connect() as con:
+            con.execute(
+                "INSERT INTO imaging_params (id, gous_uid, source_name, "
+                "line_group, spw_id, mous_uids_tm, params_source, status, "
+                "recovered_at) VALUES (5,'G','S','N2H+','23','[]','weblog',"
+                "'recovered','t')"
+            )
+            con.execute(
+                "INSERT INTO imaging_runs (params_id, gous_uid, source_name, "
+                "spw_id, started_at, status) VALUES (5,'G','S','23','t','queued')"
+            )
+            con.commit()
+            assert not column_exists(con, "imaging_params", "product_type")
+        monkeypatch.undo()  # restore the full migration list (incl. v17)
+
+    def test_id_preserved_and_backfilled_to_line(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "old.db"
+        self._build_v16_db(db_path, monkeypatch)
+        with DatabaseManager(db_path).connect() as con:
+            row = con.execute(
+                "SELECT id, product_type FROM imaging_params"
+            ).fetchone()
+            assert row == (5, "line")  # id preserved, backfilled to 'line'
+            # imaging_runs.params_id still resolves to the same row
+            assert con.execute(
+                "SELECT params_id FROM imaging_runs"
+            ).fetchone()[0] == 5
+            assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+    def test_widened_unique_key_allows_line_and_cont(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "old.db"
+        self._build_v16_db(db_path, monkeypatch)
+        with DatabaseManager(db_path).connect() as con:
+            # A continuum row with the SAME (gous, source, line_group, spw)
+            # coexists with the existing line row.
+            con.execute(
+                "INSERT INTO imaging_params (gous_uid, source_name, line_group, "
+                "spw_id, mous_uids_tm, params_source, status, recovered_at, "
+                "product_type) VALUES ('G','S','N2H+','23','[]','weblog',"
+                "'recovered','t','cont')"
+            )
+            con.commit()
+            # But a duplicate LINE row still violates the unique constraint.
+            with pytest.raises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO imaging_params (gous_uid, source_name, "
+                    "line_group, spw_id, mous_uids_tm, params_source, status, "
+                    "recovered_at, product_type) VALUES ('G','S','N2H+','23',"
+                    "'[]','weblog','recovered','t','line')"
+                )
+
+    def test_idx_ip_key_rebuilt_with_product_type(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "old.db"
+        self._build_v16_db(db_path, monkeypatch)
+        with DatabaseManager(db_path).connect() as con:
+            cols = [r[2] for r in con.execute("PRAGMA index_info(idx_ip_key)")]
+            assert cols == [
+                "gous_uid", "source_name", "line_group", "spw_id", "product_type"
+            ]
+            assert index_exists(con, "idx_ip_status")
 
 
 class TestDBSafetyRoundTrip:

@@ -115,6 +115,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Imaging method (default: tclean_feather)",
     )
     ap.add_argument(
+        "--product-type",
+        choices=["line", "cont"],
+        default="line",
+        help="'line' = spectral-line cube params (default); 'cont' = "
+             "aggregate-continuum params. Mainly used with --step recover; "
+             "continuum imaging itself runs via panta-rei-continuum-dispatch.",
+    )
+    ap.add_argument(
         "--parallel", action="store_true",
         help="Enable MPI parallelization for tclean via mpicasa (requires CASA_PATH)",
     )
@@ -129,6 +137,17 @@ def main() -> int:
     """Entry point for ``panta-rei-imaging``."""
     setup_logging()
     args = _build_parser().parse_args()
+
+    # Continuum imaging runs only through the distributed dispatcher
+    # (panta-rei-continuum-dispatch); this single-host CLI supports continuum
+    # for the recover step only.  Guard against a silently-wrong run rather
+    # than imaging line rows / doing nothing.
+    if args.product_type == "cont" and args.step not in ("recover",):
+        log.error(
+            "--product-type cont is only supported with --step recover here; "
+            "run continuum imaging via panta-rei-continuum-dispatch."
+        )
+        return 2
 
     base_dir = Path(args.base_dir).resolve()
 
@@ -196,6 +215,7 @@ def main() -> int:
         keep_intermediates=args.keep_intermediates,
         parallel=args.parallel,
         nproc=args.nproc,
+        product_type=args.product_type,
     )
 
     ctx = WorkflowContext(

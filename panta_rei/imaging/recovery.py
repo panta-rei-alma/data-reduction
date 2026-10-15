@@ -53,6 +53,15 @@ _ITER0_MARKERS = {"restoration": False, "niter": 0}
 # Public API
 # ---------------------------------------------------------------------------
 
+# Per-process caches for the NFS directory globs below.  Across a full
+# recovery these helpers are called thousands of times for the same MOUSs, and
+# on NFS each glob costs 0.25-1.2s (metadata round-trips) — far more than the
+# parsing.  The filesystem layout is immutable during a recovery, so memoizing
+# the lookups is safe.  Cleared via clear_parse_cache() (tests / long processes).
+_LOGPATH_CACHE: dict[tuple, "Optional[Path]"] = {}
+_STAGED_CACHE: dict[tuple, bool] = {}
+
+
 def find_casa_commands_log(
     weblog_base: Path,
     mous_uid: str,
@@ -65,7 +74,7 @@ def find_casa_commands_log(
       2. Raw log dir: ``{data_dir}/.../member.uid___*/log/*.casa_commands.log``
       3. Raw working dir: ``{data_dir}/.../member.uid___*/calibrated/working/pipeline-*/html/casa_commands.log``
 
-    Returns the first existing path, or *None*.
+    Returns the first existing path, or *None*.  Memoized per-process.
     """
     from panta_rei.core.uid import sanitize_uid
 
@@ -73,47 +82,83 @@ def find_casa_commands_log(
     if not uid_dir:
         return None
 
+    cache_key = (str(weblog_base), uid_dir, str(data_dir) if data_dir else None)
+    if cache_key in _LOGPATH_CACHE:
+        return _LOGPATH_CACHE[cache_key]
+
+    result: Optional[Path] = None
     # 1. Staged weblog
     if weblog_base and weblog_base.is_dir():
         candidates = sorted(weblog_base.glob(
             f"{uid_dir}/pipeline-*/html/casa_commands.log"
         ))
         if candidates:
-            return candidates[-1]  # latest pipeline run
+            result = candidates[-1]  # latest pipeline run
 
     # 2-3. Raw extracted data (structured lookup, not recursive **)
-    if data_dir and data_dir.is_dir():
+    if result is None and data_dir and data_dir.is_dir():
         from panta_rei.imaging.matching import find_member_dir
 
         member_dir = find_member_dir(data_dir, uid_dir)
         if member_dir is not None:
-            # 2. log/ directory
             for p in sorted(member_dir.glob("log/*.casa_commands.log")):
-                return p
-            # 3. calibrated/working/pipeline-*/html/
-            candidates = sorted(member_dir.glob(
-                "calibrated/working/pipeline-*/html/casa_commands.log"
-            ))
-            if candidates:
-                return candidates[-1]
+                result = p
+                break
+            if result is None:
+                candidates = sorted(member_dir.glob(
+                    "calibrated/working/pipeline-*/html/casa_commands.log"
+                ))
+                if candidates:
+                    result = candidates[-1]
 
-    return None
+    _LOGPATH_CACHE[cache_key] = result
+    return result
 
 
 def has_staged_weblog(weblog_base: Path, mous_uid: str) -> bool:
-    """Check if a staged weblog exists for a MOUS (fast glob, no parsing)."""
+    """Check if a staged weblog exists for a MOUS (fast glob, no parsing).
+
+    Memoized per-process (the glob is a slow NFS metadata round-trip).
+    """
     from panta_rei.core.uid import sanitize_uid
 
     uid_dir = sanitize_uid(mous_uid) if mous_uid else None
     if not uid_dir or not weblog_base or not weblog_base.is_dir():
         return False
-    return (
+    cache_key = (str(weblog_base), uid_dir)
+    if cache_key in _STAGED_CACHE:
+        return _STAGED_CACHE[cache_key]
+    result = (
         next(
             weblog_base.glob(f"{uid_dir}/pipeline-*/html/casa_commands.log"),
             None,
         )
         is not None
     )
+    _STAGED_CACHE[cache_key] = result
+    return result
+
+
+# Per-process cache of parsed weblogs, keyed by (path, size, mtime_ns).  A full
+# continuum recovery re-parses the same large casa_commands.log many times (once
+# per source, plus the SM weblog per unit); parsing dominates the runtime, so
+# memoizing it makes a full --re-run ~10-20x faster.  Weblogs are immutable
+# during a recovery; the size+mtime key still invalidates if one is rewritten.
+# Callers never mutate the returned dicts (extract_* build fresh dicts), so
+# returning the cached list by reference is safe.
+_PARSE_CACHE: dict[tuple, list[dict]] = {}
+
+
+def clear_parse_cache() -> None:
+    """Drop the recovery per-process caches (parsed weblogs + glob lookups).
+
+    For tests and any long-lived process that must re-see filesystem changes.
+    """
+    _PARSE_CACHE.clear()
+    _LOGPATH_CACHE.clear()
+    _STAGED_CACHE.clear()
+    from panta_rei.imaging.matching import clear_member_dir_cache
+    clear_member_dir_cache()
 
 
 def parse_tclean_calls(log_path: Path) -> list[dict]:
@@ -123,8 +168,19 @@ def parse_tclean_calls(log_path: Path) -> list[dict]:
     ``tclean(`` until a line ending with ``)`` is found, joins them, and
     converts the parameter string to a dict via :func:`ast.literal_eval`.
 
+    Results are memoized per-process (see ``_PARSE_CACHE``) since recovery
+    re-parses the same weblogs repeatedly.
+
     Returns a list of parameter dicts, one per tclean call.
     """
+    try:
+        st = log_path.stat()
+        cache_key = (str(log_path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        cache_key = None
+    if cache_key is not None and cache_key in _PARSE_CACHE:
+        return _PARSE_CACHE[cache_key]
+
     text = log_path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
@@ -150,6 +206,8 @@ def parse_tclean_calls(log_path: Path) -> list[dict]:
                 in_call = False
                 accumulator = []
 
+    if cache_key is not None:
+        _PARSE_CACHE[cache_key] = calls
     return calls
 
 
@@ -185,6 +243,58 @@ def filter_cube_iter1_calls(
         iter1.append(call)
 
     return iter1
+
+
+# Specmodes used by ALMA continuum (aggregate) imaging.  The aggregate
+# continuum product is never 'cube'.
+_CONT_SPECMODES = {"mfs", "cont"}
+
+
+def filter_continuum_iter1_calls(
+    calls: list[dict],
+    log_path: Optional[Path] = None,
+) -> list[dict]:
+    """Filter to only aggregate-continuum iter1 tclean calls.
+
+    A continuum iter1 call has ``restoration=True``, ``pbcor=True``,
+    ``specmode in {'mfs', 'cont'}`` and an ``imagename`` carrying the
+    dot-bounded ``.cont.`` token (e.g.
+    ``...spw24_26_..cont.regcal.I.iter1``).
+
+    This excludes cube calls (``.cube.`` / ``specmode='cube'``) and the
+    per-spw ``findcont`` calls (``...mfs.regcal.I.findcont`` — no ``.cont.``,
+    not iter1).  ``log_path`` is accepted for signature symmetry with
+    :func:`filter_cube_iter1_calls` but is not needed: the ``.cont.`` token
+    is an unambiguous discriminator.
+    """
+    out: list[dict] = []
+    for call in calls:
+        if call.get("restoration") is not True or call.get("pbcor") is not True:
+            continue
+        if call.get("specmode") not in _CONT_SPECMODES:
+            continue
+        if ".cont." not in str(call.get("imagename", "")):
+            continue
+        out.append(call)
+    return out
+
+
+def extract_continuum_by_field(calls: list[dict]) -> dict[str, dict]:
+    """Organize continuum iter1 calls by ``field`` name.
+
+    Continuum is aggregated across all spws, so there is exactly one
+    aggregate product per field.  Unlike the line path, the spw is **not**
+    part of the identity — the full line-free frequency-range selection
+    lives inside the params dict (``spw``).  Returns ``{field: params}``.
+    """
+    result: dict[str, dict] = {}
+    for call in calls:
+        call = _normalize_string_values(call)
+        field = _clean_field(call.get("field", ""))
+        if field in result:
+            log.debug("Duplicate continuum field %s; keeping last", field)
+        result[field] = call
+    return result
 
 
 def extract_by_field_spw(calls: list[dict]) -> dict[tuple[str, str], dict]:
@@ -273,6 +383,81 @@ def recover_params_for_mous(
     result = extract_by_field_spw(iter1_calls)
     log.info(
         "Recovered %d cube iter1 parameter sets from %s: %s",
+        len(result),
+        log_path.name,
+        list(result.keys()),
+    )
+    return result
+
+
+def eb_spw_map_from_call(call: dict) -> dict[str, str]:
+    """Build ``{eb_uid: spw_selection}`` from one aggregate-continuum call.
+
+    The ALMA continuum ``tclean`` call's ``vis`` and ``spw`` lists are parallel
+    — one line-free selection per EB, each already in that EB's own spw ids and
+    topocentric frame (verified across all weblogs).  So each EB carries the
+    exact selection the pipeline prescribed for it; no cross-array frequency
+    remapping is needed.  Keyed by EB uid (MS basename minus ``_targets*.ms``).
+    """
+    from panta_rei.imaging.matching import eb_uid_from_ms
+
+    vis = call.get("vis")
+    spw = call.get("spw")
+    vis = vis if isinstance(vis, list) else [vis]
+    spw = spw if isinstance(spw, list) else [spw]
+    # Defensive: a single shared selection applied to every EB.
+    if len(spw) == 1 and len(vis) > 1:
+        spw = spw * len(vis)
+    if len(vis) != len(spw):
+        # The ALMA contract is parallel vis/spw lists; anything else means a
+        # parse anomaly. Fail rather than zip()-truncate: this map is
+        # load-bearing and dropping EBs would silently change the joint image.
+        raise ValueError(
+            f"continuum call vis/spw length mismatch ({len(vis)} vis, "
+            f"{len(spw)} spw) for {call.get('imagename', '?')}"
+        )
+    out: dict[str, str] = {}
+    for v, s in zip(vis, spw):
+        if not v or not s:
+            continue
+        out[eb_uid_from_ms(str(v))] = str(s)
+    return out
+
+
+def recover_continuum_params_for_mous(
+    mous_uid: str,
+    weblog_base: Path,
+    data_dir: Optional[Path] = None,
+) -> Optional[dict[str, dict]]:
+    """Recover aggregate-continuum tclean parameters from a TM MOUS weblog.
+
+    Returns a dict keyed by ``field_name`` mapping to the full tclean
+    parameter dict (including the line-free frequency-range ``spw``
+    selection, ``mosweight``, masking params, etc.), or *None* if no weblog
+    or no continuum calls are found.
+
+    Note: ``deconvolver``/``nterms`` are recovered for provenance but the
+    continuum runner overrides them to ``mtmfs``/``2`` (see the runner).
+    """
+    log_path = find_casa_commands_log(weblog_base, mous_uid, data_dir)
+    if log_path is None:
+        log.warning("No casa_commands.log found for %s", mous_uid)
+        return None
+
+    log.info("Parsing %s for MOUS %s (continuum)", log_path, mous_uid)
+    all_calls = parse_tclean_calls(log_path)
+    if not all_calls:
+        log.warning("No tclean calls found in %s", log_path)
+        return None
+
+    cont_calls = filter_continuum_iter1_calls(all_calls, log_path)
+    if not cont_calls:
+        log.warning("No continuum iter1 tclean calls found in %s", log_path)
+        return None
+
+    result = extract_continuum_by_field(cont_calls)
+    log.info(
+        "Recovered %d continuum iter1 parameter sets from %s: %s",
         len(result),
         log_path.name,
         list(result.keys()),

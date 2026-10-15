@@ -9,10 +9,13 @@ import pytest
 
 from panta_rei.imaging.recovery import (
     extract_by_field_spw,
+    extract_continuum_by_field,
+    filter_continuum_iter1_calls,
     filter_cube_iter1_calls,
     find_casa_commands_log,
     has_staged_weblog,
     parse_tclean_calls,
+    recover_continuum_params_for_mous,
     recover_params_for_mous,
 )
 
@@ -249,6 +252,146 @@ class TestRecoverParamsForMous:
 
 
 # ---------------------------------------------------------------------------
+# Continuum recovery
+# ---------------------------------------------------------------------------
+
+# A realistic continuum section: a per-spw findcont decoy (mfs, but imagename
+# has '.findcont' not '.cont.'), the aggregate continuum iter1 for two fields
+# (mfs, '.cont.', frequency-range spw selection), and a cube iter1 decoy
+# (specmode='cube', '.cube.').  Only the two aggregate continuum calls must be
+# recovered.
+CONTINUUM_LOG = dedent("""\
+    # hif_makeimlist(specmode='cont')
+    tclean(vis=['eb.ms'], field='"AG344.8921+0.4602"', spw=['24'], specmode='mfs', restoration=True, pbcor=True, gridder='mosaic', imagename='uid.s32_0._AG344.8921+0.4602__sci.spw24.mfs.regcal.I.findcont')
+    tclean(vis=['eb.ms'], field='"AG344.8921+0.4602"', spw=['24:86.3229~86.3305GHz;86.3324~86.3801GHz,26:86.8295~86.8602GHz'], datacolumn='data', specmode='mfs', deconvolver='hogbom', gridder='mosaic', mosweight=True, pblimit=0.2, perchanweightdensity=False, weighting='briggs', robust=0.5, imsize=[160, 160], cell=['1.9arcsec'], phasecenter='ICRS 17:01:55.4 -041.09.30', threshold='0.00311Jy', usemask='auto-multithresh', restoration=True, pbcor=True, imagename='uid.s36_0._AG344.8921+0.4602__sci.spw24_26.cont.regcal.I.iter1')
+    tclean(vis=['eb.ms'], field='"AG345.0884+0.0818"', spw=['24:86.3~86.4GHz,26:86.8~86.9GHz'], datacolumn='corrected', specmode='mfs', deconvolver='hogbom', gridder='mosaic', mosweight=True, imsize=[160, 160], cell=['1.9arcsec'], restoration=True, pbcor=True, imagename='uid.s36_0._AG345.0884+0.0818__sci.spw24_26.cont.regcal.I.iter1')
+    tclean(vis=['eb.ms'], field='"AG344.8921+0.4602"', spw=['24'], specmode='cube', nchan=100, restoration=True, pbcor=True, imagename='uid.s45_0._AG344.8921+0.4602__sci.spw24.cube.regcal.I.iter1')
+""")
+
+
+class TestFilterContinuumIter1Calls:
+    def test_excludes_findcont_cube_keeps_aggregate(self, tmp_path):
+        p = tmp_path / "casa_commands.log"
+        p.write_text(CONTINUUM_LOG)
+        cont = filter_continuum_iter1_calls(parse_tclean_calls(p))
+        assert len(cont) == 2
+        names = {c["imagename"] for c in cont}
+        assert all(".cont." in n for n in names)
+        assert not any(".findcont" in n or ".cube." in n for n in names)
+
+    def test_preserves_full_freq_range_spw_and_params(self, tmp_path):
+        p = tmp_path / "casa_commands.log"
+        p.write_text(CONTINUUM_LOG)
+        cont = filter_continuum_iter1_calls(parse_tclean_calls(p))
+        c = next(c for c in cont if "AG344.8921+0.4602" in c["field"])
+        # full line-free GHz-range selection preserved verbatim (as a 1-elem list)
+        assert c["spw"] == ["24:86.3229~86.3305GHz;86.3324~86.3801GHz,26:86.8295~86.8602GHz"]
+        # continuum-specific fidelity preserved
+        assert c["mosweight"] is True
+        assert c["pblimit"] == 0.2
+        assert c["perchanweightdensity"] is False
+        assert c["datacolumn"] == "data"
+
+
+class TestExtractContinuumByField:
+    def test_keys_by_field_one_per_field(self, tmp_path):
+        p = tmp_path / "casa_commands.log"
+        p.write_text(CONTINUUM_LOG)
+        by_field = extract_continuum_by_field(
+            filter_continuum_iter1_calls(parse_tclean_calls(p))
+        )
+        assert set(by_field) == {"AG344.8921+0.4602", "AG345.0884+0.0818"}
+        # field quotes cleaned; spw NOT part of the key
+        assert by_field["AG345.0884+0.0818"]["datacolumn"] == "corrected"
+
+
+class TestParseCache:
+    def test_second_parse_served_from_cache(self, tmp_path):
+        from panta_rei.imaging.recovery import clear_parse_cache
+        clear_parse_cache()
+        p = tmp_path / "casa_commands.log"
+        p.write_text(ITER0_AND_ITER1)
+        first = parse_tclean_calls(p)
+        assert len(first) == 3
+        # Unchanged file → second call returns the SAME cached object (a
+        # re-parse would build a new, merely-equal list).
+        assert parse_tclean_calls(p) is first
+        clear_parse_cache()
+
+    def test_cache_invalidates_on_rewrite(self, tmp_path):
+        from panta_rei.imaging.recovery import clear_parse_cache
+        clear_parse_cache()
+        p = tmp_path / "casa_commands.log"
+        p.write_text(SINGLE_LINE_TCLEAN)
+        assert len(parse_tclean_calls(p)) == 1
+        p.write_text(ITER0_AND_ITER1)  # size + mtime change → re-parse
+        assert len(parse_tclean_calls(p)) == 3
+        clear_parse_cache()
+
+
+class TestEbSpwMapFromCall:
+    def test_parallel_vis_spw_per_eb(self):
+        from panta_rei.imaging.recovery import eb_spw_map_from_call
+        call = {
+            "vis": ["uid___A002_X1_Xa_targets.ms", "uid___A002_X2_Xb_targets.ms"],
+            "spw": ["24:86.0~86.1GHz", "24:86.01~86.11GHz"],
+        }
+        assert eb_spw_map_from_call(call) == {
+            "uid___A002_X1_Xa": "24:86.0~86.1GHz",
+            "uid___A002_X2_Xb": "24:86.01~86.11GHz",
+        }
+
+    def test_single_selection_applied_to_all_ebs(self):
+        from panta_rei.imaging.recovery import eb_spw_map_from_call
+        call = {
+            "vis": ["uid___A002_X1_Xa_targets.ms", "uid___A002_X2_Xb_targets.ms"],
+            "spw": ["24:86.0~86.1GHz"],
+        }
+        m = eb_spw_map_from_call(call)
+        assert set(m) == {"uid___A002_X1_Xa", "uid___A002_X2_Xb"}
+        assert all(v == "24:86.0~86.1GHz" for v in m.values())
+
+    def test_length_mismatch_raises(self):
+        import pytest
+        from panta_rei.imaging.recovery import eb_spw_map_from_call
+        three_vis = {
+            "vis": [f"uid___A002_X{i}_Xa_targets.ms" for i in range(3)],
+            "spw": ["24:86.0~86.1GHz", "24:86.01~86.11GHz"],
+        }
+        with pytest.raises(ValueError, match="length mismatch"):
+            eb_spw_map_from_call(three_vis)
+        more_spw = {
+            "vis": ["uid___A002_X1_Xa_targets.ms", "uid___A002_X2_Xb_targets.ms"],
+            "spw": ["24:a", "24:b", "24:c"],
+        }
+        with pytest.raises(ValueError, match="length mismatch"):
+            eb_spw_map_from_call(more_spw)
+
+
+class TestRecoverContinuumParamsForMous:
+    def test_full_recovery(self, tmp_path):
+        weblog_base = tmp_path / "weblogs"
+        log_dir = weblog_base / "uid___A001_X3833_X64bc" / "pipeline-20250101" / "html"
+        log_dir.mkdir(parents=True)
+        (log_dir / "casa_commands.log").write_text(CONTINUUM_LOG)
+        result = recover_continuum_params_for_mous(
+            "uid___a001_x3833_x64bc", weblog_base
+        )
+        assert result is not None
+        assert set(result) == {"AG344.8921+0.4602", "AG345.0884+0.0818"}
+
+    def test_none_when_only_cube_present(self, tmp_path):
+        weblog_base = tmp_path / "weblogs"
+        log_dir = weblog_base / "uid___A001_X3833_X64bc" / "pipeline-20250101" / "html"
+        log_dir.mkdir(parents=True)
+        (log_dir / "casa_commands.log").write_text(ITER0_AND_ITER1)  # cube only
+        result = recover_continuum_params_for_mous(
+            "uid___a001_x3833_x64bc", weblog_base
+        )
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
 # Staged weblog availability
 # ---------------------------------------------------------------------------
 
@@ -293,3 +436,22 @@ class TestStagedWeblogWithoutMemberDir:
         result = find_casa_commands_log(weblog_base, "uid___a001_x3833_x64bc", data_dir)
         assert result is not None
         assert "casa_commands.log" in str(result)
+
+
+class TestGlobCachesScopedToOperation:
+    def test_select_units_sees_new_member_after_prior_miss(self, tmp_path):
+        """A member-dir miss cached by one selection pass must not hide a
+        member extracted before the next pass."""
+        from panta_rei.imaging.matching import find_member_dir
+        from panta_rei.imaging.recovery import clear_parse_cache
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        assert find_member_dir(data_dir, "X1_X2") is None  # cached miss
+        member = data_dir / "science_goal.a" / "group.b" / "member.uid___A001_X1_X2"
+        member.mkdir(parents=True)
+        # Within one operation the miss is memoized...
+        assert find_member_dir(data_dir, "X1_X2") is None
+        # ...and the operation-boundary reset makes it visible again.
+        clear_parse_cache()
+        assert find_member_dir(data_dir, "X1_X2") == member

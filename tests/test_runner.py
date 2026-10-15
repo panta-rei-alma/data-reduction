@@ -12,13 +12,16 @@ import pytest
 from panta_rei.imaging.matching import ImagingUnit
 from panta_rei.imaging.runner import (
     FIXED_PARAMS,
+    FIXED_TCLEAN_CONT_PARAMS,
     FIXED_TCLEAN_PARAMS,
     _publish,
     _publish_pair,
     build_sdintimaging_params,
+    build_tclean_cont_params,
     build_tclean_params,
     cleanup_intermediates,
     get_casa_version,
+    run_continuum_trusted_preflight,
     run_sdintimaging,
     run_tclean_feather,
     run_tclean_feather_parallel,
@@ -1014,3 +1017,144 @@ class TestPublishPair:
         assert a_dst.read_text() == "A_NEW"
         assert b_dst.read_text() == "B_NEW"
         assert not list(a_dst.parent.glob("*.bak.*"))
+
+
+# ---------------------------------------------------------------------------
+# Continuum: params + per-EB trusted preflight
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def cont_unit():
+    """A minimal continuum ImagingUnit (product_type='cont')."""
+    return ImagingUnit(
+        gous_uid="X3833_X64b9",
+        source_name="SRC1",
+        line_group="N2H+",
+        spw_id="cont",
+        params_id=1,
+        product_type="cont",
+        recovered_params={
+            "spw": ["23:86.0~86.2GHz,25:87.0~87.2GHz"],
+            "imsize": [160, 160],
+            "cell": ["1.9arcsec"],
+            "phasecenter": "ICRS 17:01:55.4 -041.09.30",
+            "weighting": "briggs",
+            "robust": 0.5,
+            "niter": 20000,
+            "threshold": "0.00311Jy",
+            "mosweight": True,
+            "perchanweightdensity": False,
+            "usemask": "auto-multithresh",
+        },
+        vis_tm=["/data/tm1.ms", "/data/tm2.ms"],
+        vis_sm=["/data/sm1.ms"],
+        mous_uids_tm=["m1"],
+        mous_uids_sm=["m2"],
+        ready=True,
+    )
+
+
+def _cont_casatools(has_corrected=True):
+    """Mock casatools for the per-EB preflight: only the datacolumn probe is
+    needed (spw selection comes from the recovered spw_by_eb map, not casa)."""
+    mock = MagicMock()
+    tb = MagicMock()
+    tb.colnames.return_value = ["DATA", "FLAG"] + (
+        ["CORRECTED_DATA"] if has_corrected else []
+    )
+    mock.table.return_value = tb
+    return mock
+
+
+# cont_unit fixture vis are /data/{tm1,tm2,sm1}.ms → eb uid is the basename
+# (no _targets suffix in the test names): "tm1.ms", "tm2.ms", "sm1.ms".
+_EB_MAP = {
+    "tm1.ms": "25:90.60~90.70GHz",
+    "tm2.ms": "25:90.61~90.71GHz",   # sibling EB, its own (offset) selection
+    "sm1.ms": "24:90.59~90.69GHz",   # 7m: its own spw id + frame
+}
+
+
+class TestBuildContParams:
+    def test_fixed_continuum_overrides(self, cont_unit):
+        cont_unit.spw_selection = ["10:86.0~86.2GHz", "10:86.0~86.2GHz", "5:..."]
+        cont_unit.field_selection = ["SRC1", "SRC1", "SRC1"]
+        cont_unit.datacolumn = "corrected"
+        p = build_tclean_cont_params(cont_unit, imagename="/out/test")
+        assert p["specmode"] == "mfs"
+        assert p["gridder"] == "mosaic"
+        assert p["deconvolver"] == "mtmfs"
+        assert p["nterms"] == 2
+        assert p["pbcor"] is True
+        assert p["stokes"] == "I"
+        assert p["restoringbeam"] == "common"
+
+    def test_vis_and_recovered_geometry(self, cont_unit):
+        p = build_tclean_cont_params(cont_unit, imagename="/out/test")
+        assert p["vis"] == ["/data/tm1.ms", "/data/tm2.ms", "/data/sm1.ms"]
+        assert p["imsize"] == [160, 160]
+        assert p["cell"] == ["1.9arcsec"]
+        assert p["mosweight"] is True
+
+    def test_overrides_cannot_beat_fixed(self, cont_unit):
+        cont_unit.recovered_params["deconvolver"] = "hogbom"
+        cont_unit.recovered_params["specmode"] = "cube"
+        p = build_tclean_cont_params(cont_unit, imagename="/out/test")
+        assert p["deconvolver"] == "mtmfs"
+        assert p["specmode"] == "mfs"
+
+    def test_scales_default_and_override(self, cont_unit):
+        assert build_tclean_cont_params(cont_unit, "/o")["scales"] == [0]
+        assert build_tclean_cont_params(
+            cont_unit, "/o", scales=[0, 5, 10]
+        )["scales"] == [0, 5, 10]
+
+
+class TestRunContinuumTrustedPreflight:
+    def test_assigns_each_eb_its_own_selection(self, cont_unit):
+        cont_unit.recovered_params["spw_by_eb"] = dict(_EB_MAP)
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools()):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        # parallel to vis_tm + vis_sm, each EB's OWN selection (no remap)
+        assert cont_unit.spw_selection == [
+            "25:90.60~90.70GHz", "25:90.61~90.71GHz", "24:90.59~90.69GHz",
+        ]
+        assert cont_unit.field_selection == ["SRC1", "SRC1", "SRC1"]
+        assert cont_unit.datacolumn == "corrected"
+
+    def test_datacolumn_falls_back_to_data(self, cont_unit):
+        cont_unit.recovered_params["spw_by_eb"] = dict(_EB_MAP)
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools(has_corrected=False)):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        assert cont_unit.datacolumn == "data"
+
+    def test_drops_eb_without_selection(self, cont_unit):
+        # tm2 absent from the map (e.g. fully flagged) → dropped, tm1 remains.
+        m = dict(_EB_MAP)
+        del m["tm2.ms"]
+        cont_unit.recovered_params["spw_by_eb"] = m
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools()):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert ok, msg
+        assert cont_unit.vis_tm == ["/data/tm1.ms"]
+        assert len(cont_unit.spw_selection) == 2  # tm1 + sm1
+
+    def test_fails_when_no_sm_selection(self, cont_unit):
+        cont_unit.recovered_params["spw_by_eb"] = {
+            "tm1.ms": "25:90.60~90.70GHz", "tm2.ms": "25:90.61~90.71GHz",
+        }
+        with patch("panta_rei.imaging.runner._ensure_casatools",
+                   return_value=_cont_casatools()):
+            ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert not ok
+        assert "SM" in msg
+
+    def test_fails_when_no_map(self, cont_unit):
+        cont_unit.recovered_params.pop("spw_by_eb", None)
+        ok, msg = run_continuum_trusted_preflight(cont_unit)
+        assert not ok

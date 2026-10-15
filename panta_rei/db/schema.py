@@ -447,4 +447,77 @@ CREATE TABLE IF NOT EXISTS dispatches (
             ("imaging_runs", "terminal_source", "TEXT DEFAULT 'unknown'"),
         ],
     ),
+
+    # --- continuum joint imaging: product_type discriminator ---
+    # Adds `product_type` ('line' | 'cont') so the continuum products live
+    # alongside the line products without colliding on the unique key.
+    #
+    # imaging_params needs its TABLE-LEVEL UNIQUE constraint widened to include
+    # product_type, which SQLite cannot do with ALTER TABLE — hence a careful
+    # table rebuild (CREATE new / INSERT…SELECT / DROP / RENAME). Invariants:
+    #   * imaging_params.id is preserved EXACTLY (INSERT lists id explicitly) —
+    #     imaging_runs.params_id points at it.
+    #   * idx_ip_key is recreated with the new column list (dropped implicitly by
+    #     DROP TABLE; CREATE INDEX IF NOT EXISTS would not have widened it).
+    #   * idx_ip_status is recreated (also dropped by DROP TABLE).
+    #   * No dedup pass is needed: the old 4-col UNIQUE already guaranteed
+    #     non-NULL-line_group rows are distinct, so appending the constant
+    #     product_type='line' keeps them distinct; NULL-line_group rows remain
+    #     mutually distinct under both constraints (SQLite treats NULLs as
+    #     distinct), so the INSERT…SELECT cannot raise a UNIQUE violation.
+    # imaging_runs only carries product_type for provenance (no unique key on it),
+    # so a plain ADD COLUMN suffices.
+    Migration(
+        version=17,
+        description="add product_type to imaging_params (rebuild) and imaging_runs",
+        probe=lambda con: (
+            column_exists(con, "imaging_params", "product_type")
+            and column_exists(con, "imaging_runs", "product_type")
+        ),
+        sql=[
+            """\
+CREATE TABLE imaging_params_v17 (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    gous_uid        TEXT NOT NULL,
+    source_name     TEXT NOT NULL,
+    line_group      TEXT,
+    spw_id          TEXT NOT NULL,
+    mous_uids_tm    TEXT NOT NULL,
+    params_json_path TEXT,
+    params_source   TEXT NOT NULL,
+    weblog_path     TEXT,
+    status          TEXT NOT NULL,
+    recovered_at    TEXT NOT NULL,
+    error_message   TEXT,
+    imsize          TEXT,
+    cell            TEXT,
+    nchan           INTEGER,
+    phasecenter     TEXT,
+    robust          REAL,
+    product_type    TEXT NOT NULL DEFAULT 'line',
+    UNIQUE(gous_uid, source_name, line_group, spw_id, product_type)
+)""",
+            """\
+INSERT INTO imaging_params_v17 (
+    id, gous_uid, source_name, line_group, spw_id, mous_uids_tm,
+    params_json_path, params_source, weblog_path, status, recovered_at,
+    error_message, imsize, cell, nchan, phasecenter, robust, product_type
+)
+SELECT
+    id, gous_uid, source_name, line_group, spw_id, mous_uids_tm,
+    params_json_path, params_source, weblog_path, status, recovered_at,
+    error_message, imsize, cell, nchan, phasecenter, robust, 'line'
+FROM imaging_params""",
+            "DROP TABLE imaging_params",
+            "ALTER TABLE imaging_params_v17 RENAME TO imaging_params",
+            "DROP INDEX IF EXISTS idx_ip_key",
+            "CREATE INDEX idx_ip_key ON imaging_params("
+            "gous_uid, source_name, line_group, spw_id, product_type)",
+            "CREATE INDEX IF NOT EXISTS idx_ip_status "
+            "ON imaging_params(status)",
+        ],
+        conditional_columns=[
+            ("imaging_runs", "product_type", "TEXT NOT NULL DEFAULT 'line'"),
+        ],
+    ),
 ]

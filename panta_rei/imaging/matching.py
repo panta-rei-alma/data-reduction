@@ -138,6 +138,10 @@ class ImagingUnit:
     spw_id: str
     params_id: int
 
+    # 'line' (12m7mTP cube) or 'cont' (12m7m continuum). Drives which runner
+    # function / CASA script the worker uses and which output paths apply.
+    product_type: str = "line"
+
     # Recovered TM tclean params (full dict)
     recovered_params: dict = field(default_factory=dict)
 
@@ -224,6 +228,18 @@ def targets_by_array(
 # MS file discovery
 # ---------------------------------------------------------------------------
 
+# Per-process cache for the member-dir glob: on NFS each lookup is ~1s (it
+# walks ~250 science_goal dirs), and recovery/selection call it repeatedly for
+# the same MOUSs.  Member dirs are not created mid-run, so caching the result
+# (including a None miss) is safe.  Cleared via clear_member_dir_cache().
+_MEMBER_DIR_CACHE: dict[tuple, "Optional[Path]"] = {}
+
+
+def clear_member_dir_cache() -> None:
+    """Drop the member-dir lookup cache (tests / long-lived processes)."""
+    _MEMBER_DIR_CACHE.clear()
+
+
 def find_member_dir(data_dir: Path, mous_id: str) -> Optional[Path]:
     """Locate the member directory for a MOUS using the known hierarchy.
 
@@ -233,14 +249,19 @@ def find_member_dir(data_dir: Path, mous_id: str) -> Optional[Path]:
 
     Uses the structured path ``science_goal.*/group.*/member.uid___A001_{mous_id}``
     instead of a ``**`` recursive glob (which is prohibitively slow on large
-    data trees because it descends into MS directories).
+    data trees because it descends into MS directories).  Memoized per-process.
     """
     compact = mous_id
     if compact.lower().startswith("uid___a001_"):
         compact = compact[len("uid___A001_"):]
+    cache_key = (str(data_dir), compact)
+    if cache_key in _MEMBER_DIR_CACHE:
+        return _MEMBER_DIR_CACHE[cache_key]
     pattern = f"science_goal.*/group.*/member.uid___A001_{compact}"
     candidates = sorted(data_dir.glob(pattern))
-    return candidates[0] if candidates else None
+    result = candidates[0] if candidates else None
+    _MEMBER_DIR_CACHE[cache_key] = result
+    return result
 
 
 class MSSearchResult:
@@ -292,6 +313,43 @@ def find_ms_files(data_dir: Path, mous_id: str) -> MSSearchResult:
             f"missing (contsub not performed — likely ScriptForPI skipped "
             f"hif_uvcontsub because selfcal was unsuccessful). "
             f"Run: panta-rei-contsub --base-dir <DIR> --match {mous_id}",
+        )
+
+    return MSSearchResult([], f"no MS files in calibrated/working/ for MOUS {mous_id}")
+
+
+def find_continuum_ms(data_dir: Path, mous_id: str) -> MSSearchResult:
+    """Find the aggregate-continuum calibrated MS files for a MOUS.
+
+    Looks for ``*_targets.ms`` (the full-band, *non*-contsub split) under
+    ``calibrated/working/``, EXCLUDING ``*_targets_line.ms``.  This is the
+    MS continuum imaging runs on; where selfcal was applied it lives in this
+    MS's CORRECTED_DATA column (the runner resolves datacolumn accordingly).
+    """
+    member_dir = find_member_dir(data_dir, mous_id)
+    if member_dir is None:
+        return MSSearchResult([], f"MOUS {mous_id}: member not available on disk")
+
+    working = member_dir / "calibrated" / "working"
+    if not working.is_dir():
+        return MSSearchResult([], f"no calibrated/working/ directory for MOUS {mous_id}")
+
+    # ``*_targets.ms`` does not fnmatch ``*_targets_line.ms`` (different
+    # suffix), but the explicit guard keeps intent obvious and is robust to
+    # any unexpected naming.
+    ms_dirs = sorted(
+        p for p in working.glob("*_targets.ms")
+        if not p.name.endswith("_targets_line.ms")
+    )
+    if ms_dirs:
+        return MSSearchResult(ms_dirs)
+
+    any_ms = sorted(working.glob("*.ms"))
+    if any_ms:
+        return MSSearchResult(
+            [],
+            f"MOUS {mous_id}: calibrated MS exists but _targets.ms missing "
+            f"(mstransform split not performed).",
         )
 
     return MSSearchResult([], f"no MS files in calibrated/working/ for MOUS {mous_id}")
@@ -505,6 +563,74 @@ def build_aux_output_path(
     return output_dir / AUX_SUBDIR / subdir / filename
 
 
+# Continuum products.  The joint 12m+7m mtmfs tclean image IS the science
+# product (no feather), so the pb-corrected term images (tt0, tt1) and the
+# spectral-index map (alpha) publish to the canonical dir; the QA / diagnostic
+# products (flat non-pbcor term images, mask, residual, pb, psf) go under aux/.
+# The ``.cont.`` infix distinguishes these from the line ``.cube.`` products.
+#
+# Filename map (suffix after ``...12m7m.{freq}GHz.cont``):
+#   science (canonical dir):
+#     tt0        -> .tt0.pbcor.fits   (primary continuum science image)
+#     tt1        -> .tt1.pbcor.fits
+#     alpha      -> .alpha.fits
+#   diagnostics (aux/ dir):
+#     tt0_image  -> .tt0.image.fits   (non-pbcor / flat)
+#     tt1_image  -> .tt1.image.fits
+#     mask       -> .mask.fits
+#     residual   -> .residual.fits    (tt0 residual)
+#     pb         -> .pb.fits
+#     psf        -> .psf.fits          (tt0 psf)
+CONT_SCIENCE_PRODUCTS: tuple[str, ...] = ("tt0", "tt1", "alpha")
+CONT_AUX_PRODUCTS: tuple[str, ...] = (
+    "tt0_image", "tt1_image", "mask", "residual", "pb", "psf",
+)
+
+_CONT_FILE_SUFFIX: dict[str, str] = {
+    "tt0": "tt0.pbcor.fits",
+    "tt1": "tt1.pbcor.fits",
+    "alpha": "alpha.fits",
+    "tt0_image": "tt0.image.fits",
+    "tt1_image": "tt1.image.fits",
+    "mask": "mask.fits",
+    "residual": "residual.fits",
+    "pb": "pb.fits",
+    "psf": "psf.fits",
+}
+
+
+def build_cont_output_path(
+    output_dir: Path,
+    gous_id: str,
+    source_name: str,
+    freq_min_hz: float,
+    freq_max_hz: float,
+    product: str,
+) -> Path:
+    """Build the output FITS path for a 12m+7m continuum product.
+
+    Science products (``tt0``, ``tt1``, ``alpha``) go in the canonical group
+    dir; diagnostics (``tt0_image``, ``tt1_image``, ``mask``, ``residual``,
+    ``pb``, ``psf``) go under ``aux/``.  See ``_CONT_FILE_SUFFIX``.
+    """
+    suffix = _CONT_FILE_SUFFIX.get(product)
+    if suffix is None:
+        raise ValueError(
+            f"unknown continuum product: {product!r}; expected one of "
+            f"{CONT_SCIENCE_PRODUCTS + CONT_AUX_PRODUCTS}"
+        )
+    sanitized = sanitize_source_name(source_name)
+    freq_range = get_freq_range_string(freq_min_hz, freq_max_hz)
+    subdir = f"group.uid___A001_{gous_id}.lp_nperetto"
+    fname = (
+        f"group.uid___A001_{gous_id}.lp_nperetto."
+        f"{sanitized}.12m7m.{freq_range}GHz.cont.{suffix}"
+    )
+    if product in CONT_SCIENCE_PRODUCTS:
+        return output_dir / subdir / fname
+    return output_dir / AUX_SUBDIR / subdir / fname
+
+
 # ---------------------------------------------------------------------------
 # Preflight assembly (advisory mode)
 # ---------------------------------------------------------------------------
@@ -713,6 +839,116 @@ def build_imaging_units_advisory(
     return units
 
 
+def build_continuum_units_advisory(
+    recovered_params: list[dict],
+    targets: dict[str, list[TargetGroup]],
+    data_dir: Path,
+) -> list[ImagingUnit]:
+    """Build continuum (12m+7m) ImagingUnit objects, advisory mode.
+
+    Mirrors :func:`build_imaging_units_advisory` but for continuum:
+      * inputs are ``*_targets.ms`` (via :func:`find_continuum_ms`), not the
+        contsub ``*_targets_line.ms``;
+      * there is **no TP / feather** (``sdimage`` stays None);
+      * each EB's own line-free selection rides along in
+        ``recovered_params['spw_by_eb']`` and is assigned per-EB in the
+        trusted preflight (no cross-array remap).
+
+    ``recovered_params`` must be continuum rows (``product_type='cont'``,
+    ``spw_id='cont'``).  SPW/field/datacolumn are resolved later (casatasks).
+    """
+    units: list[ImagingUnit] = []
+
+    for row in recovered_params:
+        gous_uid = row["gous_uid"]
+        source = row["source_name"]
+        lg = row.get("line_group")
+        spw_id = row["spw_id"]
+        params_id = row["id"]
+        mous_uids_tm = json.loads(row["mous_uids_tm"])
+
+        recovered = {}
+        pjp = row.get("params_json_path")
+        if pjp and Path(pjp).exists():
+            recovered = json.loads(Path(pjp).read_text())
+
+        unit = ImagingUnit(
+            gous_uid=gous_uid,
+            source_name=source,
+            line_group=lg,
+            spw_id=spw_id,
+            params_id=params_id,
+            product_type="cont",
+            recovered_params=recovered,
+            mous_uids_tm=mous_uids_tm,
+        )
+
+        gous_targets = targets.get(gous_uid)
+        if not gous_targets:
+            unit.skip_reason = f"GOUS {gous_uid} not found in targets CSV"
+            units.append(unit)
+            continue
+
+        by_array = targets_by_array(gous_targets)
+
+        def _match(tg: TargetGroup) -> bool:
+            return tg.source_name == source and (not lg or tg.line_group == lg)
+
+        # TM continuum MS — require artifacts from ALL TM members
+        tm_groups = [tg for tg in by_array.get("TM", []) if _match(tg)]
+        tm_missing: list[str] = []
+        for tg in tm_groups:
+            for mous_id in tg.mous_ids:
+                result = find_continuum_ms(data_dir, mous_id)
+                if result:
+                    unit.vis_tm.extend(str(p) for p in result.ms_files)
+                else:
+                    tm_missing.append(result.missing_reason or mous_id)
+
+        if not unit.vis_tm:
+            unit.skip_reason = (
+                f"No TM continuum MS found: {'; '.join(tm_missing)}"
+                if tm_missing else "No TM continuum MS found"
+            )
+            units.append(unit)
+            continue
+        if tm_missing:
+            unit.skip_reason = f"GOUS incomplete — TM: {'; '.join(tm_missing)}"
+            units.append(unit)
+            continue
+
+        # SM continuum MS — require artifacts from ALL SM members
+        sm_groups = [tg for tg in by_array.get("SM", []) if _match(tg)]
+        sm_missing: list[str] = []
+        for tg in sm_groups:
+            unit.mous_uids_sm.extend(tg.mous_ids)
+            for mous_id in tg.mous_ids:
+                result = find_continuum_ms(data_dir, mous_id)
+                if result:
+                    unit.vis_sm.extend(str(p) for p in result.ms_files)
+                else:
+                    sm_missing.append(result.missing_reason or mous_id)
+
+        if not unit.vis_sm:
+            unit.skip_reason = (
+                f"No SM continuum MS found: {'; '.join(sm_missing)}"
+                if sm_missing else "No SM continuum MS found"
+            )
+            units.append(unit)
+            continue
+        if sm_missing:
+            unit.skip_reason = f"GOUS incomplete — SM: {'; '.join(sm_missing)}"
+            units.append(unit)
+            continue
+
+        # No TP for continuum. Per-EB spw / field / datacolumn are assigned in
+        # the trusted preflight from the recovered spw_by_eb map.
+        unit.ready = True
+        units.append(unit)
+
+    return units
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -809,3 +1045,102 @@ def _parse_freq_quantity(s: str) -> Optional[float]:
     unit = m.group(2).lower()
     multipliers = {"hz": 1.0, "khz": 1e3, "mhz": 1e6, "ghz": 1e9, "thz": 1e12}
     return val * multipliers.get(unit, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Continuum spw-selection parsing (line-free GHz frequency ranges)
+# ---------------------------------------------------------------------------
+
+_FREQ_UNIT_TAIL_RE = re.compile(r"(Hz|kHz|MHz|GHz|THz)\s*$", re.IGNORECASE)
+
+
+def _parse_freq_range_token(tok: str) -> Optional[tuple[float, float]]:
+    """Parse one ``flo~fhiUNIT`` range token into (lo_hz, hi_hz).
+
+    In the recovered CASA selection only the *upper* bound carries the unit
+    (e.g. ``86.3229~86.3305GHz``); the lower bound inherits it.
+    """
+    if "~" not in tok:
+        return None
+    lo_s, hi_s = tok.split("~", 1)
+    hi = _parse_freq_quantity(hi_s)
+    m = _FREQ_UNIT_TAIL_RE.search(hi_s)
+    unit = m.group(1) if m else ""
+    lo_s = lo_s.strip()
+    if unit and not _FREQ_UNIT_TAIL_RE.search(lo_s):
+        lo_s = lo_s + unit
+    lo = _parse_freq_quantity(lo_s)
+    if lo is None or hi is None:
+        return None
+    return (min(lo, hi), max(lo, hi))
+
+
+def eb_uid_from_ms(ms_name_or_path) -> str:
+    """Extract the EB uid from an MS name/path: the basename up to the
+    ``_targets[_line].ms`` suffix (e.g.
+    ``/x/uid___A002_X12fb842_X987_targets.ms`` → ``uid___A002_X12fb842_X987``).
+
+    Used to key each EB to its own pipeline-prescribed continuum spw selection
+    — both the recovered call's ``vis`` entries and the staged MS files reduce
+    to the same uid.
+    """
+    return Path(ms_name_or_path).name.split("_targets")[0]
+
+
+def parse_continuum_spw_selection(
+    spw_value,
+) -> dict[str, list[tuple[float, float]]]:
+    """Parse a recovered continuum spw selection into per-spw freq ranges.
+
+    Accepts the recovered ``spw`` value — a 1-element list or a bare string —
+    of the form ``'24:flo~fhiGHz;flo~fhiGHz,26:flo~fhiGHz,...'`` where commas
+    separate spws and semicolons separate ranges within a spw.  Returns
+    ``{src_spw_id: [(lo_hz, hi_hz), ...]}``.  Whitespace-tolerant (defends
+    against any line-wrap artefact from the weblog parser).
+    """
+    if isinstance(spw_value, (list, tuple)):
+        spw_value = spw_value[0] if spw_value else ""
+    s = "".join(str(spw_value).split())
+    out: dict[str, list[tuple[float, float]]] = {}
+    if not s:
+        return out
+    for spw_part in s.split(","):
+        if ":" not in spw_part:
+            continue
+        spw_id, ranges = spw_part.split(":", 1)
+        spw_id = spw_id.strip()
+        rngs: list[tuple[float, float]] = []
+        for tok in ranges.split(";"):
+            r = _parse_freq_range_token(tok)
+            if r:
+                rngs.append(r)
+        if rngs:
+            out.setdefault(spw_id, []).extend(rngs)
+    return out
+
+
+def continuum_freq_bounds_hz(
+    recovered_params: dict,
+) -> Optional[tuple[float, float]]:
+    """Overall (min, max) selected continuum frequency in Hz, for the output
+    filename label.  Derived from the recovered GHz-range spw selection — NOT
+    from cube ``start``/``width``/``nchan`` (which continuum mfs lacks).
+
+    Uses the union of the per-EB selections (``spw_by_eb``, covering both
+    arrays) when present, else the legacy top-level ``spw``.
+    """
+    spw_by_eb = recovered_params.get("spw_by_eb")
+    if spw_by_eb:
+        sel_strings = list(spw_by_eb.values())
+    else:
+        sel_strings = [recovered_params.get("spw")]
+    all_ranges: list[tuple[float, float]] = []
+    for s in sel_strings:
+        for rngs in parse_continuum_spw_selection(s).values():
+            all_ranges.extend(rngs)
+    if not all_ranges:
+        return None
+    return (
+        min(lo for lo, _ in all_ranges),
+        max(hi for _, hi in all_ranges),
+    )

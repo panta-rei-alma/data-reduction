@@ -449,8 +449,15 @@ class ImagingParamsQueries:
         nchan: Optional[int] = None,
         phasecenter: Optional[str] = None,
         robust: Optional[float] = None,
+        product_type: str = "line",
     ) -> int:
-        """Insert or update an imaging_params row. Returns the row ID."""
+        """Insert or update an imaging_params row. Returns the row ID.
+
+        ``product_type`` ('line' | 'cont') is part of the unique key, so a line
+        row and a continuum row for the same (gous, source, line_group, spw)
+        coexist as distinct rows. Defaults to 'line' so all existing call sites
+        are unchanged.
+        """
         now = now_iso()
         mous_json = json.dumps(mous_uids_tm)
         cur = con.execute(
@@ -459,9 +466,10 @@ class ImagingParamsQueries:
                 gous_uid, source_name, line_group, spw_id,
                 mous_uids_tm, params_json_path, params_source,
                 weblog_path, status, recovered_at, error_message,
-                imsize, cell, nchan, phasecenter, robust
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(gous_uid, source_name, line_group, spw_id) DO UPDATE SET
+                imsize, cell, nchan, phasecenter, robust, product_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(gous_uid, source_name, line_group, spw_id, product_type)
+            DO UPDATE SET
                 mous_uids_tm = excluded.mous_uids_tm,
                 params_json_path = excluded.params_json_path,
                 params_source = excluded.params_source,
@@ -479,7 +487,7 @@ class ImagingParamsQueries:
                 gous_uid, source_name, line_group, spw_id,
                 mous_json, params_json_path, params_source,
                 weblog_path, status, now, error_message,
-                imsize, cell, nchan, phasecenter, robust,
+                imsize, cell, nchan, phasecenter, robust, product_type,
             ),
         )
         return cur.lastrowid
@@ -491,6 +499,7 @@ class ImagingParamsQueries:
         source_name: str,
         line_group: Optional[str],
         spw_id: str,
+        product_type: str = "line",
     ) -> Optional[dict]:
         """Look up a single imaging_params row by its unique key."""
         con.row_factory = sqlite3.Row
@@ -498,9 +507,9 @@ class ImagingParamsQueries:
             """
             SELECT * FROM imaging_params
             WHERE gous_uid = ? AND source_name = ?
-              AND line_group IS ? AND spw_id = ?
+              AND line_group IS ? AND spw_id = ? AND product_type = ?
             """,
-            (gous_uid, source_name, line_group, spw_id),
+            (gous_uid, source_name, line_group, spw_id, product_type),
         ).fetchone()
         result = dict(row) if row else None
         con.row_factory = None
@@ -517,12 +526,19 @@ class ImagingParamsQueries:
         return result
 
     @staticmethod
-    def get_all_recovered(con: sqlite3.Connection) -> list[dict]:
-        """Return all rows with status='recovered'."""
+    def get_all_recovered(
+        con: sqlite3.Connection, product_type: str = "line"
+    ) -> list[dict]:
+        """Return all rows with status='recovered' for the given product_type.
+
+        Defaults to 'line' so the existing line selection path returns only line
+        rows (continuum rows are invisible to it). Continuum selection passes
+        product_type='cont'. This is the primary line/continuum isolation point.
+        """
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "SELECT * FROM imaging_params WHERE status = ?",
-            (ImagingParamsStatus.RECOVERED,),
+            "SELECT * FROM imaging_params WHERE status = ? AND product_type = ?",
+            (ImagingParamsStatus.RECOVERED, product_type),
         ).fetchall()
         result = [dict(r) for r in rows]
         con.row_factory = None
