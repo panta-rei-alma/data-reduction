@@ -1831,6 +1831,8 @@ def run_tclean_cont_parallel(
     import subprocess
 
     from panta_rei.imaging.matching import (
+        CONT_AUX_PRODUCTS,
+        CONT_SCIENCE_PRODUCTS,
         build_cont_output_path,
         continuum_freq_bounds_hz,
     )
@@ -2004,13 +2006,19 @@ def run_tclean_cont_parallel(
         if canonical:
             pair.append((local_aux, canonical))
 
-    # Optional products this generation did not produce: an older copy left
-    # at the destination would sit beside the new tt0, so retire it in the
-    # same transaction.
+    # Every supported optional product this generation did not publish
+    # (whatever this run's aux list): an older copy left at the destination
+    # would sit beside the new tt0, so retire it in the same transaction.
     published_dsts = {dst for _src, dst in pair}
     retire = tuple(
-        dst for dst in [str(canonical_tt1), str(canonical_alpha),
-                        *canonical_aux.values()]
+        dst for dst in (
+            str(build_cont_output_path(
+                output_dir, unit.gous_uid, unit.source_name,
+                freq_min, freq_max, product,
+            ))
+            for product in CONT_SCIENCE_PRODUCTS + CONT_AUX_PRODUCTS
+            if product != "tt0"
+        )
         if dst not in published_dsts
     )
 

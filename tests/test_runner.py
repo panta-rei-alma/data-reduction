@@ -1331,6 +1331,66 @@ class TestRunTcleanContParallelPublish:
         assert not Path(seen["aux"]["mask"]).exists()
 
 
+class TestRunTcleanContReducedAux:
+    def test_reduced_aux_overwrite_retires_unrequested_old_aux(self, cont_unit, tmp_path):
+        """Full-aux publish, then an overwrite with a reduced aux list: the
+        old psf/tt0_image/tt1_image must not survive beside the new tt0."""
+        from panta_rei.imaging.runner import run_tclean_cont_parallel
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        output_dir = tmp_path / "output"
+        specs = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            specs.append(spec)
+            run_dir = Path(spec["run_dir"])
+            canonical = spec["canonical_paths"]
+            tag = f"GEN{len(specs)}"
+            out = {}
+            for key in ("tt0", "tt1", "alpha"):
+                out[key] = run_dir / Path(canonical[key]).name
+                out[key].write_text(f"{tag}-{key}")
+            aux = {}
+            for kind, dst in canonical["aux"].items():
+                aux[kind] = str(run_dir / Path(dst).name)
+                Path(aux[kind]).write_text(f"{tag}-{kind}")
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True, "tt0_fits": str(out["tt0"]),
+                "tt1_fits": str(out["tt1"]), "alpha_fits": str(out["alpha"]),
+                "aux_fits": aux,
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_continuum_trusted_preflight",
+                   return_value=(True, "OK")), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            ok, msg, _ = run_tclean_cont_parallel(
+                unit=cont_unit, output_dir=output_dir, row_id=1,
+                casa_path=str(casa_path), publish_policy="overwrite",
+            )
+            assert ok, msg
+            full_aux = dict(specs[0]["canonical_paths"]["aux"])
+            assert set(full_aux) == {"tt0_image", "tt1_image", "mask",
+                                     "residual", "pb", "psf"}
+            assert all(Path(p).exists() for p in full_aux.values())
+
+            ok, msg, _ = run_tclean_cont_parallel(
+                unit=cont_unit, output_dir=output_dir, row_id=2,
+                casa_path=str(casa_path), publish_policy="overwrite",
+                aux_products=("mask", "residual", "pb"),
+            )
+            assert ok, msg
+        for kind in ("mask", "residual", "pb"):
+            assert Path(full_aux[kind]).read_text() == f"GEN2-{kind}"
+        for kind in ("tt0_image", "tt1_image", "psf"):
+            assert not Path(full_aux[kind]).exists()
+        assert Path(specs[1]["canonical_paths"]["alpha"]).read_text() == "GEN2-alpha"
+
+
 class TestRunContinuumTrustedPreflight:
     def test_assigns_each_eb_its_own_selection(self, cont_unit):
         cont_unit.recovered_params["spw_by_eb"] = dict(_EB_MAP)
