@@ -1383,6 +1383,31 @@ def _publish_pair(
     return True, "ok"
 
 
+def _line_retire_candidates(
+    output_dir: Path, unit: ImagingUnit, freq_min: float, freq_max: float,
+    pairs: list[tuple[str, str]],
+) -> tuple[str, ...]:
+    """Optional line products (12m7m tclean-only + every aux kind) that
+    this generation is not publishing; see ``_publish_pair(retire=...)``."""
+    from panta_rei.imaging.matching import (
+        AUX_PRODUCT_KINDS,
+        build_aux_output_path,
+        build_tclean_only_output_path,
+    )
+
+    candidates = [str(build_tclean_only_output_path(
+        output_dir, unit.gous_uid, unit.source_name, freq_min, freq_max,
+    ))] + [
+        str(build_aux_output_path(
+            output_dir, unit.gous_uid, unit.source_name,
+            freq_min, freq_max, kind,
+        ))
+        for kind in AUX_PRODUCT_KINDS
+    ]
+    published = {dst for _src, dst in pairs}
+    return tuple(dst for dst in candidates if dst not in published)
+
+
 def run_tclean_feather(
     unit: ImagingUnit,
     output_dir: Path,
@@ -1610,7 +1635,8 @@ def run_tclean_feather(
     )
     (run_dir / "result.json").write_text(json.dumps(result, indent=2))
 
-    ok, msg = _publish_pair(pair, policy=publish_policy)
+    retire = _line_retire_candidates(output_dir, unit, freq_min, freq_max, pair)
+    ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)
     if not ok:
         return False, msg, None
 
@@ -1872,7 +1898,10 @@ def run_tclean_feather_parallel(
     # whether publish is in progress, so publish is also unsafe to start.
     on_publish_start()
 
-    ok, msg = _publish_pair(pair, policy=publish_policy)
+    # Older optional products this generation lacks must not survive beside
+    # the new feathered cube (same rule as continuum).
+    retire = _line_retire_candidates(output_dir, unit, freq_min, freq_max, pair)
+    ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)
     if not ok:
         return False, msg, None
 

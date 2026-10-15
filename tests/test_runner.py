@@ -1014,6 +1014,55 @@ class TestRunTcleanFeatherParallel:
             assert not list(Path(output).parent.glob(f"*.cube.{kind}.fits"))
 
 
+class TestRunTcleanFeatherParallelGenerations:
+    def _run(self, basic_unit, tmp_path, policy):
+        casa_path = tmp_path / "casa"
+        (casa_path / "bin").mkdir(parents=True, exist_ok=True)
+        (casa_path / "bin" / "mpicasa").touch()
+        (casa_path / "bin" / "casa").touch()
+        seen = {}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            spec = json.loads(Path(cmd[-1]).read_text())
+            seen.update(spec["canonical_paths"])
+            run_dir = Path(spec["run_dir"])
+            # Previous generation: tclean-only cube + mask already published.
+            for dst in (spec["canonical_paths"]["tclean_only"],
+                        spec["canonical_paths"]["aux"]["mask"]):
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                Path(dst).write_text("OLD")
+            feathered = run_dir / Path(spec["canonical_paths"]["feathered"]).name
+            feathered.write_text("NEW-F")
+            # New generation: feathered only (tclean/aux exports failed).
+            (run_dir / "result.json").write_text(json.dumps({
+                "success": True, "feathered_fits": str(feathered),
+                "tclean_fits": None, "aux_fits": {},
+            }))
+            mr = MagicMock(); mr.returncode = 0
+            return mr
+
+        with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(True, "OK")), \
+             patch("subprocess.run", side_effect=fake_subprocess_run):
+            result = run_tclean_feather_parallel(
+                unit=basic_unit, output_dir=tmp_path / "output", row_id=9,
+                casa_path=str(casa_path), publish_policy=policy,
+            )
+        return result, seen
+
+    def test_overwrite_retires_old_optional_products(self, basic_unit, tmp_path):
+        (ok, msg, out), seen = self._run(basic_unit, tmp_path, "overwrite")
+        assert ok, msg
+        assert Path(out).read_text() == "NEW-F"
+        assert not Path(seen["tclean_only"]).exists()
+        assert not Path(seen["aux"]["mask"]).exists()
+
+    def test_fail_if_exists_refuses_mixed_generation(self, basic_unit, tmp_path):
+        (ok, msg, _), seen = self._run(basic_unit, tmp_path, "fail_if_exists")
+        assert not ok and "collision" in msg
+        assert not Path(seen["feathered"]).exists()
+        assert Path(seen["aux"]["mask"]).read_text() == "OLD"
+
+
 # ---------------------------------------------------------------------------
 # _publish + _publish_pair
 # ---------------------------------------------------------------------------
