@@ -166,7 +166,7 @@ def parse_tclean_calls(log_path: Path) -> list[dict]:
 
     Each call may span multiple lines.  The parser accumulates lines from
     ``tclean(`` until a line ending with ``)`` is found, joins them, and
-    converts the parameter string to a dict via :func:`ast.literal_eval`.
+    converts the keyword arguments to a dict (see :func:`_parse_one_call`).
 
     Results are memoized per-process (see ``_PARSE_CACHE``) since recovery
     re-parses the same weblogs repeatedly.
@@ -472,30 +472,47 @@ def recover_continuum_params_for_mous(
 def _parse_one_call(call_str: str) -> dict:
     """Parse a single ``tclean(key=val, ...)`` string into a dict.
 
-    Primary method: ``ast.literal_eval`` on ``dict(...)`` form.
-    Fallback: regex-based extraction of individual parameters.
-    """
-    # Strip leading 'tclean' and convert to dict(...)
-    inner = call_str.strip()
-    if inner.startswith("tclean"):
-        inner = inner[len("tclean"):]
+    Primary method: ``ast.parse`` the call expression and
+    ``ast.literal_eval`` each keyword value (never ``eval``), so every
+    literal argument is kept — nested lists, quoted field names, booleans,
+    negative numbers.  A keyword whose value is not a literal is logged and
+    skipped; the rest of the call is still recovered.
 
-    # Try ast.literal_eval with dict() wrapper
+    Fallback: if the call text itself does not parse (e.g. a truncated
+    log), regex-based extraction of the most important parameters.
+    """
     try:
-        result = ast.literal_eval(f"dict{inner}")
+        node = ast.parse(call_str.strip(), mode="eval").body
+    except SyntaxError:
+        node = None
+
+    if isinstance(node, ast.Call):
+        result: dict = {}
+        for kw in node.keywords:
+            if kw.arg is None:  # **kwargs splat — nothing literal to keep
+                continue
+            try:
+                result[kw.arg] = ast.literal_eval(kw.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError,
+                    RecursionError):
+                # debug, not warning: the only non-literals seen in real
+                # weblogs are np.float64(...) reprs in self-cal solve calls.
+                log.debug(
+                    "Skipping non-literal tclean argument %s=%.60s",
+                    kw.arg, ast.unparse(kw.value),
+                )
         return result
-    except (ValueError, SyntaxError):
-        pass
 
     # Fallback: regex extraction
-    log.debug("ast.literal_eval failed, falling back to regex for: %.100s...", call_str)
+    log.debug("ast.parse failed, falling back to regex for: %.100s...", call_str)
     return _regex_parse(call_str)
 
 
 def _regex_parse(call_str: str) -> dict:
     """Fallback regex parser for tclean parameter strings.
 
-    Handles the most important parameters that sdintimaging needs.
+    Only used when the call text is not valid Python.  Handles the most
+    important parameters that sdintimaging needs.
     """
     result: dict = {}
 
