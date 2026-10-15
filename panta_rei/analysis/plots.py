@@ -34,6 +34,18 @@ COLOR_SPECTRUM = "cornflowerblue"
 CMAP_MOMENT = "inferno"
 ARRAY_TAG = "12m7mTP"
 
+# Continuum quicklook conventions. Continuum is the joint 12m+7m MFS product
+# (no TP), so its tag differs from the feathered line products above.
+CMAP_CONTINUUM = "inferno"
+CMAP_ALPHA = "RdBu_r"  # diverging — spectral index is signed, not a flux
+ARRAY_TAG_CONTINUUM = "12m7m"
+# Spectral-index colour range. Physical alpha is roughly [-1, 4]; clamp so a
+# few noisy survivors don't blow out the scale (we also S/N-mask, below).
+ALPHA_VMIN, ALPHA_VMAX = -2.0, 4.0
+# Default S/N threshold for the alpha mask, applied on the FLAT (non-pbcor)
+# image whose noise is spatially uniform (pbcor amplifies edge noise).
+ALPHA_SNR_DEFAULT = 5.0
+
 
 def _resolve_beam_for_scalar(cube):
     """Return a single ``Beam`` for cube-wide jtok.
@@ -224,6 +236,125 @@ def plot_mean_spectrum(
             title = f"{title} | {source_label}"
         ax.set_title(title, fontsize=10)
 
+        fig.tight_layout()
+        _atomic_savefig(fig, out_path)
+    finally:
+        plt.close(fig)
+
+
+# --- Continuum quicklooks -------------------------------------------------
+# 2D MFS images (no cube). The renderers take plain numpy arrays + the FITS
+# header (for WCS), mirroring the moment-map look: WCS axes, a colourbar, an
+# inferno/diverging map, and an atomic PNG write.
+
+
+def _celestial_axes(fig, header):
+    """Add a subplot with WCS celestial axes when possible, else pixel axes."""
+    wcs = None
+    try:
+        wcs = WCS(header).celestial
+    except Exception:
+        wcs = None
+    if wcs is not None:
+        ax = fig.add_subplot(111, projection=wcs)
+        ax.set_xlabel("RA (J2000)")
+        ax.set_ylabel("Dec (J2000)")
+    else:
+        ax = fig.add_subplot(111)
+        ax.set_xlabel("x (pix)")
+        ax.set_ylabel("y (pix)")
+    return ax
+
+
+def mask_alpha_by_snr(alpha, flat, snr: float = ALPHA_SNR_DEFAULT):
+    """Return ``(masked_alpha, n_significant)``.
+
+    The spectral-index map is meaningless where there is no continuum signal,
+    so we blank it outside ``flat > snr * sigma``. ``flat`` is the non-pbcor
+    (flat-noise) image; ``sigma`` is its 3-sigma-clipped standard deviation.
+    """
+    from astropy.stats import sigma_clipped_stats
+
+    alpha = np.asarray(alpha, dtype=np.float64)
+    flat = np.asarray(flat, dtype=np.float64)
+    flat_finite = np.isfinite(flat)
+    if flat_finite.any():
+        _, _, sigma = sigma_clipped_stats(flat[flat_finite], sigma=3.0)
+        mask = flat_finite & np.isfinite(alpha) & (flat > snr * float(sigma))
+    else:
+        mask = np.zeros(alpha.shape, dtype=bool)
+    masked = np.where(mask, alpha, np.nan)
+    return masked, int(mask.sum())
+
+
+def plot_continuum_image(data_jy, header, out_path: Path, *, source_label: str | None = None) -> None:
+    """Plot a 2D continuum image (Jy/beam → mJy/beam) with an asinh stretch.
+
+    asinh keeps the faint extended emission visible alongside bright cores
+    (continuum has a very wide dynamic range); the softening width is set at
+    the image noise so it is ~linear below the rms and logarithmic above.
+    """
+    from astropy.stats import sigma_clipped_stats
+    from astropy.visualization import AsinhStretch, ImageNormalize, ManualInterval
+
+    data = np.asarray(data_jy, dtype=np.float64)
+    mjy = data * 1000.0  # Jy/beam → mJy/beam
+    finite = np.isfinite(mjy)
+    if not finite.any():
+        raise ValueError("continuum image is entirely non-finite")
+
+    _, _, sigma = sigma_clipped_stats(mjy[finite], sigma=3.0)
+    sigma = float(sigma) if np.isfinite(sigma) and sigma > 0 else float(np.nanstd(mjy[finite]))
+    vmin = -2.0 * sigma
+    vmax = float(np.nanmax(mjy[finite]))
+    if vmax <= vmin:
+        vmax = vmin + (abs(vmin) or 1.0)
+    a = float(np.clip(sigma / (vmax - vmin), 1e-3, 0.5))
+    norm = ImageNormalize(mjy, interval=ManualInterval(vmin, vmax), stretch=AsinhStretch(a=a))
+
+    fig = plt.figure(figsize=(7.5, 6.0))
+    ax = _celestial_axes(fig, header)
+    try:
+        im = ax.imshow(
+            mjy, origin="lower", cmap=CMAP_CONTINUUM, norm=norm, interpolation="nearest",
+        )
+        fig.colorbar(im, ax=ax, label="Flux density (mJy/beam)", fraction=0.046, pad=0.04)
+        title = f"{ARRAY_TAG_CONTINUUM} | Continuum (tt0, PB-corrected)"
+        if source_label:
+            title = f"{title} | {source_label}"
+        ax.set_title(title, fontsize=10)
+        fig.tight_layout()
+        _atomic_savefig(fig, out_path)
+    finally:
+        plt.close(fig)
+
+
+def plot_continuum_alpha(
+    masked_alpha,
+    header,
+    out_path: Path,
+    *,
+    source_label: str | None = None,
+    snr: float = ALPHA_SNR_DEFAULT,
+) -> None:
+    """Plot a S/N-masked spectral-index map (diverging cmap, fixed [-2, 4] range).
+
+    ``masked_alpha`` should already be blanked outside the significant region
+    (see :func:`mask_alpha_by_snr`); this function only renders.
+    """
+    alpha = np.asarray(masked_alpha, dtype=np.float64)
+    fig = plt.figure(figsize=(7.5, 6.0))
+    ax = _celestial_axes(fig, header)
+    try:
+        im = ax.imshow(
+            alpha, origin="lower", cmap=CMAP_ALPHA,
+            vmin=ALPHA_VMIN, vmax=ALPHA_VMAX, interpolation="nearest",
+        )
+        fig.colorbar(im, ax=ax, label=r"Spectral index $\alpha$", fraction=0.046, pad=0.04)
+        title = f"{ARRAY_TAG_CONTINUUM} | Spectral index (S/N>{snr:g})"
+        if source_label:
+            title = f"{title} | {source_label}"
+        ax.set_title(title, fontsize=10)
         fig.tight_layout()
         _atomic_savefig(fig, out_path)
     finally:

@@ -57,3 +57,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local scratch / test artifacts
+.tmp/
+panta_rei.db
