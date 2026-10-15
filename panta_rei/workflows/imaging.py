@@ -667,10 +667,11 @@ class JointImagingStep(Step):
             status = ImagingRunStatus.SUCCESS if success else ImagingRunStatus.FAILED
             retcode = 0 if success else 1
 
-            # The parallel path runs a monolithic CASA whose version the
-            # script records in result.json; prefer it over casatools'.
+            # result.json records the CASA that cleaned the products (the
+            # parallel path's monolithic CASA, or a resumed run's original
+            # cleaner); prefer it over the casatools version stamped above.
             executed_version = None
-            if opts.method == "tclean_feather" and opts.parallel:
+            if opts.method == "tclean_feather":
                 from panta_rei.imaging.runner import executing_casa_version
                 executed_version = executing_casa_version(
                     opts.output_dir / "runs" / str(row_id)

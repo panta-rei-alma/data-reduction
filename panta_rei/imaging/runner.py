@@ -111,6 +111,66 @@ def executing_casa_version(run_dir: Path) -> Optional[str]:
     return version or None
 
 
+# tclean return-value provenance for the in-process (serial) line path.
+# Mirrors the helpers in panta_rei/casa/tclean_feather.py / tclean_cont.py,
+# which run inside monolithic CASA and cannot import panta_rei; keep the
+# result.json / tclean_summary.json schema identical.
+TCLEAN_SUMMARY_KEYS = ("stopcode", "stopDescription", "iterdone", "nmajordone")
+
+
+def _json_safe(obj):
+    """Recursively convert tclean's return value into JSON-serialisable data."""
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if hasattr(obj, "tolist"):  # numpy array or scalar
+        try:
+            return _json_safe(obj.tolist())
+        except Exception:  # noqa: BLE001
+            pass
+    return repr(obj)
+
+
+def _record_tclean_summary(ret, run_dir: Path, result: dict) -> None:
+    """Write tclean's return to tclean_summary.json; headline it in result."""
+    summary = _json_safe(ret) if ret is not None else None
+    path = run_dir / "tclean_summary.json"
+    try:
+        path.write_text(json.dumps(summary, indent=2))
+        result["tclean_summary_json"] = str(path)
+    except OSError as e:
+        log.warning("could not write %s: %s", path.name, e)
+    if isinstance(summary, dict):
+        result["tclean_summary"] = {k: summary.get(k) for k in TCLEAN_SUMMARY_KEYS}
+
+
+def _carry_prior_provenance(run_dir: Path, result: dict) -> None:
+    """On resume (tclean skipped), keep the earlier run's cleaning provenance."""
+    try:
+        prior = json.loads((run_dir / "result.json").read_text())
+    except (OSError, ValueError):
+        prior = {}
+    if not isinstance(prior, dict):
+        prior = {}
+    result["casa_version"] = prior.get("casa_version") or "unknown"
+    result["tclean_summary"] = prior.get("tclean_summary")
+    sidecar = run_dir / "tclean_summary.json"
+    if sidecar.exists():
+        result["tclean_summary_json"] = str(sidecar)
+        if result["tclean_summary"] is None:
+            try:
+                summary = json.loads(sidecar.read_text())
+            except (OSError, ValueError):
+                summary = None
+            if isinstance(summary, dict):
+                result["tclean_summary"] = {
+                    k: summary.get(k) for k in TCLEAN_SUMMARY_KEYS
+                }
+
+
 def resolve_spw_for_ms(
     ms_path: str,
     target_center_hz: float,
@@ -1459,14 +1519,27 @@ def run_tclean_feather(
     job_json_path.write_text(json.dumps(job_spec, indent=2, default=str))
     log.info("Wrote job spec: %s", job_json_path)
 
-    # 7. Execute tclean (or skip if products already exist)
+    # 7. Execute tclean (or skip if products already exist).  ``result``
+    # follows the result.json schema of the standalone CASA scripts.
     pbcor_image = f"{imagename}.image.pbcor"
+    casa_version = get_casa_version()
+    result: dict = {
+        "success": False,
+        "feathered_fits": None,
+        "tclean_fits": None,
+        "aux_fits": {},
+        "tclean_summary": None,
+        "casa_version": casa_version,
+        "export_casa_version": casa_version,
+        "error_message": None,
+    }
 
     if Path(pbcor_image).exists():
         log.info(
             "tclean products already exist, skipping to feather: %s",
             Path(pbcor_image).name,
         )
+        _carry_prior_provenance(run_dir, result)
     else:
         tclean, _, _, _ = _ensure_casatasks_tclean()
         log.info(
@@ -1474,7 +1547,8 @@ def run_tclean_feather(
             unit.gous_uid, unit.source_name, unit.spw_id,
             Path(imagename).name,
         )
-        tclean(**params)
+        ret = tclean(**params)
+        _record_tclean_summary(ret, run_dir, result)
 
         if not Path(pbcor_image).exists():
             return False, f"tclean did not produce {Path(pbcor_image).name}", None
@@ -1527,6 +1601,14 @@ def run_tclean_feather(
     ]
     for kind, local_path in aux_local.items():
         pair.append((local_path, canonical_aux[kind]))
+
+    result.update(
+        success=True,
+        feathered_fits=local_feathered_fits,
+        tclean_fits=local_tclean_fits,
+        aux_fits=aux_local,
+    )
+    (run_dir / "result.json").write_text(json.dumps(result, indent=2))
 
     ok, msg = _publish_pair(pair, policy=publish_policy)
     if not ok:

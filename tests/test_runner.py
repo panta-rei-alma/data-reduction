@@ -700,6 +700,10 @@ class TestRunTcleanFeather:
             Path(f"{imagename}.image").mkdir(parents=True)
             Path(f"{imagename}.pb").mkdir(parents=True)
             Path(f"{imagename}.psf").mkdir(parents=True)
+            import numpy as np
+            return {"stopcode": np.int64(2), "stopDescription": "threshold",
+                    "iterdone": np.int64(321), "nmajordone": 4,
+                    "summarymajor": np.array([0, 100, 321])}
 
         mock_tclean.side_effect = fake_tclean
 
@@ -775,6 +779,18 @@ class TestRunTcleanFeather:
         assert spec["canonical_paths"]["tclean_only"].endswith(".fits")
         assert "12m7mTP" in spec["canonical_paths"]["feathered"]
         assert "12m7m." in spec["canonical_paths"]["tclean_only"]
+
+        # Same result.json / tclean_summary.json schema as the CASA scripts
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["success"] is True
+        assert result["casa_version"] == "6.6.6"
+        assert result["export_casa_version"] == "6.6.6"
+        assert result["tclean_summary"] == {
+            "stopcode": 2, "stopDescription": "threshold",
+            "iterdone": 321, "nmajordone": 4,
+        }
+        sidecar = json.loads((run_dir / "tclean_summary.json").read_text())
+        assert sidecar["summarymajor"] == [0, 100, 321]
 
     def test_preflight_failure(self, basic_unit, tmp_path):
         """If trusted preflight fails, should return failure."""
