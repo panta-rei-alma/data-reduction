@@ -88,6 +88,26 @@ def needs_contsub(member_dir: Path) -> Tuple[bool, str]:
     )
 
 
+RERUN_REFUSED_MSG = (
+    "existing contsub outputs present; in-place re-run is unsupported "
+    "(re-subtraction will use direct uvcontsub into versioned outputs)"
+)
+
+
+def existing_contsub_outputs(member_dir: Path) -> List[Path]:
+    """Existing ``*_targets.ms`` / ``*_targets_line.ms`` for the base EBs."""
+    working_dir = member_dir / "calibrated" / "working"
+    found: List[Path] = []
+    if not working_dir.is_dir():
+        return found
+    for ms_path in _find_base_ms_files(working_dir):
+        for suffix in ("_targets.ms", "_targets_line.ms"):
+            product = working_dir / ms_path.name.replace(".ms", suffix)
+            if product.is_dir():
+                found.append(product)
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Single MOUS execution
 # ---------------------------------------------------------------------------
@@ -104,8 +124,9 @@ def _run_one_contsub(
 ) -> Tuple[str, int, Path]:
     """Run the contsub CASA script for one MOUS.
 
-    *re_run* is forwarded to the script, which otherwise exits early when
-    every ``_targets_line.ms`` already exists.
+    *re_run* is forwarded to the script, which refuses it if any contsub
+    output already exists (the step checks that first, see
+    :func:`existing_contsub_outputs`).
 
     Returns ``(status, retcode, log_path)``.
     """
@@ -278,6 +299,18 @@ class ContsubStep(Step):
             # Apply match filter
             if match_re and not match_re.search(uid):
                 continue
+
+            # --re-run never touches existing outputs: refuse loudly rather
+            # than re-running the pipeline stages in place.
+            if opts.re_run:
+                present = existing_contsub_outputs(mous_dir)
+                if present:
+                    log.error(
+                        "Refusing --re-run for %s: %s (%s)", uid,
+                        RERUN_REFUSED_MSG, ", ".join(p.name for p in present),
+                    )
+                    errors.append(f"{uid}: {RERUN_REFUSED_MSG}")
+                    continue
 
             # Check if contsub is needed (on-disk is authoritative)
             if not opts.re_run:

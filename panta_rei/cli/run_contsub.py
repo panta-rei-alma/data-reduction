@@ -57,7 +57,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--re-run", action="store_true",
-        help="Force re-run even when _targets_line.ms already exists",
+        help="Bypass the completeness skip; refuses (in-place re-run "
+             "unsupported) if any _targets*.ms already exists",
     )
     ap.add_argument(
         "--obs-csv", type=str, default=None,

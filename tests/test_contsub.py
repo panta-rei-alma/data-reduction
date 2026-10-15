@@ -295,8 +295,7 @@ class TestContsubStep:
         assert result.items_processed == 1
 
     @patch("panta_rei.workflows.contsub.subprocess.run")
-    def test_re_run_bypasses_disk_check(self, mock_sub, contsub_tree, db):
-        mock_sub.return_value = MagicMock(returncode=0)
+    def test_re_run_refused_when_outputs_exist(self, mock_sub, contsub_tree, db):
         ctx = self._make_ctx(contsub_tree, db)
         opts = ContsubOptions(
             casa_cmd="casa --pipeline",
@@ -304,15 +303,21 @@ class TestContsubStep:
             re_run=True,
         )
         result = ContsubStep(opts).run(ctx)
-        assert result.items_processed == 1  # re_run forces processing
+        assert not result.success
+        assert result.items_processed == 0
+        assert "in-place re-run is unsupported" in result.errors[0]
+        mock_sub.assert_not_called()
+        # Existing output untouched
+        working = contsub_tree["member_complete"] / "calibrated" / "working"
+        assert (working / "uid___A002_XABCD_XEFGH_targets_line.ms").is_dir()
 
     @patch("panta_rei.workflows.contsub.subprocess.run")
     def test_re_run_forwarded_to_script(self, mock_sub, contsub_tree, db):
         mock_sub.return_value = MagicMock(returncode=0)
         ctx = self._make_ctx(contsub_tree, db)
         ContsubStep(ContsubOptions(
-            casa_cmd="casa --pipeline", match="X64bd", re_run=True,
-        )).run(ctx)
+            casa_cmd="casa --pipeline", match="X64bc", re_run=True,
+        )).run(ctx)  # no outputs yet → allowed, flag forwarded
         assert mock_sub.call_args[0][0][-1] == "--re-run"
 
         mock_sub.reset_mock()
@@ -410,29 +415,33 @@ class TestContsubRemediationScript:
         assert self._main(script, monkeypatch, "--member-dir", str(member)) == 0
         assert script.calls == []
 
-    def test_re_run_moves_aside_and_regenerates(self, script, contsub_tree, monkeypatch):
+    @pytest.mark.parametrize("extra", [[], ["--dry-run"]])
+    def test_re_run_refused_when_outputs_exist(self, script, contsub_tree,
+                                               monkeypatch, caplog, extra):
         member, working = self._complete_member(contsub_tree)
+        monkeypatch.chdir(member)
+        code = self._main(script, monkeypatch, "--member-dir", str(member),
+                          "--re-run", *extra)
+        assert code == 2
+        assert script.calls == []
+        assert "in-place re-run is unsupported" in caplog.text
+        line = working / "uid___A002_X12fb842_X4e4e_targets_line.ms"
+        assert (line / "old_marker").read_text() == "old"
+        assert sorted(p.name for p in working.iterdir() if "targets" in p.name) == [
+            "uid___A002_X12fb842_X4e4e_targets.ms",
+            "uid___A002_X12fb842_X4e4e_targets_line.ms",
+        ]
+
+    def test_re_run_without_outputs_runs_normally(self, script, contsub_tree, monkeypatch):
+        member = contsub_tree["member_needs"]
         monkeypatch.chdir(member)
         code = self._main(script, monkeypatch, "--member-dir", str(member), "--re-run")
         assert code == 0
         assert "hif_uvcontsub" in script.calls
-        line = working / "uid___A002_X12fb842_X4e4e_targets_line.ms"
-        assert line.is_dir() and not (line / "old_marker").exists()
-        backups = sorted(p.name for p in working.glob("*.pre-rerun-*"))
-        assert len(backups) == 2
-        old_line = next(working.glob("*_targets_line.ms.pre-rerun-*"))
-        assert (old_line / "old_marker").read_text() == "old"
-        # Backups don't look like MSs to the base-EB / product globs
-        assert len(script.find_base_ms_files(str(working))) == 1
 
-    def test_re_run_dry_run_moves_nothing(self, script, contsub_tree, monkeypatch):
-        member, working = self._complete_member(contsub_tree)
-        monkeypatch.chdir(member)
-        code = self._main(script, monkeypatch, "--member-dir", str(member),
-                          "--re-run", "--dry-run")
-        assert code == 0
-        assert script.calls == []
-        assert not list(working.glob("*.pre-rerun-*"))
+    def test_refusal_message_matches_workflow(self, script):
+        from panta_rei.workflows.contsub import RERUN_REFUSED_MSG
+        assert script.RERUN_REFUSED_MSG == RERUN_REFUSED_MSG
 
     def test_has_uvcontfit_sees_global_task(self, script, contsub_tree, monkeypatch):
         member = contsub_tree["member_needs"]

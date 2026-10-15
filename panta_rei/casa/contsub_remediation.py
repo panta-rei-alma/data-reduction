@@ -22,14 +22,12 @@ Usage:
     casa --nologger --nogui --pipeline -c contsub_remediation.py \
          --member-dir /path/to/member.uid___... --re-run
 
-``--re-run`` regenerates the products even when every _targets_line.ms
-exists.  Nothing is deleted: each existing *_targets.ms / *_targets_line.ms
-is first renamed to ``<name>.pre-rerun-<timestamp>`` so the stages run on
-the same clean state as a first remediation (hif_uvcontsub would otherwise
-rmtree the line MS itself, and hif_mstransform is not designed to run over
-an existing _targets.ms).  Note the regenerated _targets.ms carries no
-hif_selfcal solutions (this script never runs hif_selfcal); the renamed
-originals stay alongside for comparison or manual restore.
+``--re-run`` refuses (exit 2) when any *_targets.ms / *_targets_line.ms
+already exists: re-running the pipeline stages in place inside a resumed
+context is unsupported (the context already registers those MSs, and a
+partial failure would leave canonical products half-replaced).
+Re-subtraction will instead use direct uvcontsub into versioned outputs.
+With no existing outputs it behaves like a normal run.
 
 Author: Generated for Dan Walker
 Project: Panta Rei ALMA Large Program (2025.1.00383.L)
@@ -38,7 +36,6 @@ Project: Panta Rei ALMA Large Program (2025.1.00383.L)
 import argparse
 import ast
 import builtins
-import datetime
 import glob
 import logging
 import os
@@ -184,18 +181,11 @@ def existing_targets_products(working_dir):
     return found
 
 
-def move_aside(paths, stamp):
-    """Rename each path to ``<path>.pre-rerun-<stamp>``; return the new names."""
-    moved = []
-    for path in paths:
-        dest = f"{path}.pre-rerun-{stamp}"
-        if os.path.exists(dest):
-            raise FileExistsError(f"Backup name already in use: {dest}")
-        os.rename(path, dest)
-        log.info("Moved aside: %s -> %s", os.path.basename(path),
-                 os.path.basename(dest))
-        moved.append(dest)
-    return moved
+# Shared with panta_rei.workflows.contsub (this script cannot import it).
+RERUN_REFUSED_MSG = (
+    "existing contsub outputs present; in-place re-run is unsupported "
+    "(re-subtraction will use direct uvcontsub into versioned outputs)"
+)
 
 
 def validate_output(working_dir):
@@ -253,8 +243,8 @@ def main():
     )
     parser.add_argument(
         "--re-run", action="store_true",
-        help="Regenerate even if all _targets_line.ms exist (existing "
-             "_targets*.ms are renamed aside, not deleted)",
+        help="Run even if outputs might exist; refuses if any "
+             "_targets*.ms is already present",
     )
 
     # CASA passes extra args we need to ignore
@@ -279,13 +269,17 @@ def main():
     log.info("Existing _targets_line.ms: %d", len(existing))
     log.info("Missing _targets_line.ms: %d", len(missing))
 
-    if all_present and not re_run:
+    if re_run:
+        present = existing_targets_products(working_dir)
+        if present:
+            log.error("REFUSED --re-run: %s", RERUN_REFUSED_MSG)
+            for path in present:
+                log.error("  %s", path)
+            sys.exit(2)
+
+    if all_present:
         log.info("All _targets_line.ms already exist. Nothing to do.")
         sys.exit(0)
-
-    # --re-run: existing products are renamed aside just before execution
-    to_move = existing_targets_products(working_dir) if re_run else []
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     if not base_ms:
         log.error("No base calibrated MS files in %s", working_dir)
@@ -326,9 +320,6 @@ def main():
     # --- Dry run ---
     if dry_run:
         log.info("DRY RUN — would execute:")
-        for path in to_move:
-            log.info("  0. mv %s -> %s.pre-rerun-%s",
-                     os.path.basename(path), os.path.basename(path), stamp)
         log.info("  1. os.chdir(%s)", working_dir)
         log.info("  2. cp %s -> %s", cont_dat_src, cont_dat_dst)
         if context_files:
@@ -350,10 +341,6 @@ def main():
         sys.exit(0)
 
     # --- Execute ---
-    if to_move:
-        log.info("--re-run: moving %d existing _targets*.ms aside", len(to_move))
-        move_aside(to_move, stamp)
-
     os.chdir(working_dir)
     log.info("Working directory: %s", os.getcwd())
 
