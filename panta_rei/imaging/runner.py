@@ -98,8 +98,8 @@ def executing_casa_version(run_dir: Path) -> Optional[str]:
 
     The standalone mpicasa scripts run in monolithic CASA, whose version can
     differ from the orchestration env's casatools (:func:`get_casa_version`).
-    On a resume the script carries the original cleaning version forward
-    (``unknown`` if it had none), so that is what this returns.  Returns None
+    On a resume that version comes only from the run's completed cleaning
+    record (tclean_summary.json), else ``unknown``; this returns it as is.  Returns None
     if result.json is missing, unreadable or predates version recording.
     """
     try:
@@ -111,11 +111,13 @@ def executing_casa_version(run_dir: Path) -> Optional[str]:
     return version or None
 
 
-# tclean return-value provenance for the in-process (serial) line path.
-# Mirrors the helpers in panta_rei/casa/tclean_feather.py / tclean_cont.py,
-# which run inside monolithic CASA and cannot import panta_rei; keep the
-# result.json / tclean_summary.json schema identical.
+# tclean cleaning-record provenance for the in-process (serial) line path.
+# Mirrors the helpers in panta_rei/casa/tclean_feather.py / tclean_cont.py
+# (see CLEANING_RECORD there), which run inside monolithic CASA and cannot
+# import panta_rei; keep the result.json / tclean_summary.json schema
+# identical.
 TCLEAN_SUMMARY_KEYS = ("stopcode", "stopDescription", "iterdone", "nmajordone")
+CLEANING_RECORD = "tclean_summary.json"
 
 
 def _json_safe(obj):
@@ -134,41 +136,63 @@ def _json_safe(obj):
     return repr(obj)
 
 
-def _record_tclean_summary(ret, run_dir: Path, result: dict) -> None:
-    """Write tclean's return to tclean_summary.json; headline it in result."""
-    summary = _json_safe(ret) if ret is not None else None
-    path = run_dir / "tclean_summary.json"
+def _write_cleaning_record(
+    run_dir: Path, ret, casa_version: str, completed: bool,
+) -> None:
+    """Write {completed, casa_version, summary} for this tclean generation."""
+    record = {
+        "completed": completed,
+        "casa_version": casa_version,
+        "summary": _json_safe(ret) if ret is not None else None,
+    }
+    path = run_dir / CLEANING_RECORD
     try:
-        path.write_text(json.dumps(summary, indent=2))
-        result["tclean_summary_json"] = str(path)
+        path.write_text(json.dumps(record, indent=2))
     except OSError as e:
         log.warning("could not write %s: %s", path.name, e)
+
+
+def _apply_cleaning_record(run_dir: Path, result: dict) -> bool:
+    """Copy a *completed* cleaning record's version + headline into result.
+
+    The record is the only source of cleaning provenance: a prior
+    result.json casa_version may be a legacy exporter stamp.  Returns False
+    (result untouched) if there is no completed record.
+    """
+    path = run_dir / CLEANING_RECORD
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("completed") is not True:
+        return False
+    result["casa_version"] = record.get("casa_version") or "unknown"
+    summary = record.get("summary")
     if isinstance(summary, dict):
         result["tclean_summary"] = {k: summary.get(k) for k in TCLEAN_SUMMARY_KEYS}
+    result["tclean_summary_json"] = str(path)
+    return True
 
 
-def _carry_prior_provenance(run_dir: Path, result: dict) -> None:
-    """On resume (tclean skipped), keep the earlier run's cleaning provenance."""
+def _run_tclean_recorded(
+    tclean_task, params: dict, run_dir: Path, result: dict, casa_version: str,
+) -> None:
+    """Run a fresh tclean generation and record its cleaning provenance.
+
+    The previous record is deleted first and the new one is written as
+    soon as tclean returns (or raises), before any export/feather step.
+    """
+    path = run_dir / CLEANING_RECORD
+    if path.exists():
+        path.unlink()  # new generation: never inherit an old record
+    result["casa_version"] = casa_version
     try:
-        prior = json.loads((run_dir / "result.json").read_text())
-    except (OSError, ValueError):
-        prior = {}
-    if not isinstance(prior, dict):
-        prior = {}
-    result["casa_version"] = prior.get("casa_version") or "unknown"
-    result["tclean_summary"] = prior.get("tclean_summary")
-    sidecar = run_dir / "tclean_summary.json"
-    if sidecar.exists():
-        result["tclean_summary_json"] = str(sidecar)
-        if result["tclean_summary"] is None:
-            try:
-                summary = json.loads(sidecar.read_text())
-            except (OSError, ValueError):
-                summary = None
-            if isinstance(summary, dict):
-                result["tclean_summary"] = {
-                    k: summary.get(k) for k in TCLEAN_SUMMARY_KEYS
-                }
+        ret = tclean_task(**params)
+    except Exception:
+        _write_cleaning_record(run_dir, None, casa_version, completed=False)
+        raise
+    _write_cleaning_record(run_dir, ret, casa_version, completed=True)
+    _apply_cleaning_record(run_dir, result)
 
 
 def resolve_spw_for_ms(
@@ -1554,67 +1578,84 @@ def run_tclean_feather(
         "tclean_fits": None,
         "aux_fits": {},
         "tclean_summary": None,
-        "casa_version": casa_version,
+        "casa_version": "unknown",  # set from the cleaning record
         "export_casa_version": casa_version,
         "error_message": None,
     }
 
-    if Path(pbcor_image).exists():
-        log.info(
-            "tclean products already exist, skipping to feather: %s",
-            Path(pbcor_image).name,
+    # Steps 7-11 persist result.json on success or failure (try/finally);
+    # the cleaning record written right after tclean is never discarded.
+    try:
+        if Path(pbcor_image).exists():
+            log.info(
+                "tclean products already exist, skipping to feather: %s",
+                Path(pbcor_image).name,
+            )
+            _apply_cleaning_record(run_dir, result)
+        else:
+            tclean, _, _, _ = _ensure_casatasks_tclean()
+            log.info(
+                "Running tclean: %s/%s/spw%s → %s",
+                unit.gous_uid, unit.source_name, unit.spw_id,
+                Path(imagename).name,
+            )
+            _run_tclean_recorded(tclean, params, run_dir, result, casa_version)
+
+            if not Path(pbcor_image).exists():
+                result["error_message"] = (
+                    f"tclean did not produce {Path(pbcor_image).name}"
+                )
+                return False, result["error_message"], None
+
+        # 8. Export tclean-only product to run_dir
+        local_tclean_fits = str(run_dir / canonical_tclean.name)
+        export_to_fits(pbcor_image, local_tclean_fits)
+
+        # 9. Prepare TP for feathering
+        tp_regridded = prepare_tp_for_feather(
+            unit.sdimage, f"{imagename}.image", run_dir,
         )
-        _carry_prior_provenance(run_dir, result)
-    else:
-        tclean, _, _, _ = _ensure_casatasks_tclean()
-        log.info(
-            "Running tclean: %s/%s/spw%s → %s",
-            unit.gous_uid, unit.source_name, unit.spw_id,
-            Path(imagename).name,
+
+        # 10. Feather
+        feathered_image = f"{imagename}.image.pbcor.feather"
+        run_feather_task(pbcor_image, tp_regridded, feathered_image)
+
+        # 11. Export feathered product to run_dir
+        local_feathered_fits = str(run_dir / canonical_feathered.name)
+        export_to_fits(feathered_image, local_feathered_fits)
+
+        # 11b. Best-effort export of aux QA products (mask/residual/pb) to
+        # FITS.  Each is sourced from <imagename>.<kind> in the run_dir.  A
+        # failure here is logged but does NOT fail the imaging run; the aux
+        # is simply omitted from the publish transaction.
+        aux_local: dict[str, str] = {}
+        for kind in aux_products:
+            casa_image = f"{imagename}.{kind}"
+            if not Path(casa_image).exists():
+                log.warning("aux %s: CASA image not found at %s — skipping",
+                            kind, Path(casa_image).name)
+                continue
+            canonical = canonical_aux.get(kind)
+            if not canonical:
+                continue
+            local_path = str(run_dir / Path(canonical).name)
+            try:
+                export_to_fits(casa_image, local_path)
+                aux_local[kind] = local_path
+            except Exception as exc:
+                log.warning("aux %s export failed: %s", kind, exc)
+
+        result.update(
+            success=True,
+            feathered_fits=local_feathered_fits,
+            tclean_fits=local_tclean_fits,
+            aux_fits=aux_local,
         )
-        ret = tclean(**params)
-        _record_tclean_summary(ret, run_dir, result)
-
-        if not Path(pbcor_image).exists():
-            return False, f"tclean did not produce {Path(pbcor_image).name}", None
-
-    # 8. Export tclean-only product to run_dir
-    local_tclean_fits = str(run_dir / canonical_tclean.name)
-    export_to_fits(pbcor_image, local_tclean_fits)
-
-    # 9. Prepare TP for feathering
-    tp_regridded = prepare_tp_for_feather(
-        unit.sdimage, f"{imagename}.image", run_dir,
-    )
-
-    # 10. Feather
-    feathered_image = f"{imagename}.image.pbcor.feather"
-    run_feather_task(pbcor_image, tp_regridded, feathered_image)
-
-    # 11. Export feathered product to run_dir
-    local_feathered_fits = str(run_dir / canonical_feathered.name)
-    export_to_fits(feathered_image, local_feathered_fits)
-
-    # 11b. Best-effort export of aux QA products (mask/residual/pb) to
-    # FITS.  Each is sourced from <imagename>.<kind> in the run_dir.  A
-    # failure here is logged but does NOT fail the imaging run; the aux
-    # is simply omitted from the publish transaction.
-    aux_local: dict[str, str] = {}
-    for kind in aux_products:
-        casa_image = f"{imagename}.{kind}"
-        if not Path(casa_image).exists():
-            log.warning("aux %s: CASA image not found at %s — skipping",
-                        kind, Path(casa_image).name)
-            continue
-        canonical = canonical_aux.get(kind)
-        if not canonical:
-            continue
-        local_path = str(run_dir / Path(canonical).name)
-        try:
-            export_to_fits(casa_image, local_path)
-            aux_local[kind] = local_path
-        except Exception as exc:
-            log.warning("aux %s export failed: %s", kind, exc)
+    except Exception as exc:
+        result["error_message"] = str(exc)
+        raise
+    finally:
+        (run_dir / "result.json").write_text(json.dumps(result, indent=2))
 
     # 12. Atomic publish to canonical paths (only on success).  Treat the
     # tclean + feathered + aux outputs as a single transaction: if any
@@ -1626,14 +1667,6 @@ def run_tclean_feather(
     ]
     for kind, local_path in aux_local.items():
         pair.append((local_path, canonical_aux[kind]))
-
-    result.update(
-        success=True,
-        feathered_fits=local_feathered_fits,
-        tclean_fits=local_tclean_fits,
-        aux_fits=aux_local,
-    )
-    (run_dir / "result.json").write_text(json.dumps(result, indent=2))
 
     retire = _line_retire_candidates(output_dir, unit, freq_min, freq_max, pair)
     ok, msg = _publish_pair(pair, policy=publish_policy, retire=retire)

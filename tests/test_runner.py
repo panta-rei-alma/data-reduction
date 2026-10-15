@@ -789,8 +789,81 @@ class TestRunTcleanFeather:
             "stopcode": 2, "stopDescription": "threshold",
             "iterdone": 321, "nmajordone": 4,
         }
-        sidecar = json.loads((run_dir / "tclean_summary.json").read_text())
-        assert sidecar["summarymajor"] == [0, 100, 321]
+        record = json.loads((run_dir / "tclean_summary.json").read_text())
+        assert record["completed"] is True and record["casa_version"] == "6.6.6"
+        assert record["summary"]["summarymajor"] == [0, 100, 321]
+
+    def _serial(self, basic_unit, tmp_path, version, tclean=None,
+                prepare_tp=None):
+        """run_tclean_feather with CASA mocked; returns (outcome, run_dir)."""
+        output_dir = tmp_path / "output"
+
+        def fake_exportfits(imagename, fitsimage, **kwargs):
+            Path(fitsimage).parent.mkdir(parents=True, exist_ok=True)
+            Path(fitsimage).write_text("fits")
+
+        def fake_prepare_tp(tp_fits_path, tclean_image, run_dir):
+            regridded = Path(run_dir) / "tp" / "tp_regridded.image"
+            regridded.mkdir(parents=True, exist_ok=True)
+            return str(regridded)
+
+        mock_tclean = MagicMock(side_effect=tclean)
+        with patch("panta_rei.imaging.runner.run_trusted_preflight", return_value=(True, "OK")), \
+             patch("panta_rei.imaging.runner._ensure_casatasks_tclean",
+                   return_value=(mock_tclean, MagicMock(), MagicMock(), MagicMock())), \
+             patch("panta_rei.imaging.runner.export_to_fits", side_effect=lambda i, o: fake_exportfits(i, o)), \
+             patch("panta_rei.imaging.runner.run_feather_task"), \
+             patch("panta_rei.imaging.runner.prepare_tp_for_feather",
+                   side_effect=prepare_tp or fake_prepare_tp), \
+             patch("panta_rei.imaging.runner.get_casa_version", return_value=version):
+            try:
+                outcome = run_tclean_feather(unit=basic_unit, output_dir=output_dir, row_id=7)
+            except Exception as exc:  # noqa: BLE001
+                outcome = exc
+        return outcome, output_dir / "runs" / "7", mock_tclean
+
+    def test_serial_failure_after_tclean_keeps_record(self, basic_unit, tmp_path):
+        """N1: TP prep fails after tclean.  result.json records the failure,
+        the cleaning record survives, and a resume credits the cleaner."""
+        def fake_tclean(**kwargs):
+            Path(f"{kwargs['imagename']}.image.pbcor").mkdir(parents=True)
+            return {"stopcode": 2, "iterdone": 77}
+
+        def broken_tp(*_a):
+            raise RuntimeError("TP regrid failed")
+
+        outcome, run_dir, _ = self._serial(basic_unit, tmp_path, "A", fake_tclean, broken_tp)
+        assert isinstance(outcome, RuntimeError)
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["success"] is False
+        assert result["error_message"] == "TP regrid failed"
+        assert result["casa_version"] == "A"
+        assert json.loads((run_dir / "tclean_summary.json").read_text())["completed"] is True
+
+        (ok, _msg, _out), run_dir, mock_tclean = self._serial(basic_unit, tmp_path, "B")
+        assert ok
+        mock_tclean.assert_not_called()  # resumed
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["casa_version"] == "A"
+        assert result["export_casa_version"] == "B"
+        assert result["tclean_summary"]["iterdone"] == 77
+
+    def test_serial_failed_fresh_tclean_drops_old_record(self, basic_unit, tmp_path):
+        run_dir = tmp_path / "output" / "runs" / "7"
+        run_dir.mkdir(parents=True)
+        (run_dir / "tclean_summary.json").write_text(json.dumps(
+            {"completed": True, "casa_version": "A", "summary": {"iterdone": 123}}
+        ))
+
+        def failing_tclean(**_kw):
+            raise RuntimeError("tclean failed")
+
+        outcome, run_dir, _ = self._serial(basic_unit, tmp_path, "B", failing_tclean)
+        assert isinstance(outcome, RuntimeError)
+        record = json.loads((run_dir / "tclean_summary.json").read_text())
+        assert record == {"completed": False, "casa_version": "B", "summary": None}
+        result = json.loads((run_dir / "result.json").read_text())
+        assert result["tclean_summary"] is None and result["success"] is False
 
     def test_preflight_failure(self, basic_unit, tmp_path):
         """If trusted preflight fails, should return failure."""
