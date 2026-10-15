@@ -270,6 +270,43 @@ class TestExtractByFieldSpw:
         assert out["weighting"] == "briggsbwtaper"
 
 
+# A QA2 cube section where spw27 is a nondetection (only the restored dirty
+# iter0 is published) and spw25 has a dirty iter0 published *after* its iter1
+# (order must not matter: the cleaned call wins).
+DIRTY_ONLY_LOG = dedent("""\
+    # hif_makeimlist(specmode='cube')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['25'], specmode='cube', restoration=False, pbcor=False, niter=0, imagename='x.spw25.cube.selfcal.I.iter0')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['25'], specmode='cube', restoration=True, pbcor=True, niter=4360, threshold='0.0145Jy', imagename='x.spw25.cube.selfcal.I.iter1')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['25'], specmode='cube', restoration=True, pbcor=True, niter=0, threshold='0.0mJy', imagename='x.spw25.cube.regcal.I.iter0')
+    tclean(vis=['eb.ms'], field='"SRC1"', spw=['27'], specmode='cube', restoration=True, pbcor=True, niter=0, threshold='0.0mJy', imagename='x.spw27.cube.regcal.I.iter0')
+""")
+
+
+class TestDirtyIter0Seeds:
+    def _extract(self, tmp_path):
+        from panta_rei.imaging.recovery import clear_parse_cache
+        clear_parse_cache()
+        p = tmp_path / "casa_commands.log"
+        p.write_text(DIRTY_ONLY_LOG)
+        return extract_by_field_spw(filter_cube_iter1_calls(parse_tclean_calls(p), p))
+
+    def test_cleaned_call_beats_dirty_iter0(self, tmp_path):
+        params = self._extract(tmp_path)[("SRC1", "25")]
+        assert params["niter"] == 4360
+        assert params["imagename"].endswith(".iter1")
+        assert "qa2_dirty_only" not in params
+
+    def test_dirty_only_kept_and_marked(self, tmp_path):
+        params = self._extract(tmp_path)[("SRC1", "27")]
+        assert params["niter"] == 0
+        assert params["qa2_dirty_only"] is True
+
+    def test_marker_does_not_leak_into_parse_cache(self, tmp_path):
+        self._extract(tmp_path)
+        cached = parse_tclean_calls(tmp_path / "casa_commands.log")
+        assert not any("qa2_dirty_only" in c for c in cached)
+
+
 # ---------------------------------------------------------------------------
 # find_casa_commands_log
 # ---------------------------------------------------------------------------

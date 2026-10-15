@@ -1,9 +1,10 @@
 """Recover tclean imaging parameters from ALMA pipeline weblogs.
 
 Parses ``casa_commands.log`` from TM (12m) pipeline weblogs to extract
-the tclean parameters used for cube imaging.  Only the **iter1** calls
-(``restoration=True, pbcor=True``) are returned — these represent the
-final cleaned images.
+the tclean parameters used for cube imaging.  Only the restored,
+PB-corrected calls (``restoration=True, pbcor=True``) are returned — the
+final cleaned ``iter1`` images, or the published dirty ``iter0`` image when
+QA2 found nothing to clean (see :func:`extract_by_field_spw`).
 
 The recovered parameters serve as the baseline for ``sdintimaging``.
 """
@@ -306,6 +307,14 @@ def extract_by_field_spw(calls: list[dict]) -> dict[tuple[str, str], dict]:
     joins lines with spaces, which can introduce spurious whitespace
     inside string values like ``'auto- multithresh'``).
 
+    The restored/PB-corrected filter also admits the QA2 ``iter0`` dirty
+    call (``niter=0``) that the pipeline publishes directly when it sees no
+    emission.  A cleaned call (``niter>0``) always wins over a dirty one for
+    the same key; a key with only a dirty call keeps it (geometry, spectral
+    grid and weighting are still the right seed) but is marked
+    ``qa2_dirty_only=True`` so the builder gives it a positive clean budget
+    — a QA2 nondetection is not a joint 12m+7m nondetection.
+
     Returns ``{(field, spw): params_dict}``.
     """
     result: dict[tuple[str, str], dict] = {}
@@ -322,10 +331,28 @@ def extract_by_field_spw(calls: list[dict]) -> dict[tuple[str, str], dict]:
 
         key = (field, spw)
         if key in result:
+            if _is_dirty_call(call) and not _is_dirty_call(result[key]):
+                log.debug("Duplicate (field, spw) = %s; keeping cleaned call "
+                          "over dirty iter0", key)
+                continue
             log.debug("Duplicate (field, spw) = %s; keeping last", key)
         result[key] = call
 
+    for key, call in result.items():
+        if _is_dirty_call(call):
+            log.info("(field, spw) = %s has only a QA2 dirty (niter=0) call",
+                     key)
+            call["qa2_dirty_only"] = True
+
     return result
+
+
+def _is_dirty_call(params: dict) -> bool:
+    """True for a tclean call that does no deconvolution (``niter=0``)."""
+    try:
+        return int(params.get("niter", -1)) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _normalize_string_values(params: dict) -> dict:

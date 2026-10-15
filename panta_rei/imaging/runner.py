@@ -351,6 +351,26 @@ def run_continuum_trusted_preflight(unit: ImagingUnit) -> tuple[bool, str]:
 # Parameter assembly
 # ---------------------------------------------------------------------------
 
+def _clean_budget(recovered: dict, fallback: int) -> int:
+    """Recovered ``niter``, or *fallback* when it is absent or zero.
+
+    A recovered ``niter=0`` is the QA2 dirty ``iter0`` call the pipeline
+    publishes when it finds nothing to clean (recovery marks these
+    ``qa2_dirty_only``).  Imaging the more sensitive joint data with it
+    would leave the cube undeconvolved (and feather a Jy/dirty-beam image),
+    so it gets the same budget as a missing niter; the recovered threshold
+    and automasking still decide how deep it actually cleans.
+    """
+    niter = int(recovered.get("niter", fallback))
+    if niter <= 0:
+        log.warning(
+            "Recovered niter=%d (QA2 dirty-only seed) — using niter=%d",
+            niter, fallback,
+        )
+        return fallback
+    return niter
+
+
 # Fixed parameters per plan (section 4)
 FIXED_PARAMS = {
     "gridder": "mosaic",
@@ -399,7 +419,7 @@ def build_sdintimaging_params(
         "veltype": recovered.get("veltype", "radio"),
         "weighting": recovered.get("weighting", "briggsbwtaper"),
         "robust": float(recovered.get("robust", 0.5)),
-        "niter": int(recovered.get("niter", 30000)),
+        "niter": _clean_budget(recovered, 30000),
         "threshold": recovered.get("threshold", "0.0Jy"),
         "pblimit": float(recovered.get("pblimit", 0.2)),
         # Auto-masking from recovery
@@ -472,7 +492,7 @@ def build_tclean_params(
         "veltype": recovered.get("veltype", "radio"),
         "weighting": recovered.get("weighting", "briggsbwtaper"),
         "robust": float(recovered.get("robust", 0.5)),
-        "niter": int(recovered.get("niter", 30000)),
+        "niter": _clean_budget(recovered, 30000),
         "threshold": recovered.get("threshold", "0.0Jy"),
         "pblimit": float(recovered.get("pblimit", 0.2)),
         # Auto-masking from recovery
@@ -540,7 +560,7 @@ def build_tclean_cont_params(
         "phasecenter": recovered.get("phasecenter", ""),
         "weighting": recovered.get("weighting", "briggs"),
         "robust": float(recovered.get("robust", 0.5)),
-        "niter": int(recovered.get("niter", 20000)),
+        "niter": _clean_budget(recovered, 20000),
         "threshold": recovered.get("threshold", "0.0Jy"),
         "pblimit": float(recovered.get("pblimit", 0.2)),
         "mosweight": bool(recovered.get("mosweight", True)),

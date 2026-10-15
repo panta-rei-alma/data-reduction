@@ -556,6 +556,20 @@ class TestBuildTcleanParams:
         assert params["robust"] == 0.5
         assert params["threshold"] == "0.276Jy"
 
+    def test_qa2_dirty_seed_gets_positive_budget(self, basic_unit, caplog):
+        """A recovered niter=0 (QA2 dirty-only iter0) must not image dirty."""
+        basic_unit.recovered_params["niter"] = 0
+        basic_unit.recovered_params["qa2_dirty_only"] = True
+        with caplog.at_level("WARNING", logger="panta_rei.imaging.runner"):
+            params = build_tclean_params(basic_unit, imagename="/out/test")
+        assert params["niter"] == 30000
+        assert "qa2_dirty_only" not in params
+        assert "dirty-only" in caplog.text
+
+    def test_positive_niter_unchanged(self, basic_unit):
+        basic_unit.recovered_params["niter"] = 4360
+        assert build_tclean_params(basic_unit, "/o")["niter"] == 4360
+
 
 # ---------------------------------------------------------------------------
 # run_tclean_feather (mocked CASA)
@@ -1102,6 +1116,10 @@ class TestBuildContParams:
         p = build_tclean_cont_params(cont_unit, imagename="/out/test")
         assert p["deconvolver"] == "mtmfs"
         assert p["specmode"] == "mfs"
+
+    def test_zero_niter_gets_positive_budget(self, cont_unit):
+        cont_unit.recovered_params["niter"] = 0
+        assert build_tclean_cont_params(cont_unit, "/o")["niter"] == 20000
 
     def test_scales_default_and_override(self, cont_unit):
         assert build_tclean_cont_params(cont_unit, "/o")["scales"] == [0]
