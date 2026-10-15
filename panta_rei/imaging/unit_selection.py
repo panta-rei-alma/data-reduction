@@ -83,6 +83,11 @@ def select_units_to_image(
          non-terminal dispatch.
       7. Honour ``limit``.
     """
+    from panta_rei.imaging.recovery import clear_parse_cache
+
+    # Memoized glob caches are scoped to one selection pass (a long-lived
+    # dispatcher re-selects; it must see newly extracted members).
+    clear_parse_cache()
     if filters.scales is None:
         filters.scales = [0, 5, 10, 15, 20]
 

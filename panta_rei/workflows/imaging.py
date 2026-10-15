@@ -98,6 +98,11 @@ class RecoverParamsStep(Step):
         return None
 
     def run(self, ctx: WorkflowContext) -> StepResult:
+        from panta_rei.imaging.recovery import clear_parse_cache
+
+        # Glob/weblog caches are memoized within one recovery; reset them so a
+        # second recovery in the same process sees new members and weblogs.
+        clear_parse_cache()
         opts = self._opts
         weblog_dir = opts.weblog_dir or ctx.config.weblog_dir
         csv_path = opts.obs_csv or ctx.targets_csv_path
@@ -250,12 +255,17 @@ class RecoverParamsStep(Step):
                     # Continuum: attach each EB's own line-free spw selection
                     # (12m from the TM call(s), 7m recovered from the SM call(s))
                     # so the joint image uses pipeline-prescribed channels per EB.
+                    cont_error = None
                     if opts.product_type == "cont":
                         canon_params = dict(canon_params)
-                        canon_params["spw_by_eb"] = _build_cont_spw_by_eb(
-                            all_mous_results, groups, field_name, lg,
-                            weblog_dir, ctx.data_dir,
-                        )
+                        try:
+                            canon_params["spw_by_eb"] = _build_cont_spw_by_eb(
+                                all_mous_results, groups, field_name, lg,
+                                weblog_dir, ctx.data_dir,
+                            )
+                        except ValueError as exc:
+                            cont_error = f"per-EB continuum selection: {exc}"
+                            canon_params["spw_by_eb"] = {}
 
                     # Write JSON sidecar
                     safe_source = field_name.replace('"', "").replace("'", "")
@@ -272,6 +282,13 @@ class RecoverParamsStep(Step):
                         log.error(
                             "DIVERGENCE: %s/%s/spw%s — %s",
                             gous_uid, field_name, spw_id, divergence,
+                        )
+                    elif cont_error:
+                        status = ImagingParamsStatus.FAILED
+                        error_msg = cont_error
+                        log.error(
+                            "CONT SELECTION: %s/%s/spw%s — %s",
+                            gous_uid, field_name, spw_id, cont_error,
                         )
                     else:
                         status = ImagingParamsStatus.RECOVERED

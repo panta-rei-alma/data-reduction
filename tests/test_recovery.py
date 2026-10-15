@@ -351,6 +351,22 @@ class TestEbSpwMapFromCall:
         assert set(m) == {"uid___A002_X1_Xa", "uid___A002_X2_Xb"}
         assert all(v == "24:86.0~86.1GHz" for v in m.values())
 
+    def test_length_mismatch_raises(self):
+        import pytest
+        from panta_rei.imaging.recovery import eb_spw_map_from_call
+        three_vis = {
+            "vis": [f"uid___A002_X{i}_Xa_targets.ms" for i in range(3)],
+            "spw": ["24:86.0~86.1GHz", "24:86.01~86.11GHz"],
+        }
+        with pytest.raises(ValueError, match="length mismatch"):
+            eb_spw_map_from_call(three_vis)
+        more_spw = {
+            "vis": ["uid___A002_X1_Xa_targets.ms", "uid___A002_X2_Xb_targets.ms"],
+            "spw": ["24:a", "24:b", "24:c"],
+        }
+        with pytest.raises(ValueError, match="length mismatch"):
+            eb_spw_map_from_call(more_spw)
+
 
 class TestRecoverContinuumParamsForMous:
     def test_full_recovery(self, tmp_path):
@@ -420,3 +436,22 @@ class TestStagedWeblogWithoutMemberDir:
         result = find_casa_commands_log(weblog_base, "uid___a001_x3833_x64bc", data_dir)
         assert result is not None
         assert "casa_commands.log" in str(result)
+
+
+class TestGlobCachesScopedToOperation:
+    def test_select_units_sees_new_member_after_prior_miss(self, tmp_path):
+        """A member-dir miss cached by one selection pass must not hide a
+        member extracted before the next pass."""
+        from panta_rei.imaging.matching import find_member_dir
+        from panta_rei.imaging.recovery import clear_parse_cache
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        assert find_member_dir(data_dir, "X1_X2") is None  # cached miss
+        member = data_dir / "science_goal.a" / "group.b" / "member.uid___A001_X1_X2"
+        member.mkdir(parents=True)
+        # Within one operation the miss is memoized...
+        assert find_member_dir(data_dir, "X1_X2") is None
+        # ...and the operation-boundary reset makes it visible again.
+        clear_parse_cache()
+        assert find_member_dir(data_dir, "X1_X2") == member

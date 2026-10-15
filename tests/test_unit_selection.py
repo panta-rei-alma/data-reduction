@@ -185,3 +185,18 @@ def test_exclude_active_allows_when_prior_dispatch_terminal(tmp_path):
     # Terminal status row → not active.  Unit should pass through.
     assert res.skipped_active == 0
     assert len(res.ready) == 1
+
+
+def test_selection_resets_glob_caches_each_pass(tmp_path, monkeypatch):
+    """Each selection pass starts with fresh glob/weblog caches, so a
+    long-lived dispatcher sees members extracted since its last pass."""
+    from panta_rei.imaging import recovery
+
+    calls = []
+    monkeypatch.setattr(recovery, "clear_parse_cache", lambda: calls.append(1))
+    db = DatabaseManager(":memory:")
+    csv = tmp_path / "targets.csv"
+    csv.write_text("source_name,array,sb_name,sgous_id,gous_id,mous_ids,Line group\n")
+    for _ in range(2):
+        select_units_to_image(db, csv, tmp_path, SelectionFilters())
+    assert len(calls) == 2

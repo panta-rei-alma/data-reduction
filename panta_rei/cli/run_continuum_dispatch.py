@@ -25,8 +25,21 @@ from panta_rei.cli.run_imaging_dispatch import main as _dispatch_main
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    # Inject the continuum product type unless the caller already set one.
-    if not any(a == "--product-type" or a.startswith("--product-type=") for a in argv):
+    # Force the continuum product type; reject an explicit non-cont value so
+    # this command can never launch line imaging.
+    for i, a in enumerate(argv):
+        if a == "--product-type" or a.startswith("--product-type="):
+            value = a.split("=", 1)[1] if "=" in a else (
+                argv[i + 1] if i + 1 < len(argv) else ""
+            )
+            if value != "cont":
+                sys.stderr.write(
+                    "panta-rei-continuum-dispatch only runs --product-type cont "
+                    f"(got {value!r}); use panta-rei-imaging-dispatch for lines\n"
+                )
+                return 2
+            break
+    else:
         argv = ["--product-type", "cont", *argv]
     return _dispatch_main(argv)
 

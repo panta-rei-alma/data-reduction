@@ -62,3 +62,25 @@ def test_does_not_double_inject_when_already_present():
         run_continuum_dispatch.main(["--product-type", "cont", "--base-dir", "/b"])
 
     assert captured["argv"].count("--product-type") == 1
+
+
+def test_rejects_explicit_line_product_type():
+    called = []
+    with mock.patch.object(
+        run_continuum_dispatch, "_dispatch_main", lambda argv: called.append(argv)
+    ):
+        assert run_continuum_dispatch.main(["--product-type", "line"]) == 2
+        assert run_continuum_dispatch.main(["--product-type=line"]) == 2
+    assert called == []
+
+
+def test_accepts_equals_form_cont():
+    captured = {}
+
+    def fake_main(argv):
+        captured["argv"] = argv
+        return 0
+
+    with mock.patch.object(run_continuum_dispatch, "_dispatch_main", fake_main):
+        assert run_continuum_dispatch.main(["--product-type=cont"]) == 0
+    assert captured["argv"] == ["--product-type=cont"]

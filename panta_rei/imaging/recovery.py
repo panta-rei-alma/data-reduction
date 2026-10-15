@@ -410,12 +410,11 @@ def eb_spw_map_from_call(call: dict) -> dict[str, str]:
         spw = spw * len(vis)
     if len(vis) != len(spw):
         # The ALMA contract is parallel vis/spw lists; anything else means a
-        # parse anomaly. Warn loudly — this map is load-bearing and a silent
-        # zip() truncation would drop EBs from the joint image.
-        log.warning(
-            "continuum call vis/spw length mismatch (%d vis, %d spw) for %s; "
-            "EBs beyond the shorter list are dropped",
-            len(vis), len(spw), call.get("imagename", "?"),
+        # parse anomaly. Fail rather than zip()-truncate: this map is
+        # load-bearing and dropping EBs would silently change the joint image.
+        raise ValueError(
+            f"continuum call vis/spw length mismatch ({len(vis)} vis, "
+            f"{len(spw)} spw) for {call.get('imagename', '?')}"
         )
     out: dict[str, str] = {}
     for v, s in zip(vis, spw):

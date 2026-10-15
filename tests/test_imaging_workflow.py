@@ -266,6 +266,50 @@ class TestRecoverParamsStep:
             "sm_eb": "22:85.99~86.09GHz,24:86.99~87.09GHz",
         }
 
+    def test_continuum_vis_spw_mismatch_fails_unit(self, imaging_ctx, imaging_tree):
+        """A malformed per-EB selection (vis/spw lengths differ) must fail the
+        unit at recovery, not zip-truncate EBs out of the joint image."""
+        tm_log = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_tm']}"
+            / "pipeline-20250101" / "html" / "casa_commands.log"
+        )
+        tm_log.write_text(tm_log.read_text() + MOCK_CONTINUUM_COMMANDS)
+        sm_html = (
+            imaging_tree["weblog_dir"]
+            / f"uid___A001_{imaging_tree['mous_id_sm']}"
+            / "pipeline-20250101" / "html"
+        )
+        sm_html.mkdir(parents=True)
+        (sm_html / "casa_commands.log").write_text(
+            MOCK_CONTINUUM_COMMANDS_SM.replace(
+                "vis=['sm_eb_targets.ms']",
+                "vis=['sm_eb_targets.ms', 'sm_eb2_targets.ms', 'sm_eb3_targets.ms']",
+            ).replace(
+                "spw=['22:85.99~86.09GHz,24:86.99~87.09GHz']",
+                "spw=['22:85.99~86.09GHz', '24:86.99~87.09GHz']",
+            )
+        )
+
+        RecoverParamsStep(ImagingOptions(
+            product_type="cont",
+            weblog_dir=imaging_tree["weblog_dir"],
+            obs_csv=imaging_tree["csv_path"],
+            step="recover",
+        )).run(imaging_ctx)
+
+        with imaging_ctx.db_manager.connect() as con:
+            assert ImagingParamsQueries.get_all_recovered(
+                con, product_type="cont"
+            ) == []
+            row = con.execute(
+                "SELECT status, error_message FROM imaging_params "
+                "WHERE product_type='cont'"
+            ).fetchone()
+        status, error_message = tuple(row)
+        assert status == "failed"
+        assert "length mismatch" in error_message
+
     def test_recovers_continuum_isolated_from_line(self, imaging_ctx, imaging_tree):
         """Continuum recovery stores spw_id='cont'/product_type='cont' rows, and
         the default (line) selection never sees them (Codex line-isolation)."""
