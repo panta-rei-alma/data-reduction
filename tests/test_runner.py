@@ -570,6 +570,29 @@ class TestBuildTcleanParams:
         basic_unit.recovered_params["niter"] = 4360
         assert build_tclean_params(basic_unit, "/o")["niter"] == 4360
 
+    def test_recovered_controls_forwarded(self, basic_unit):
+        basic_unit.recovered_params.update({
+            "cyclefactor": 3.0, "fastnoise": False, "minpercentchange": 1.0,
+            "dogrowprune": True, "nsigma": 0.0, "mosweight": True,
+            "perchanweightdensity": True, "smoothfactor": 1.0,
+        })
+        params = build_tclean_params(basic_unit, "/o")
+        assert params["cyclefactor"] == 3.0
+        assert params["fastnoise"] is False
+        assert params["minpercentchange"] == 1.0
+        assert params["dogrowprune"] is True
+        assert params["nsigma"] == 0.0
+        assert params["mosweight"] is True
+        assert params["perchanweightdensity"] is True
+        assert params["smoothfactor"] == 1.0
+
+    def test_absent_controls_left_to_casa(self, basic_unit):
+        params = build_tclean_params(basic_unit, "/o")
+        for key in ("cyclefactor", "fastnoise", "minpercentchange",
+                    "minpsffraction", "maxpsffraction", "cutthreshold",
+                    "mosweight", "perchanweightdensity", "nsigma"):
+            assert key not in params
+
 
 # ---------------------------------------------------------------------------
 # run_tclean_feather (mocked CASA)
@@ -1116,6 +1139,13 @@ class TestBuildContParams:
         p = build_tclean_cont_params(cont_unit, imagename="/out/test")
         assert p["deconvolver"] == "mtmfs"
         assert p["specmode"] == "mfs"
+
+    def test_recovered_controls_forwarded(self, cont_unit):
+        cont_unit.recovered_params.update({"cyclefactor": 3.0, "fastnoise": False})
+        p = build_tclean_cont_params(cont_unit, "/o")
+        assert p["cyclefactor"] == 3.0
+        assert p["fastnoise"] is False
+        assert "minpercentchange" not in p
 
     def test_zero_niter_gets_positive_budget(self, cont_unit):
         cont_unit.recovered_params["niter"] = 0

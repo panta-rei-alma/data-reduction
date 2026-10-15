@@ -446,6 +446,36 @@ def build_sdintimaging_params(
 # tclean parameter assembly
 # ---------------------------------------------------------------------------
 
+# Clean-cycle and automask controls copied verbatim from the recovered call
+# when present (e.g. QA2's cyclefactor=3, fastnoise=False,
+# minpercentchange=1.0).  Absent keys are not passed, so CASA's defaults
+# apply as before.
+FORWARDED_TCLEAN_CONTROLS = (
+    "cyclefactor",
+    "minpsffraction",
+    "maxpsffraction",
+    "nsigma",
+    "fastnoise",
+    "minpercentchange",
+    "dogrowprune",
+    "smoothfactor",
+    "cutthreshold",
+)
+
+# Line-only extras: the continuum builder already seeds these with fallbacks.
+FORWARDED_LINE_CONTROLS = FORWARDED_TCLEAN_CONTROLS + (
+    "mosweight",
+    "perchanweightdensity",
+)
+
+
+def _forward_recovered(params: dict, recovered: dict, keys: tuple) -> None:
+    """Copy each of *keys* present in *recovered* into *params*."""
+    for key in keys:
+        if key in recovered:
+            params[key] = recovered[key]
+
+
 # Fixed parameters for tclean (no sdintimaging-specific keys)
 FIXED_TCLEAN_PARAMS = {
     "gridder": "mosaic",
@@ -508,6 +538,7 @@ def build_tclean_params(
         "scales": scales,
         "parallel": parallel,
     }
+    _forward_recovered(params, recovered, FORWARDED_LINE_CONTROLS)
 
     # Apply fixed params (always override)
     params.update(FIXED_TCLEAN_PARAMS)
@@ -584,6 +615,7 @@ def build_tclean_cont_params(
     reffreq = recovered.get("reffreq")
     if reffreq:
         params["reffreq"] = reffreq
+    _forward_recovered(params, recovered, FORWARDED_TCLEAN_CONTROLS)
 
     # Apply fixed continuum overrides (always win)
     params.update(FIXED_TCLEAN_CONT_PARAMS)
